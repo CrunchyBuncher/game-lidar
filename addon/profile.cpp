@@ -1,5 +1,7 @@
 #include "profile.h"
 
+#include "camera_math.h"
+
 #include <algorithm>
 #include <cctype>
 #include <charconv>
@@ -185,8 +187,8 @@ constexpr shader_stage kStages[] = {shader_stage::vertex, shader_stage::pixel,  
                                     shader_stage::hull,   shader_stage::domain, shader_stage::compute};
 
 bool read_camera(const Table& t, CameraProfile& c, std::string& error) {
-    static const char* const kKeys[] = {"stage",       "slot",  "size",   "layout", "view_offset",
-                                        "proj_offset", "major", "handed", "latch"};
+    static const char* const kKeys[] = {"stage",  "slot",        "space",       "size",  "layout",
+                                        "view_offset", "proj_offset", "major", "handed", "latch"};
     for (const auto& [key, v] : t)
         if (std::none_of(std::begin(kKeys), std::end(kKeys), [&](const char* k) { return key == k; }))
             return error = "line " + std::to_string(v.line) + ": unknown key '" + key + "' in [camera]", false;
@@ -194,82 +196,45 @@ bool read_camera(const Table& t, CameraProfile& c, std::string& error) {
     Reader r{t, "camera", error};
     int stage = 0, layout = 0, major = 0, handed = 0, latch = 0;
     if (!r.choice("stage", {"vertex", "pixel", "geometry", "hull", "domain", "compute"}, stage, true) ||
-        !r.uint("slot", c.key.slot, true, 255) || !r.uint("size", c.key.size, false, 1u << 20) ||
-        !r.choice("layout", {"view+proj", "viewproj+proj", "invview+proj", "invviewproj+proj"}, layout, true) ||
-        !r.uint("view_offset", c.view_offset, true, 1u << 20) || !r.uint("proj_offset", c.proj_offset, true, 1u << 20) ||
-        !r.choice("major", {"row", "column"}, major, false) || !r.choice("handed", {"left", "right"}, handed, false) ||
-        !r.choice("latch", {"first", "last"}, latch, false))
+        !r.uint("slot", c.key.slot, true, 255) || !r.uint("space", c.key.space, false, 0xFFFFFFEFu) ||
+        !r.uint("size", c.key.size, false, 1u << 20) ||
+        !r.choice("layout",
+                  {"view+proj", "viewproj+proj", "invview+proj", "invviewproj+proj", "viewproj", "invviewproj"},
+                  layout, true) ||
+        !r.uint("view_offset", c.view_offset, true, 1u << 20))
+        return false;
+    c.layout = CameraLayout(layout);
+    if (c.single_matrix()) {
+        if (const Value* v = r.find("proj_offset", false))
+            return error = r.where(*v) + "proj_offset doesn't apply to layout " + layout_name(c.layout), false;
+    } else if (!r.uint("proj_offset", c.proj_offset, true, 1u << 20)) {
+        return false;
+    }
+    if (!r.choice("major", {"row", "column"}, major, false) || !r.choice("handed", {"left", "right"}, handed, false) ||
+        !r.choice("latch", {"first", "last", "common"}, latch, false))
         return false;
     c.key.stage = kStages[stage];
-    c.layout = CameraLayout(layout);
     c.column_major = major == 1;
     c.right_handed = handed == 1;
-    c.latch_last = latch == 1;
+    c.latch = Latch(latch);
     if (c.view_offset % 4 != 0 || c.proj_offset % 4 != 0) return error = "offsets must be multiples of 4 bytes", false;
-    const uint32_t lo = std::min(c.view_offset, c.proj_offset), hi = std::max(c.view_offset, c.proj_offset);
-    if (hi - lo < 64) return error = "view_offset and proj_offset overlap", false;
-    if (c.key.size != 0 && hi + 64 > c.key.size) return error = "matrices extend past the buffer size", false;
-    return true;
-}
-
-// ---- Matrix math (double, row-major, row-vector) --------------------------------------------
-
-struct Mat {
-    double m[4][4];
-};
-
-Mat load(const uint8_t* p, bool column_major) {
-    float f[16];
-    std::memcpy(f, p, sizeof(f));
-    Mat r;
-    for (int i = 0; i < 4; ++i)
-        for (int j = 0; j < 4; ++j) r.m[i][j] = column_major ? f[j * 4 + i] : f[i * 4 + j];
-    return r;
-}
-
-void store(const Mat& a, float out[16]) {
-    for (int i = 0; i < 4; ++i)
-        for (int j = 0; j < 4; ++j) out[i * 4 + j] = float(a.m[i][j]);
-}
-
-Mat mul(const Mat& a, const Mat& b) {
-    Mat r{};
-    for (int i = 0; i < 4; ++i)
-        for (int j = 0; j < 4; ++j)
-            for (int k = 0; k < 4; ++k) r.m[i][j] += a.m[i][k] * b.m[k][j];
-    return r;
-}
-
-// Gauss-Jordan with partial pivoting.
-bool inverse(const Mat& a, Mat& out) {
-    double w[4][8];
-    for (int i = 0; i < 4; ++i)
-        for (int j = 0; j < 4; ++j) w[i][j] = a.m[i][j], w[i][j + 4] = i == j ? 1.0 : 0.0;
-    for (int c = 0; c < 4; ++c) {
-        int p = c;
-        for (int i = c + 1; i < 4; ++i)
-            if (std::abs(w[i][c]) > std::abs(w[p][c])) p = i;
-        if (std::abs(w[p][c]) < 1e-12) return false;
-        if (p != c) std::swap(w[p], w[c]);
-        const double inv = 1.0 / w[c][c];
-        for (int j = 0; j < 8; ++j) w[c][j] *= inv;
-        for (int i = 0; i < 4; ++i) {
-            if (i == c) continue;
-            const double f = w[i][c];
-            for (int j = 0; j < 8; ++j) w[i][j] -= f * w[c][j];
-        }
+    if (!c.single_matrix()) {
+        const uint32_t lo = std::min(c.view_offset, c.proj_offset), hi = std::max(c.view_offset, c.proj_offset);
+        if (hi - lo < 64) return error = "view_offset and proj_offset overlap", false;
     }
-    for (int i = 0; i < 4; ++i)
-        for (int j = 0; j < 4; ++j) out.m[i][j] = w[i][j + 4];
+    if (c.key.size != 0 && c.window_offset() + c.window_size() > c.key.size)
+        return error = "matrices extend past the buffer size", false;
     return true;
 }
 
-bool finite(const Mat& a) {
-    for (const auto& row : a.m)
-        for (double v : row)
-            if (!std::isfinite(v)) return false;
-    return true;
-}
+// ---- Matrix math (double, row-major, row-vector: matrix.h) ----------------------------------
+
+using mat::finite;
+using mat::inverse;
+using mat::load;
+using mat::Mat;
+using mat::mul;
+using mat::store;
 
 // A rigid world->view transform: last column (0,0,0,1), rotation part with |det| ~ 1.
 bool plausible_view(const float v[16]) {
@@ -288,8 +253,12 @@ bool fail(std::string* why, const char* msg) {
 
 }  // namespace
 
-uint32_t CameraProfile::window_offset() const { return std::min(view_offset, proj_offset); }
-uint32_t CameraProfile::window_size() const { return std::max(view_offset, proj_offset) + 64 - window_offset(); }
+uint32_t CameraProfile::window_offset() const {
+    return single_matrix() ? view_offset : std::min(view_offset, proj_offset);
+}
+uint32_t CameraProfile::window_size() const {
+    return single_matrix() ? 64 : std::max(view_offset, proj_offset) + 64 - window_offset();
+}
 
 bool parse_profile(std::string_view text, Profile& out, std::string& error) {
     std::map<std::string, Table> doc;
@@ -311,12 +280,51 @@ bool load_profile(const std::filesystem::path& path, Profile& out, std::string& 
     return parse_profile(ss.str(), out, error);
 }
 
+std::string format_profile(const CameraProfile& c, std::string_view comment) {
+    std::string s;
+    while (!comment.empty()) {
+        const size_t nl = comment.find('\n');
+        s += "# " + std::string(comment.substr(0, nl)) + "\n";
+        comment = nl == std::string_view::npos ? std::string_view{} : comment.substr(nl + 1);
+    }
+    if (!s.empty()) s += "\n";
+    auto line = [&](const char* key, const std::string& value) {
+        s += key;
+        s.append(12 > std::strlen(key) ? 12 - std::strlen(key) : 1, ' ');
+        s += "= " + value + "\n";
+    };
+    auto quoted = [](const char* v) { return std::string("\"") + v + "\""; };
+    s += "[camera]\n";
+    line("stage", quoted(stage_name(c.key.stage)));
+    line("slot", std::to_string(c.key.slot));
+    if (c.key.space != 0) line("space", std::to_string(c.key.space));
+    if (c.key.size != 0) line("size", std::to_string(c.key.size));
+    line("layout", quoted(layout_name(c.layout)));
+    line("view_offset", std::to_string(c.view_offset));
+    if (!c.single_matrix()) line("proj_offset", std::to_string(c.proj_offset));
+    line("major", quoted(c.column_major ? "column" : "row"));
+    line("handed", quoted(c.right_handed ? "right" : "left"));
+    line("latch", quoted(latch_name(c.latch)));
+    return s;
+}
+
 const char* layout_name(CameraLayout layout) {
     switch (layout) {
         case CameraLayout::ViewAndProj: return "view+proj";
         case CameraLayout::ViewProjAndProj: return "viewproj+proj";
         case CameraLayout::InvViewAndProj: return "invview+proj";
         case CameraLayout::InvViewProjAndProj: return "invviewproj+proj";
+        case CameraLayout::ViewProj: return "viewproj";
+        case CameraLayout::InvViewProj: return "invviewproj";
+    }
+    return "?";
+}
+
+const char* latch_name(Latch latch) {
+    switch (latch) {
+        case Latch::First: return "first";
+        case Latch::Last: return "last";
+        case Latch::Common: return "common";
     }
     return "?";
 }
@@ -337,12 +345,25 @@ bool decode_camera(const CameraProfile& c, const uint8_t* window, size_t window_
                    std::string* why) {
     if (window_size < c.window_size()) return fail(why, "latched window too small");
     const uint8_t* a = window + (c.view_offset - c.window_offset());
-    const uint8_t* b = window + (c.proj_offset - c.window_offset());
-    const Mat first = load(a, c.column_major), p = load(b, c.column_major);
-    if (!finite(first) || !finite(p)) return fail(why, "non-finite values");
-    store(p, proj);  // float -> double -> float is exact
+    const Mat first = load(a, c.column_major);
+    if (!finite(first)) return fail(why, "non-finite values");
 
     Mat v, inv;
+    if (c.single_matrix()) {
+        Mat vp = first, p;
+        if (c.layout == CameraLayout::InvViewProj && !inverse(first, vp))
+            return fail(why, "inverse view-projection is singular");
+        if (!decompose_view_proj(vp, v, p)) return fail(why, "not a perspective view-projection");
+        store(v, view);
+        store(p, proj);
+        return true;
+    }
+
+    const uint8_t* b = window + (c.proj_offset - c.window_offset());
+    const Mat p = load(b, c.column_major);
+    if (!finite(p)) return fail(why, "non-finite values");
+    store(p, proj);  // float -> double -> float is exact
+
     switch (c.layout) {
         case CameraLayout::ViewAndProj:
             v = first;  // exact, like proj
@@ -361,6 +382,8 @@ bool decode_camera(const CameraProfile& c, const uint8_t* window, size_t window_
             v = mul(vp, inv);
             break;
         }
+        case CameraLayout::ViewProj:
+        case CameraLayout::InvViewProj: break;  // handled above
     }
     store(v, view);
     if (!analyze_projection(proj).valid) return fail(why, "proj is not a perspective projection");

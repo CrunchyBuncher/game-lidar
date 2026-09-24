@@ -9,5 +9,6 @@ std::unique_ptr<CbufferSource> create(reshade::api::device* dev);
 
 void register_events();
 void unregister_events();
+void init_device(reshade::api::device* dev);  // idempotent, ignores other APIs
 
 }  // namespace lidar::cam::d3d11

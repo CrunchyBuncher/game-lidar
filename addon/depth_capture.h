@@ -1,6 +1,6 @@
 // The API-specific half of the depth path: snapshot the scene depth-stencil, point-sample it
 // down to the capture size (protocol.h mapping) and read it back without stalling the game.
-// Each graphics API gets one implementation (d3d11/ today). Everything around it (choosing the
+// Each graphics API gets one implementation (d3d9/, d3d11/, d3d12/). Everything around it (choosing the
 // depth-stencil, pairing it with the camera, the ring) is shared.
 #pragma once
 #include <reshade.hpp>
@@ -43,5 +43,13 @@ protected:
 // The implementation for `dev`'s API. Returns nullptr and sets `error` if the API isn't
 // supported or setup fails.
 std::unique_ptr<DepthCapture> create_depth_capture(reshade::api::device* dev, std::string& error);
+
+// Whether `dev`'s API has an implementation (D3D9, D3D11, D3D12).
+bool is_supported(reshade::api::device* dev);
+
+// Registers the event handlers `api`'s implementation needs, once per API (D3D12 tracks
+// depth-stencil states, D3D9 makes depth-stencils readable).
+void register_capture_events(reshade::api::device_api api);
+void init_capture_device(reshade::api::device* dev);  // for a device created before registration
 
 }  // namespace lidar

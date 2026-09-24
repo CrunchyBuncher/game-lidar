@@ -89,12 +89,38 @@ Test first on the **fake game with ReShade injected**, then on the real game.
 **Exit:** the fake game scans perfectly through ReShade using only the addon. ✅ (2026-09-24)
 
 ## M3 — Discovery mode → first real game scan
-- [ ] Candidate scanner: 4×4 windows in cbuffers bound during scene-depth draws,
-      classified as view / proj / viewProj / inverse.
-- [ ] Temporal scoring (still vs moving) and ranked candidate list in the overlay.
-- [ ] Reprojection auto-validation (depth frame N → N+k error).
-- [ ] "Use candidate" (live preview in the viewer) and "Save to profile".
+- [x] Candidate scanner (2026-09-24): the camera tracker samples up to `DiscoverySamples` (48)
+      draws per frame into the captured depth-stencil and reads every bound constant buffer
+      (`CbufferSource::read_all_at_draw`: D3D9 register files, D3D11 bound cbuffers, D3D12 root
+      CBVs and tables, up to 8 KB each). A below-normal-priority worker classifies each 16-byte
+      aligned 64-byte window, both majors, as rigid / projection / view-projection / inverse
+      view-projection (`camera_math`, cached per window), and pairs them into hypotheses:
+      view+proj, viewproj+proj, invview+proj, invviewproj+proj, and the new single-matrix
+      `viewproj` / `invviewproj`, which are split into view and projection
+      (`decompose_view_proj`, jitter and either handedness). Per-object WVP constants become a
+      `viewproj` candidate with **latch "common"** (the value most draws into the depth-stencil
+      had), since the first/last draw may be an object with its own world matrix.
+- [x] Temporal scoring (still vs moving: constant while depth doesn't change, changing when it
+      does) and a ranked candidate list in the overlay's Discovery section, with live values,
+      FOV/near/far/depth convention, and a status/cost readout (≈0.04 ms of worker time per frame
+      on fake_game). A summary goes to `ReShade.log` every 10 s; **Write report** dumps
+      everything to `lidar_discovery.txt`.
+- [x] Reprojection auto-validation: depth frame N → N+k with each candidate, counting only
+      "informative" pixels (depth changed > 1%, so a frozen matrix can't pass on flat ground),
+      bilinear 1/z, median relative error; a round needs ≥ 50 such pixels to count.
+- [x] **Use** (unsaved preview profile, live in the viewer) and **Save** (writes
+      `lidar_profile.toml` next to the exe with the candidate as a comment, keeps a `.bak`, reloads).
+      `DiscoveryAutoStart` / `DiscoveryAutoSave=<s>` in the ini do the same unattended.
+- [x] Validated on the **fake game**, with no profile: discovery auto-saves after 20 s (NPC on),
+      then `lidar_verify ring --frames 60` with the saved profile passes (max ≤ 0.1 mm) for
+      `fake_game --camera-layout separate|viewproj|wvp` on D3D11, D3D12 (root CBVs and
+      `--cbv-tables`), D3D9 64-bit (auto and `--own-depth`), and the 32-bit D3D9 addon (separate,
+      wvp). separate → view+proj at b0/c0, 0 / 64; wvp → viewproj at b1/c13, latch common.
+      Wrong candidates (the NPC's world matrix, decoys) score 0 on reprojection.
 - [ ] Run it on the real test game and write its profile.
+- Known limits: needs a captured scene depth buffer and camera movement; only windows at
+  16-byte alignment and within the first 8 KB of each buffer; D3D12 root constants aren't
+  scanned; a view-projection with a scaling world matrix isn't recognized.
 
 **Exit:** the 360° turn test passes in a real game. **First live scan.** 🎉
 
@@ -104,11 +130,54 @@ Test first on the **fake game with ReShade injected**, then on the real game.
 - [ ] Follow-player camera, trail, clear/reset. Handle resolution changes.
 
 ## M5 — More APIs
-- [ ] D3D9 via `push_constants`.
-- [ ] D3D12/Vulkan: a `DepthCapture` on the ReShade API (copies, barriers, fenced readback)
-      and a `CbufferSource` that tracks persistently mapped upload buffers, resolves root CBVs
-      and descriptors at scene-depth draws (`ready = false`), and reads the memory in
-      `resolve()` at submit. Profiles need a binding key beyond stage + slot.
+- [x] **D3D12** (2026-09-24), ahead of M3.
+  - `fake_game --api d3d12`: same scene, camera and depth modes, render only. Camera and
+    per-object constants in one persistently mapped upload buffer, a region per frame,
+    3 frames in flight. Root CBVs (b1 at parameter 0, b0 at 1; root signature 1.1), or
+    `--cbv-tables`: one table [b1, b0 appended] copied every frame from a CPU-only heap
+    (root signature 1.0). Depth ends each frame in PIXEL_SHADER_RESOURCE. `--d3d12-debug`
+    turns on the debug layer and exits 3 on any error.
+  - `D3D12CbufferSource`: upload buffers + Map pointers, root signature layouts, CBV
+    descriptor shadows (creates and copies), per-command-list root CBVs / tables. Records at
+    the draw, reads in `resolve()` at submit. Profiles gained `space`.
+  - `D3D12Capture`: ReShade API only (immediate command list, no events), depth state tracked
+    from the game's barriers and restored, fenced readback ring.
+  - **Result:** `lidar_verify ring --frames 60` passes in all 3 depth modes for both binding
+    modes with the same accuracy as D3D11 (standard max 0.3 mm, reversed ≤ 0.1 mm).
+    `lidar_verify addon` against the un-injected D3D11 reference is bit-identical (depth,
+    proj and view 0 diff) in all 6 combinations. The debug layer reports no errors while
+    capturing. Forcing the addon to assume DEPTH_WRITE makes it report state mismatches,
+    so the state tracking is needed and is working.
+  - Known limits: only graphics bindings are tracked (no compute or bundles). Custom heaps
+    with CPU access aren't tracked, and neither are enhanced-barrier layouts beyond what
+    ReShade maps to states. D24S8/D32S8 depth copies are untested on D3D12. Descriptor
+    shadows grow to the highest index written. Measure the cost of the descriptor events on
+    a real D3D12 game.
+- [x] Unsupported APIs are harmless (2026-09-24): until a D3D9/D3D11/D3D12 device appears, the addon
+      registers only `init_device` (registering events changes how ReShade hooks D3D9), logs
+      "Inactive" and does nothing else. `d3dcompiler_47.dll` is delay-loaded. Checked once with
+      a throwaway D3D9 test (renders identically with and without the addon, "Inactive" logged).
+      Found via A Hat in Time, whose "DX12" mode is D3D9On12.
+- [x] **D3D9** (2026-09-24). Reverses the earlier "not D3D9" decision: many older games are D3D9.
+  - `fake_game --api d3d9`: same scene, camera and depth modes, render only. Camera in VS
+    constants c0-c12 (same bytes as b0, so the same profile works), decoy c13-c17 per draw.
+    Auto depth-stencil, or `--own-depth`. The half-pixel offset is corrected in the VS. Runs from
+    `sandbox/fake_game_d3d9/` with ReShade as `d3d9.dll`.
+  - `d3d9::` constants source: shadows the VS/PS float register files from `push_constants`.
+  - `D3D9Capture`: INTZ replacement at `create_resource`, ps_3_0 downsample, event query +
+    GetRenderTargetData readback, state block save/restore, targets dropped before Reset.
+  - Backends now register per API, so a D3D9 game doesn't get D3D11's map hooks (and vice versa).
+  - **Result:** `lidar_verify ring --frames 60` passes in all 3 depth modes, with the auto and own
+    depth-stencil (standard max 0.3 mm, reversed 0.1 mm, same as D3D11); the viewproj profile
+    passes too (max 1 mm). `lidar_verify addon` against an un-injected D3D11 `--d24` reference:
+    view and proj match exactly, and depth is bit-identical in standard mode. In reversed modes ~5%
+    of pixels are one 24-bit step apart (rasterizer rounding), within `--depth-tol 6e-8`. Three
+    window resizes (Resets) in a row keep capturing, and the game's Reset never fails.
+  - Known limits: MSAA depth can't be INTZ (error in the overlay). Fixed-function games
+    (`SetTransform`) have no shader constants. Depth buffers created before the addon loaded
+    stay unreadable. Not yet measured: the addon's CPU cost on a real D3D9 game
+    (GetRenderTargetData may sync), and D3D9On12 / D3D9Ex.
+- [ ] Vulkan: same shape as D3D12 (host-visible memory, descriptor sets, pipeline layouts).
 
 ## M6 — Scale & extras (as needed)
 - [ ] Chunked pool with eviction/streaming for huge levels. Resume saved scans.
@@ -118,5 +187,6 @@ Test first on the **fake game with ReShade injected**, then on the real game.
 ---
 
 ## Immediate next steps
-1. Pick a single-player **D3D11** test game with working ReShade depth.
-2. Start M0: CMake skeleton, `protocol.h`, D3D11 fake game, viewer.
+1. Run discovery on the test game (Sonic Adventure 2, 32-bit D3D9), save its profile, and do
+   the 360° turn test (M3 exit).
+2. Then M4.

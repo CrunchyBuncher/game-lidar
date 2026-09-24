@@ -25,7 +25,7 @@ ComPtr<ID3DBlob> compile_shader(const char* src, const char* entry, const char* 
     return code;
 }
 
-bool App::create(const wchar_t* title, int w, int h) {
+bool App::create(const wchar_t* title, int w, int h, bool d3d11) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     WNDCLASSEXW wc{sizeof(wc)};
@@ -52,6 +52,10 @@ bool App::create(const wchar_t* title, int w, int h) {
     GetClientRect(hwnd, &cr);
     width = cr.right - cr.left;
     height = cr.bottom - cr.top;
+    if (!d3d11) {  // the caller brings its own device and swap chain
+        ShowWindow(hwnd, SW_SHOW);
+        return true;
+    }
 
     UINT flags = 0;
 #ifdef _DEBUG
@@ -107,12 +111,14 @@ bool App::pump() {
     }
     if (pending_resize_ && width > 0 && height > 0) {
         pending_resize_ = false;
-        ctx->OMSetRenderTargets(0, nullptr, nullptr);
-        back_rtv.Reset();
-        back_buffer.Reset();
-        ctx->Flush();
-        check(swap->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0), "ResizeBuffers");
-        create_back_buffer();
+        if (swap) {
+            ctx->OMSetRenderTargets(0, nullptr, nullptr);
+            back_rtv.Reset();
+            back_buffer.Reset();
+            ctx->Flush();
+            check(swap->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0), "ResizeBuffers");
+            create_back_buffer();
+        }
         resized = true;
     }
     return !quit_;

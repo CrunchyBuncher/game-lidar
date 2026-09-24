@@ -20,6 +20,11 @@ public:
     Slot* begin_frame();
     void commit();
 
+    // For the writing thread to look at what it committed: the last committed seq (0: none yet)
+    // and the slot a seq went to (valid until kSlotCount more frames are written).
+    uint64_t latest_seq() const { return hdr_ ? hdr_->latest_seq : 0; }
+    const Slot* slot(uint64_t seq) const { return &slots_[seq % kSlotCount]; }
+
 private:
     void* map_ = nullptr;
     uint8_t* base_ = nullptr;

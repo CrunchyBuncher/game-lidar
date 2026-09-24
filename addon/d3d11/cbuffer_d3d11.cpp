@@ -49,9 +49,6 @@ struct __declspec(uuid("2d8b4f13-95a7-4c6e-b0d2-7e3f1a6c5b98")) Bindings {
 
 bool is_d3d11(device* dev) { return dev->get_api() == device_api::d3d11; }
 
-void on_init_device(device* dev) {
-    if (is_d3d11(dev)) dev->create_private_data<DeviceData>();
-}
 void on_destroy_device(device* dev) {
     if (is_d3d11(dev)) dev->destroy_private_data<DeviceData>();
 }
@@ -186,7 +183,37 @@ public:
         out.offset = r.offset + offset;
         out.bytes.assign(data.begin() + ptrdiff_t(out.offset), data.begin() + ptrdiff_t(out.offset + size));
         out.ready = true;
+        out.source_size = uint32_t(data.size());
         return true;
+    }
+
+    void read_all_at_draw(command_list* cmd, uint32_t max_bytes, std::vector<BoundBuffer>& out) override {
+        static constexpr shader_stage kGraphics[] = {shader_stage::vertex, shader_stage::hull, shader_stage::domain,
+                                                     shader_stage::geometry, shader_stage::pixel};
+        const Bindings* b = cmd->get_private_data<Bindings>();
+        if (b == nullptr) return;
+        DeviceData* dd = dev_->get_private_data<DeviceData>();
+        const std::lock_guard lock(dd->mutex);
+        for (const shader_stage stage : kGraphics) {
+            const int si = stage_index(stage);
+            for (uint32_t slot = 0; slot < kSlots; ++slot) {
+                const buffer_range& r = b->cb[si][slot];
+                if (r.buffer == 0) continue;
+                const auto it = dd->buffers.find(r.buffer.handle);
+                if (it == dd->buffers.end() || !it->second.valid) continue;
+                const std::vector<uint8_t>& data = it->second.data;
+                if (r.offset >= data.size()) continue;
+                const uint64_t n = std::min<uint64_t>({r.size, data.size() - r.offset, max_bytes}) & ~uint64_t(15);
+                if (n == 0) continue;
+                BoundBuffer& bb = out.emplace_back();
+                bb.key = {stage, slot, 0, uint32_t(data.size())};
+                bb.read.buffer = r.buffer.handle;
+                bb.read.offset = r.offset;
+                bb.read.bytes.assign(data.begin() + ptrdiff_t(r.offset), data.begin() + ptrdiff_t(r.offset + n));
+                bb.read.ready = true;
+                bb.read.source_size = uint32_t(data.size());
+            }
+        }
     }
 
     size_t tracked_buffers() const override {
@@ -201,6 +228,10 @@ private:
 
 }  // namespace
 
+void init_device(device* dev) {
+    if (is_d3d11(dev) && dev->get_private_data<DeviceData>() == nullptr) dev->create_private_data<DeviceData>();
+}
+
 std::unique_ptr<CbufferSource> create(device* dev) {
     if (!is_d3d11(dev) || dev->get_private_data<DeviceData>() == nullptr) return nullptr;
     return std::make_unique<Source>(dev);
@@ -208,7 +239,7 @@ std::unique_ptr<CbufferSource> create(device* dev) {
 
 void register_events() {
     using reshade::addon_event;
-    reshade::register_event<addon_event::init_device>(on_init_device);
+    reshade::register_event<addon_event::init_device>(init_device);
     reshade::register_event<addon_event::destroy_device>(on_destroy_device);
     reshade::register_event<addon_event::init_command_list>(on_init_command_list);
     reshade::register_event<addon_event::destroy_command_list>(on_destroy_command_list);
@@ -226,7 +257,7 @@ void register_events() {
 
 void unregister_events() {
     using reshade::addon_event;
-    reshade::unregister_event<addon_event::init_device>(on_init_device);
+    reshade::unregister_event<addon_event::init_device>(init_device);
     reshade::unregister_event<addon_event::destroy_device>(on_destroy_device);
     reshade::unregister_event<addon_event::init_command_list>(on_init_command_list);
     reshade::unregister_event<addon_event::destroy_command_list>(on_destroy_command_list);

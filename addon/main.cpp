@@ -8,18 +8,27 @@
 // camera-relative (no pose flag) with a projection from the overlay settings.
 //
 // Only the DepthCapture and CbufferSource implementations are API-specific (backends.cpp).
+//
+// Discovery mode (discovery.h) runs on top of both paths: the camera tracker samples draws, the
+// published depth frames are tapped from the ring, and its candidates can be previewed (used as an
+// unsaved profile) or saved as lidar_profile.toml.
 #include <imgui.h>
 #include <reshade.hpp>
 
 #include <DirectXMath.h>
 #include <windows.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -27,8 +36,10 @@
 #include "cbuffer_source.h"
 #include "depth_capture.h"
 #include "depth_tracker.h"
+#include "discovery.h"
 #include "profile.h"
 #include "ring.h"
+#include "watchdog.h"
 
 using namespace reshade::api;
 using namespace lidar;
@@ -41,6 +52,8 @@ namespace {
 
 constexpr char kSection[] = "LIDAR";
 constexpr char kDefaultProfile[] = "lidar_profile.toml";
+constexpr char kDiscoveryReport[] = "lidar_discovery.txt";
+constexpr uint32_t kDiscoveryBytes = 8192;  // per bound buffer at a sampled draw
 
 enum class DepthMode : int { Standard = 0, Reversed = 1, ReversedInfinite = 2 };
 
@@ -53,8 +66,17 @@ struct Settings {
     float near_z = 0.1f;
     float far_z = 1000.0f;
     int depth_mode = int(DepthMode::Reversed);
+    // Discovery, read from the ini only (for unattended runs): start with the game, save the best
+    // candidate after this many seconds once it's confident (0 = never), draws sampled per frame.
+    bool discovery_autostart = false;
+    int discovery_autosave = 0;
+    int discovery_samples = 48;
 
     void load() {
+        reshade::get_config_value(nullptr, kSection, "DiscoveryAutoStart", discovery_autostart);
+        reshade::get_config_value(nullptr, kSection, "DiscoveryAutoSave", discovery_autosave);
+        reshade::get_config_value(nullptr, kSection, "DiscoverySamples", discovery_samples);
+        discovery_samples = std::clamp(discovery_samples, 4, 512);
         reshade::get_config_value(nullptr, kSection, "Enabled", enabled);
         reshade::get_config_value(nullptr, kSection, "CaptureWidth", capture_width);
         char buf[1024];
@@ -106,31 +128,166 @@ uint64_t g_selected = 0;                     // handle captured last frame
 uint64_t g_override = 0;                     // manual pick from the overlay, 0 = auto
 double g_cpu_us = 0;                         // smoothed CPU cost of our present work
 
+disc::Discovery g_discovery;
+bool g_discovering = false;
+uint64_t g_ring_seen = 0;                // last ring seq handed to discovery
+std::optional<CameraProfile> g_preview;  // a discovery candidate in use instead of the profile (not saved)
+disc::Status g_disc_status;              // refreshed at most every half second
+std::chrono::steady_clock::time_point g_disc_polled{}, g_disc_logged{};
+bool g_disc_autosaved = false;
+std::string g_disc_message;
+
 std::filesystem::path game_dir() {
     wchar_t buf[MAX_PATH];
     const DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
     return std::filesystem::path(std::wstring(buf, n)).parent_path();
 }
 
-// (Re)loads the profile and points the camera tracker at it. Caller holds g_mutex.
+// The camera in use: a previewed discovery candidate, or the profile's.
+const CameraProfile* active_camera() {
+    if (g_preview) return &*g_preview;
+    return g_profile.has_camera ? &g_profile.camera : nullptr;
+}
+
+// Points the camera tracker at the active camera. Caller holds g_mutex.
+void configure_camera() {
+    g_camera = {};
+    const CameraProfile* c = active_camera();
+    if (c != nullptr && g_source != nullptr) {
+        const cam::LatchRequest req{c->key, c->window_offset(), c->window_size(), c->latch};
+        cam::configure(g_device, g_source.get(), &req);
+    } else {
+        cam::configure(g_device, nullptr, nullptr);
+    }
+}
+
+// (Re)loads the profile and points the camera tracker at it. Ends any preview. Caller holds g_mutex.
 void reload_profile() {
     g_profile = {};
     g_profile_error.clear();
-    g_camera = {};
+    g_preview.reset();
     g_profile_path = std::filesystem::path(std::u8string(g_settings.profile.begin(), g_settings.profile.end()));
     if (g_profile_path.is_relative()) g_profile_path = game_dir() / g_profile_path;
     if (g_source == nullptr)
         g_profile_error = "camera sniffing isn't supported for this graphics API yet";
     else
         load_profile(g_profile_path, g_profile, g_profile_error);
+    configure_camera();
+}
 
-    if (g_profile.has_camera) {
-        const CameraProfile& c = g_profile.camera;
-        const cam::LatchRequest req{c.key, c.window_offset(), c.window_size(), c.latch_last};
-        cam::configure(g_device, g_source.get(), &req);
-    } else {
-        cam::configure(g_device, nullptr, nullptr);
+void log_info(const std::string& msg) { reshade::log::message(reshade::log::level::info, msg.c_str()); }
+
+// ---- Discovery ------------------------------------------------------------------------------
+
+void start_discovery() {
+    if (g_source == nullptr || g_discovering) return;
+    g_discovery.start(g_device->get_api() == device_api::d3d9);
+    cam::configure_discovery(g_device, g_source.get(), uint32_t(g_settings.discovery_samples), kDiscoveryBytes);
+    g_discovering = true;
+    g_ring_seen = g_ring.latest_seq();
+    g_disc_autosaved = false;
+    g_disc_message.clear();
+    g_disc_logged = std::chrono::steady_clock::now();
+    log_info("Discovery started (" + std::to_string(g_settings.discovery_samples) + " sampled draws per frame).");
+}
+
+void stop_discovery() {
+    if (!g_discovering) return;
+    cam::configure_discovery(g_device, nullptr, 0, 0);
+    g_discovery.stop();
+    g_disc_status = g_discovery.status();
+    g_discovering = false;
+    log_info("Discovery stopped.");
+}
+
+std::string candidate_line(const disc::CandidateInfo& c) {
+    char buf[320];
+    int n = std::snprintf(buf, sizeof(buf), "%s at %s, %s-major, latch %s: score %.2f%s, reprojection %u/%u (error %.4f), "
+                                            "still/moving %u/%u",
+                          layout_name(c.profile.layout), c.where.c_str(), c.profile.column_major ? "column" : "row",
+                          latch_name(c.profile.latch), c.score, c.confident ? " (confident)" : "", c.reproj_passes,
+                          c.reproj_tests, c.reproj_error, c.temporal_agree, c.temporal_checks);
+    if (c.have_values && c.info.valid)
+        std::snprintf(buf + n, sizeof(buf) - n, "; FOV %.1f, near %.4g, %s depth", c.info.fov_y_deg, c.info.near_z,
+                      c.info.reversed ? "reversed" : "standard");
+    return buf;
+}
+
+void log_discovery(const disc::Status& s) {
+    char buf[320];
+    std::snprintf(buf, sizeof(buf),
+                  "Discovery %.0f s: %llu frames analyzed (%llu dropped, %.2f ms each), %u draws/%u sampled/%u buffers "
+                  "last frame; hypotheses: %zu rigid, %zu proj, %zu viewproj, %zu invviewproj; depth %llu frames "
+                  "(%llu still, %llu moving), %llu reprojection rounds",
+                  s.seconds, (unsigned long long)s.frames_analyzed, (unsigned long long)s.frames_dropped, s.analyze_ms,
+                  s.last_draws, s.last_samples, s.last_buffers, s.hypotheses[0], s.hypotheses[1], s.hypotheses[2],
+                  s.hypotheses[3],
+                  (unsigned long long)s.depth_frames, (unsigned long long)s.still_frames,
+                  (unsigned long long)s.moving_frames, (unsigned long long)s.reproj_rounds);
+    log_info(buf);
+    for (size_t i = 0; i < s.candidates.size() && i < 5; ++i)
+        log_info("  #" + std::to_string(i + 1) + " " + candidate_line(s.candidates[i]));
+}
+
+// Writes the candidate as lidar_profile.toml next to the exe (keeping the old one as .bak), makes
+// it the profile and reloads. Caller holds g_mutex.
+bool save_candidate(const disc::CandidateInfo& c) {
+    const std::filesystem::path path = game_dir() / kDefaultProfile;
+    std::error_code ec;
+    if (std::filesystem::exists(path, ec))
+        std::filesystem::rename(path, std::filesystem::path(path).concat(".bak"), ec);
+    const std::time_t now = std::time(nullptr);
+    char date[32];
+    std::strftime(date, sizeof(date), "%Y-%m-%d %H:%M", std::localtime(&now));
+    std::string comment = std::string("Written by game-lidar discovery mode, ") + date + ".\n" + candidate_line(c);
+    std::ofstream f(path, std::ios::binary);
+    f << format_profile(c.profile, comment);
+    f.close();
+    if (!f) {
+        g_disc_message = "Couldn't write " + path.string();
+        return false;
     }
+    g_settings.profile = kDefaultProfile;
+    g_settings.save();
+    reload_profile();
+    g_disc_message = g_profile.has_camera ? "Saved " + path.string() + " and loaded it."
+                                          : "Saved " + path.string() + ", but it didn't load: " + g_profile_error;
+    log_info(g_disc_message);
+    if (g_discovering) g_discovery.request_report(game_dir() / kDiscoveryReport);
+    return g_profile.has_camera;
+}
+
+// Once per present while discovering: refresh the status, log it now and then, auto-save.
+void discovery_tick() {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - g_disc_polled < std::chrono::milliseconds(500)) return;
+    g_disc_polled = now;
+    g_disc_status = g_discovery.status();
+    if (now - g_disc_logged >= std::chrono::seconds(10)) {
+        g_disc_logged = now;
+        log_discovery(g_disc_status);
+    }
+    const int autosave = g_settings.discovery_autosave;
+    if (autosave > 0 && !g_disc_autosaved && g_disc_status.seconds >= autosave && !g_disc_status.candidates.empty() &&
+        g_disc_status.candidates.front().confident) {
+        g_disc_autosaved = true;
+        log_discovery(g_disc_status);
+        log_info("Discovery auto-save: " + candidate_line(g_disc_status.candidates.front()));
+        save_candidate(g_disc_status.candidates.front());
+    }
+}
+
+// Hands this frame's samples (for the captured depth-stencil) and newly published depth frames to
+// discovery.
+void feed_discovery(cam::FrameSamples& samples, uint64_t captured_ds) {
+    const uint64_t latest = g_ring.latest_seq();
+    for (uint64_t seq = std::max(g_ring_seen, latest > kSlotCount ? latest - kSlotCount : 0) + 1; seq <= latest; ++seq) {
+        const Slot* s = g_ring.slot(seq);
+        g_discovery.submit_depth(s->frame, s->depth);
+    }
+    g_ring_seen = latest;
+    if (const auto it = samples.find(captured_ds); it != samples.end())
+        g_discovery.submit_samples(g_frame, std::move(it->second));
 }
 
 // Row-major, row-vector (D3D) projection, as protocol.h expects. Same math as fake_game.
@@ -156,7 +313,8 @@ void make_proj(const Settings& s, float aspect, float out[16]) {
 
 // Fills the header's pose from this frame's latch for the captured depth-stencil.
 bool apply_camera(const cam::FrameLatches& latches, uint64_t depth_stencil, FrameHeader& h) {
-    if (!g_profile.has_camera) {
+    const CameraProfile* camera = active_camera();
+    if (camera == nullptr) {
         g_camera.state = CameraStatus::NoProfile;
         return false;
     }
@@ -166,7 +324,7 @@ bool apply_camera(const cam::FrameLatches& latches, uint64_t depth_stencil, Fram
         return false;
     }
     float view[16], proj[16];
-    if (!decode_camera(g_profile.camera, it->second.bytes.data(), it->second.bytes.size(), view, proj, &g_camera.why)) {
+    if (!decode_camera(*camera, it->second.bytes.data(), it->second.bytes.size(), view, proj, &g_camera.why)) {
         g_camera.state = CameraStatus::Rejected;
         return false;
     }
@@ -180,8 +338,63 @@ bool apply_camera(const cam::FrameLatches& latches, uint64_t depth_stencil, Fram
     return true;
 }
 
+const char* api_name(device_api api) {
+    switch (api) {
+        case device_api::d3d9: return "Direct3D 9";
+        case device_api::d3d10: return "Direct3D 10";
+        case device_api::d3d11: return "Direct3D 11";
+        case device_api::d3d12: return "Direct3D 12";
+        case device_api::opengl: return "OpenGL";
+        case device_api::vulkan: return "Vulkan";
+    }
+    return "this graphics API";
+}
+
+void register_active_handlers();  // below, next to the handlers it registers
+
+// Until a supported device shows up, the addon's only handler is init_device. Registering an
+// event can change how ReShade hooks the game (on D3D9, map events wrap every buffer Lock), so on
+// an API we don't support the addon must not register anything else: the game has to run exactly
+// as it does without the addon. On the first supported device, the shared modules register, plus
+// that API's backend (only it: D3D11's map events would cost a D3D9 game for nothing). That device
+// was created before the modules' handlers existed, so it's set up by hand. On D3D9 this runs
+// before the device's auto depth-stencil is created, so the backend can still make it readable.
+void attach_modules(device* dev) {
+    static bool registered = false;
+    if (!registered) {
+        depth::register_events();
+        cam::register_events();
+        register_active_handlers();
+        registered = true;
+    }
+    static std::vector<device_api> backends;
+    if (std::find(backends.begin(), backends.end(), dev->get_api()) == backends.end()) {
+        cam::register_source_events(dev->get_api());
+        register_capture_events(dev->get_api());
+        backends.push_back(dev->get_api());
+    }
+    depth::init_device(dev);
+    cam::init_device(dev);
+    cam::init_source_device(dev);
+    init_capture_device(dev);
+}
+
 void on_init_device(device* dev) {
+    const watchdog::Step step("init_device");
     const std::lock_guard lock(g_mutex);
+    if (!is_supported(dev)) {
+        static bool logged = false;
+        if (!logged) {
+            const std::string msg = std::string("Inactive: the game created a ") + api_name(dev->get_api()) +
+                                    " device, which isn't supported (D3D9, D3D11 and D3D12 are). Nothing else is hooked.";
+            reshade::log::message(reshade::log::level::warning, msg.c_str());
+            logged = true;
+        }
+        return;
+    }
+    // Later supported devices get this from the modules' own init_device handlers too, but those
+    // run after this one.
+    attach_modules(dev);
     if (g_device != nullptr) return;
     std::string error;
     std::unique_ptr<DepthCapture> capture = create_depth_capture(dev, error);
@@ -191,17 +404,22 @@ void on_init_device(device* dev) {
     }
     if (capture == nullptr) return;
     g_device = dev;
+    watchdog::start();
     g_init_error.clear();
     g_capture = std::move(capture);
     g_source = cam::create_cbuffer_source(dev);
     g_settings.load();
     if (!g_ring.open()) g_init_error = "failed to create the shared-memory ring";
     reload_profile();
+    if (g_settings.discovery_autostart) start_discovery();
 }
 
 void on_destroy_device(device* dev) {
+    const watchdog::Step step("destroy_device");
     const std::lock_guard lock(g_mutex);
     if (dev != g_device) return;
+    stop_discovery();
+    watchdog::stop();
     cam::configure(dev, nullptr, nullptr);
     g_source.reset();
     g_capture.reset();
@@ -212,19 +430,26 @@ void on_destroy_device(device* dev) {
 
 void on_present(command_queue* queue, swapchain* sc, const rect*, const rect*, uint32_t, const rect*) {
     device* const dev = sc->get_device();
+    watchdog::heartbeat();
+    const watchdog::Step step("present: waiting for the addon lock");
     const std::lock_guard lock(g_mutex);
     if (dev != g_device || !g_init_error.empty()) return;
 
     LARGE_INTEGER t0, t1, freq;
     QueryPerformanceCounter(&t0);
 
-    const cam::FrameLatches latches = cam::end_frame(dev);
+    watchdog::exchange_step("present: camera end_frame");
+    cam::FrameSamples samples;
+    const cam::FrameLatches latches = cam::end_frame(dev, g_discovering ? &samples : nullptr);
+    watchdog::exchange_step("present: depth end_frame");
     const resource_desc bb = dev->get_resource_desc(sc->get_current_back_buffer());
     std::vector<depth::Candidate> candidates = depth::end_frame(dev, bb.texture.width, bb.texture.height);
     if (candidates.empty()) return;  // e.g. a second present without any rendering in between
     g_candidates = std::move(candidates);
 
+    watchdog::exchange_step("present: publish");
     g_capture->publish(queue, g_ring);
+    watchdog::exchange_step("present: capture");
 
     const depth::Candidate* pick = nullptr;
     for (const auto& c : g_candidates)
@@ -246,6 +471,11 @@ void on_present(command_queue* queue, swapchain* sc, const rect*, const rect*, u
         }
         g_capture->capture(queue, pick->resource, uint32_t(g_settings.capture_width), h);
     }
+    if (g_discovering) {
+        watchdog::exchange_step("present: discovery");
+        feed_discovery(samples, g_selected);
+        discovery_tick();
+    }
     ++g_frame;
 
     QueryPerformanceCounter(&t1);
@@ -264,6 +494,8 @@ const char* format_name(format f) {
         case format::r32_typeless: return "R32 typeless";
         case format::d32_float_s8_uint: return "D32FS8";
         case format::r32_g8_typeless: return "R32G8 typeless";
+        case format::d24_unorm_x8_uint: return "D24X8";
+        case format::intz: return "INTZ";
         default: return "other";
     }
 }
@@ -293,23 +525,47 @@ bool draw_camera_section() {
     }
     ImGui::SameLine();
     if (ImGui::Button("Reload")) reload_profile();
-    if (!g_profile_error.empty()) {
+    // Shown without a profile too: it's what tells whether the game's camera is in constants at all.
+    const bool d3d9 = g_device->get_api() == device_api::d3d9;
+    if (g_source)
+        ImGui::TextDisabled(d3d9 ? "Tracking %zu constant registers" : "Tracking %zu constant buffers",
+                            g_source->tracked_buffers());
+    if (g_preview) {
+        ImGui::TextColored(ImVec4(1, 0.8f, 0.2f, 1), "Previewing a discovery candidate (not saved)");
+        ImGui::SameLine();
+        if (ImGui::Button("End preview")) {
+            g_preview.reset();
+            configure_camera();
+        }
+    } else if (!g_profile_error.empty()) {
         ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1), "%s", g_profile_error.c_str());
         return changed;
     }
 
-    const CameraProfile& c = g_profile.camera;
-    ImGui::TextDisabled("%s b%u%s, %s at %u / %u, %s-major, %s-handed, %s latch", stage_name(c.key.stage), c.key.slot,
-                        c.key.size ? (" (" + std::to_string(c.key.size) + " bytes)").c_str() : "",
-                        layout_name(c.layout), c.view_offset, c.proj_offset, c.column_major ? "column" : "row",
-                        c.right_handed ? "right" : "left", c.latch_last ? "last" : "first");
-    if (g_source) ImGui::TextDisabled("Tracking %zu constant buffers", g_source->tracked_buffers());
+    const CameraProfile& c = *active_camera();
+    // D3D9: one register file per stage, no buffers: offsets are registers (16 bytes each).
+    auto at = [&](uint32_t offset) {
+        return d3d9 ? "c" + std::to_string(offset / 16) + (offset % 16 ? " (unaligned)" : "") : std::to_string(offset);
+    };
+    const std::string where = c.single_matrix() ? at(c.view_offset) : at(c.view_offset) + " / " + at(c.proj_offset);
+    if (d3d9)
+        ImGui::TextDisabled("%s constants, %s at %s, %s-major, %s-handed, %s latch", stage_name(c.key.stage),
+                            layout_name(c.layout), where.c_str(), c.column_major ? "column" : "row",
+                            c.right_handed ? "right" : "left", latch_name(c.latch));
+    else
+        ImGui::TextDisabled("%s b%u%s%s, %s at %s, %s-major, %s-handed, %s latch", stage_name(c.key.stage), c.key.slot,
+                            c.key.space ? (" space" + std::to_string(c.key.space)).c_str() : "",
+                            c.key.size ? (" (" + std::to_string(c.key.size) + " bytes)").c_str() : "",
+                            layout_name(c.layout), where.c_str(), c.column_major ? "column" : "row",
+                            c.right_handed ? "right" : "left", latch_name(c.latch));
 
     switch (g_camera.state) {
         case CameraStatus::NoProfile: break;
         case CameraStatus::NoLatch:
             ImGui::TextColored(ImVec4(1, 0.8f, 0.2f, 1),
-                               "No latch: no draw into the captured depth buffer had that cbuffer bound.");
+                               d3d9 ? "No latch: those registers were never set before a draw into the captured depth "
+                                      "buffer (or slot isn't 0)."
+                                    : "No latch: no draw into the captured depth buffer had that cbuffer bound.");
             break;
         case CameraStatus::Rejected:
             ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1), "Latched, but rejected: %s", g_camera.why.c_str());
@@ -340,7 +596,121 @@ bool draw_camera_section() {
     return changed;
 }
 
+void draw_discovery_section() {
+    if (!ImGui::CollapsingHeader("Discovery", g_profile.has_camera ? 0 : ImGuiTreeNodeFlags_DefaultOpen)) return;
+    if (g_source == nullptr) {
+        ImGui::TextDisabled("Not available for this graphics API.");
+        return;
+    }
+    ImGui::TextWrapped("Finds the camera in the game's constants. Start it, then move and turn the camera for a few "
+                       "seconds (stand still for a moment too): candidates are checked against how the depth image "
+                       "moves. Use one to preview it in the viewer, then save it as the profile.");
+    if (ImGui::Button(g_discovering ? "Stop" : "Start")) {
+        if (g_discovering)
+            stop_discovery();
+        else
+            start_discovery();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Write report")) {
+        g_discovery.request_report(game_dir() / kDiscoveryReport);
+        g_disc_message = g_discovering ? "Writing " + (game_dir() / kDiscoveryReport).string()
+                                       : "Start discovery first: the report is written by it.";
+    }
+    if (!g_disc_message.empty()) ImGui::TextDisabled("%s", g_disc_message.c_str());
+
+    const disc::Status& s = g_disc_status;
+    if (s.frames_analyzed == 0 && !g_discovering) return;
+    ImGui::Text("%.0f s: %llu frames analyzed (%llu dropped, %.2f ms each). Last frame: %u draws, %u sampled, %u "
+                "buffers",
+                s.seconds, (unsigned long long)s.frames_analyzed, (unsigned long long)s.frames_dropped, s.analyze_ms,
+                s.last_draws, s.last_samples, s.last_buffers);
+    ImGui::Text("Matrices found: %zu rigid, %zu projection, %zu view-projection, %zu inverse", s.hypotheses[0],
+                s.hypotheses[1], s.hypotheses[2], s.hypotheses[3]);
+    ImGui::Text("Depth: %llu frames (%llu still, %llu moving), %llu reprojection rounds",
+                (unsigned long long)s.depth_frames, (unsigned long long)s.still_frames,
+                (unsigned long long)s.moving_frames, (unsigned long long)s.reproj_rounds);
+    const ImVec4 warn(1, 0.8f, 0.2f, 1);
+    if (g_discovering && s.frames_analyzed == 0 && g_selected == 0)
+        ImGui::TextColored(warn, "No depth buffer is captured, so no draws are sampled.");
+    else if (g_discovering && s.depth_frames == 0 && s.seconds > 3)
+        ImGui::TextColored(warn, "No depth frames: turn Capture on (candidates are validated with depth).");
+    else if (g_discovering && s.reproj_rounds == 0 && s.seconds > 3)
+        ImGui::TextColored(warn, "Move and turn the camera: validation needs the view to change.");
+    if (s.candidates.empty()) {
+        if (s.frames_analyzed > 0) ImGui::TextDisabled("No candidates yet.");
+        return;
+    }
+
+    static int expanded = -1;
+    if (ImGui::BeginTable("candidates", 7, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
+        ImGui::TableSetupColumn("#");
+        ImGui::TableSetupColumn("Layout");
+        ImGui::TableSetupColumn("Where");
+        ImGui::TableSetupColumn("Score");
+        ImGui::TableSetupColumn("Reprojection");
+        ImGui::TableSetupColumn("Still/moving");
+        ImGui::TableSetupColumn("");
+        ImGui::TableHeadersRow();
+        for (int i = 0; i < int(s.candidates.size()); ++i) {
+            const disc::CandidateInfo& c = s.candidates[size_t(i)];
+            ImGui::PushID(i);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            if (ImGui::Selectable(std::to_string(i + 1).c_str(), expanded == i, ImGuiSelectableFlags_SpanAllColumns))
+                expanded = expanded == i ? -1 : i;
+            ImGui::TableNextColumn();
+            ImGui::Text("%s%s%s", layout_name(c.profile.layout), c.profile.column_major ? " (column)" : "",
+                        c.profile.latch == Latch::Common ? " (common)" : "");
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(c.where.c_str());
+            ImGui::TableNextColumn();
+            if (c.confident)
+                ImGui::TextColored(ImVec4(0.3f, 1, 0.4f, 1), "%.2f", c.score);
+            else
+                ImGui::Text("%.2f", c.score);
+            ImGui::TableNextColumn();
+            if (c.reproj_tests)
+                ImGui::Text("%u/%u, err %.2f%%", c.reproj_passes, c.reproj_tests, c.reproj_error * 100);
+            else
+                ImGui::TextDisabled("-");
+            ImGui::TableNextColumn();
+            ImGui::Text("%u/%u", c.temporal_agree, c.temporal_checks);
+            ImGui::TableNextColumn();
+            if (ImGui::SmallButton("Use")) {
+                g_preview = c.profile;
+                configure_camera();
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Save")) save_candidate(c);
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    if (expanded >= 0 && expanded < int(s.candidates.size())) {
+        const disc::CandidateInfo& c = s.candidates[size_t(expanded)];
+        ImGui::Text("#%d, live values:", expanded + 1);
+        if (!c.have_values) {
+            ImGui::TextDisabled("(no values in the latest frame)");
+        } else {
+            const ProjectionInfo& p = c.info;
+            if (p.valid) {
+                char far_text[32] = "infinite";
+                if (!std::isinf(p.far_z)) std::snprintf(far_text, sizeof(far_text), "%.6g", p.far_z);
+                ImGui::Text("FOV %.2f deg, aspect %.3f, near %.4g, far %s, %s, %s-handed", p.fov_y_deg, p.aspect,
+                            p.near_z, far_text, p.reversed ? "reversed depth" : "standard depth",
+                            p.right_handed ? "right" : "left");
+            }
+            ImGui::TextUnformatted("view");
+            matrix_table("cand_view", c.view);
+            ImGui::TextUnformatted("proj");
+            matrix_table("cand_proj", c.proj);
+        }
+    }
+}
+
 void draw_overlay(effect_runtime*) {
+    const watchdog::Step step("overlay");
     const std::lock_guard lock(g_mutex);
     if (g_device == nullptr) {
         ImGui::TextColored(ImVec4(1, 0.6f, 0.2f, 1), "No supported device: %s",
@@ -362,6 +732,7 @@ void draw_overlay(effect_runtime*) {
     changed |= ImGui::SliderInt("Capture width", &g_settings.capture_width, 64, int(kMaxWidth));
 
     changed |= draw_camera_section();
+    draw_discovery_section();
 
     if (ImGui::CollapsingHeader("Fallback projection (frames without a pose)")) {
         changed |= ImGui::SliderFloat("Vertical FOV", &g_settings.fov_y_deg, 20.0f, 120.0f, "%.1f deg");
@@ -414,20 +785,20 @@ void draw_overlay(effect_runtime*) {
     if (changed) g_settings.save();
 }
 
+void register_active_handlers() {
+    reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
+    reshade::register_event<reshade::addon_event::present>(on_present);
+    reshade::register_overlay("LiDAR", draw_overlay);
+}
+
 }  // namespace
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
     switch (reason) {
         case DLL_PROCESS_ATTACH:
             if (!reshade::register_addon(module)) return FALSE;
-            // The trackers' and sources' init_device must run first: they create per-device data.
-            depth::register_events();
-            cam::register_events();
-            cam::register_source_events();
+            // Everything else registers in attach_modules(), for supported devices only.
             reshade::register_event<reshade::addon_event::init_device>(on_init_device);
-            reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
-            reshade::register_event<reshade::addon_event::present>(on_present);
-            reshade::register_overlay("LiDAR", draw_overlay);
             break;
         case DLL_PROCESS_DETACH:
             reshade::unregister_addon(module);

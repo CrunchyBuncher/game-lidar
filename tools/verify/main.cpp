@@ -2,10 +2,13 @@
 //
 //   lidar_verify ring [--frames 30] [--tol 0.02]   read live frames from the ring (CPU unprojection)
 //   lidar_verify ply <file> [--tol 0.02]           check a viewer-saved .ply (GPU pipeline)
-//   lidar_verify addon [--frames 30] [--tol 0.02]  check the ReShade addon's frames against a reference
+//   lidar_verify addon [--frames 30] [--tol 0.02] [--depth-tol 0]
+//                                                  check the ReShade addon's frames against a reference
 //       Needs two fake_games' worth of setup: the ReShade-injected one run with
 //       `--no-npc --no-publish --freeze T`, plus a plain `fake_game --no-npc --freeze T
 //       --ring Local\game_lidar_ref` as reference. Same T, same window size.
+//       --depth-tol: largest per-pixel depth difference that still counts as a match (default 0,
+//       exact). D3D9 against a `--d24` reference needs 6e-8 in reversed modes: one 24-bit step.
 //
 // `ring` needs every frame to carry a pose (fake_game itself, or the addon with a profile).
 // Run the fake game with --no-npc, since the moving NPC isn't in the reference scene.
@@ -88,7 +91,7 @@ int verify_ring(int frames_wanted, float tol) {
 // pixel for pixel. Frames with a pose (the addon's camera sniffer) are unprojected with their own
 // matrices, which must also match the reference's. Pose-less frames borrow the reference's view,
 // so the addon's fallback projection is what gets checked.
-int verify_addon(int frames_wanted, float tol) {
+int verify_addon(int frames_wanted, float tol, float depth_tol) {
     RingReader ref_ring, ring;
     Frame ref, f;
     const ULONGLONG deadline = GetTickCount64() + 15000;
@@ -107,7 +110,7 @@ int verify_addon(int frames_wanted, float tol) {
     std::vector<float> err;
     int frames = 0;
     float max_diff = 0, view_diff = 0;
-    size_t mismatched = 0, compared = 0;
+    size_t differ = 0, mismatched = 0, compared = 0;
     int with_pose = 0;
     while (frames < frames_wanted && GetTickCount64() < deadline) {
         if (!ring.is_open() && !ring.try_open()) {
@@ -128,7 +131,8 @@ int verify_addon(int frames_wanted, float tol) {
         for (size_t i = 0; i < f.depth.size(); ++i) {
             const float d = std::abs(f.depth[i] - ref.depth[i]);
             max_diff = std::max(max_diff, d);
-            mismatched += d != 0;
+            differ += d != 0;
+            mismatched += d > depth_tol;
             ++compared;
         }
         if (f.header.flags & kFlagPoseValid) {
@@ -154,7 +158,9 @@ int verify_addon(int frames_wanted, float tol) {
     }
     float proj_diff = 0;
     for (int i = 0; i < 16; ++i) proj_diff = std::max(proj_diff, std::abs(f.header.proj[i] - ref.header.proj[i]));
-    std::printf("depth vs reference: %zu of %zu pixels differ, max |diff| %.3g\n", mismatched, compared, max_diff);
+    std::printf("depth vs reference: %zu of %zu pixels differ, max |diff| %.3g", differ, compared, max_diff);
+    if (depth_tol > 0) std::printf(", %zu beyond %.3g", mismatched, depth_tol);
+    std::printf("\n");
     std::printf("projection vs reference: max |diff| %.3g\n", proj_diff);
     std::printf("frames with the addon's pose: %d of %d", with_pose, frames);
     if (with_pose > 0) std::printf(", view vs reference: max |diff| %.3g", view_diff);
@@ -191,22 +197,24 @@ int verify_ply(const char* path, float tol) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::printf("usage: lidar_verify ring [--frames N] [--tol m] | ply <file> [--tol m] | addon [--frames N] [--tol m]\n");
+        std::printf("usage: lidar_verify ring [--frames N] [--tol m] | ply <file> [--tol m] |\n"
+                    "                    addon [--frames N] [--tol m] [--depth-tol d]\n");
         return 2;
     }
     const std::string mode = argv[1];
-    float tol = 0.02f;
+    float tol = 0.02f, depth_tol = 0;
     int frames = 30;
     const char* file = nullptr;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--tol" && i + 1 < argc) tol = float(std::atof(argv[++i]));
+        else if (a == "--depth-tol" && i + 1 < argc) depth_tol = float(std::atof(argv[++i]));
         else if (a == "--frames" && i + 1 < argc) frames = std::atoi(argv[++i]);
         else file = argv[i];
     }
     if (mode == "ring") return verify_ring(frames, tol);
     if (mode == "ply" && file) return verify_ply(file, tol);
-    if (mode == "addon") return verify_addon(frames, tol);
+    if (mode == "addon") return verify_addon(frames, tol, depth_tol);
     std::printf("bad arguments\n");
     return 2;
 }
