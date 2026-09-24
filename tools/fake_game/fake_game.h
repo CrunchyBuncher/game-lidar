@@ -1,4 +1,4 @@
-// Shared between the fake game's D3D11 and D3D12 renderers: options, the scene shader and
+// Shared between the fake game's D3D11, D3D12 and D3D9 renderers: options, the scene shader and
 // geometry, and the camera (scripted path or manual).
 #pragma once
 #include <DirectXMath.h>
@@ -12,7 +12,8 @@
 
 namespace lidar::fake {
 
-// Camera cbuffer in b0 (vertex + pixel), per-object decoy in b1. Same source for both APIs.
+// Camera cbuffer in b0 (vertex + pixel), per-object decoy in b1. Same source for D3D11 and D3D12
+// (D3D9 has its own, with the same layout in constant registers).
 inline const char* kSceneHlsl = R"(
 cbuffer Camera : register(b0) {
     row_major float4x4 view;
@@ -62,12 +63,14 @@ struct Vertex {
 };
 
 enum class DepthMode { Standard, Reversed, ReversedInfinite };
-enum class Api { D3D11, D3D12 };
+enum class Api { D3D11, D3D12, D3D9 };
 
 struct Options {
     Api api = Api::D3D11;
     bool cbv_tables = false;   // D3D12: bind the cbuffers through a descriptor table instead of root CBVs
     bool d3d12_debug = false;  // D3D12: enable the debug layer, print its messages, exit 3 on errors
+    bool own_depth = false;    // D3D9: CreateDepthStencilSurface instead of the auto depth-stencil
+    bool d24 = false;          // D3D11: 24-bit depth buffer (a reference for D3D9, whose depth is 24-bit)
     DepthMode depth = DepthMode::Reversed;
     uint32_t capture_width = 480;
     uint32_t capture_every = 1;
@@ -108,5 +111,6 @@ ObjectCB static_object();
 
 int run_d3d11(const Options& opt);
 int run_d3d12(const Options& opt);
+int run_d3d9(const Options& opt);
 
 }  // namespace lidar::fake

@@ -16,12 +16,18 @@ add_library(lidar_common STATIC common/ring.cpp common/app.cpp)
 target_include_directories(lidar_common PUBLIC common)
 target_link_libraries(lidar_common PUBLIC d3d11 dxgi d3dcompiler)
 
-add_executable(fake_game tools/fake_game/main.cpp tools/fake_game/render_d3d11.cpp tools/fake_game/render_d3d12.cpp)
-target_link_libraries(fake_game PRIVATE lidar_common d3d12)
+add_executable(fake_game tools/fake_game/main.cpp tools/fake_game/render_d3d11.cpp tools/fake_game/render_d3d12.cpp
+  tools/fake_game/render_d3d9.cpp)
+target_link_libraries(fake_game PRIVATE lidar_common d3d12 d3d9)
 # Own folder outside build/ so ReShade's dxgi.dll next to it doesn't hook the viewer and
 # survives clean rebuilds. The $<1:> stops VS from appending a per-config subdirectory.
 set_target_properties(fake_game PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY $<1:${CMAKE_SOURCE_DIR}/sandbox/fake_game>)
+# D3D9 needs ReShade as d3d9.dll, in a folder of its own: next to the dxgi.dll copy it would load twice.
+set(FAKE_GAME_D3D9_DIR ${CMAKE_SOURCE_DIR}/sandbox/fake_game_d3d9)
+add_custom_command(TARGET fake_game POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${FAKE_GAME_D3D9_DIR}
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:fake_game> ${FAKE_GAME_D3D9_DIR}/)
 
 add_executable(lidar_viewer viewer/main.cpp)
 target_link_libraries(lidar_viewer PRIVATE lidar_common)
@@ -44,21 +50,23 @@ FetchContent_MakeAvailable(reshade_sdk reshade_imgui)
 add_library(lidar_capture SHARED
   addon/main.cpp addon/backends.cpp addon/depth_tracker.cpp addon/camera_tracker.cpp addon/profile.cpp
   addon/d3d11/capture_d3d11.cpp addon/d3d11/cbuffer_d3d11.cpp
-  addon/d3d12/capture_d3d12.cpp addon/d3d12/cbuffer_d3d12.cpp addon/d3d12/root_layout.cpp)
+  addon/d3d12/capture_d3d12.cpp addon/d3d12/cbuffer_d3d12.cpp addon/d3d12/root_layout.cpp
+  addon/d3d9/capture_d3d9.cpp addon/d3d9/constants_d3d9.cpp)
 target_include_directories(lidar_capture PRIVATE addon ${reshade_sdk_SOURCE_DIR}/include ${reshade_imgui_SOURCE_DIR})
 target_compile_definitions(lidar_capture PRIVATE ImTextureID=ImU64)
 target_link_libraries(lidar_capture PRIVATE lidar_common delayimp)
 # Only load the shader compiler once a capture actually starts, not in every game the addon is in.
 target_link_options(lidar_capture PRIVATE /DELAYLOAD:d3dcompiler_47.dll)
 set_target_properties(lidar_capture PROPERTIES PREFIX "" SUFFIX ".addon64")
-# ReShade loads addons from the game's folder, so drop a copy next to the fake game, along with
-# its profile under the name the addon looks for by default.
-add_custom_command(TARGET lidar_capture POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:lidar_capture> ${CMAKE_SOURCE_DIR}/sandbox/fake_game/
-  COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_SOURCE_DIR}/profiles/fake_game.toml
-          ${CMAKE_SOURCE_DIR}/sandbox/fake_game/lidar_profile.toml
-  COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_SOURCE_DIR}/profiles/fake_game_viewproj.toml
-          ${CMAKE_SOURCE_DIR}/sandbox/fake_game/)
+# ReShade loads addons from the game's folder, so drop a copy next to both fake games, along with
+# the profile under the name the addon looks for by default.
+foreach(dir ${CMAKE_SOURCE_DIR}/sandbox/fake_game ${FAKE_GAME_D3D9_DIR})
+  add_custom_command(TARGET lidar_capture POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${dir}
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:lidar_capture> ${dir}/
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_SOURCE_DIR}/profiles/fake_game.toml ${dir}/lidar_profile.toml
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_SOURCE_DIR}/profiles/fake_game_viewproj.toml ${dir}/)
+endforeach()
 
 enable_testing()
 add_executable(lidar_tests tests/test_main.cpp addon/profile.cpp addon/d3d12/root_layout.cpp)

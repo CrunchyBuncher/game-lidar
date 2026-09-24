@@ -19,7 +19,7 @@ trails from NPCs and other moving objects are acceptable.
 | Camera pose source | **Constant-buffer sniffing inside the same addon** | No second mod needed. Matrices come from the exact frame being rendered, so sync is perfect. |
 | Per-game work | A one-time **discovery** step that finds where the camera matrices live, saved as a game profile | Guided by an in-overlay tool, not manual reverse engineering |
 | First graphics API | **D3D11** | Constant buffers are updated via `Map`/`UpdateSubresource`, and ReShade reports both as events. That's the easiest to sniff. |
-| Later APIs | D3D12 (done, see §3.3), Vulkan. Not D3D9. | On unsupported APIs the addon stays inactive |
+| Later APIs | D3D12 (done, see §3.3), D3D9 (done, see §3.4), Vulkan | On unsupported APIs the addon stays inactive |
 | Unprojection | On the GPU in the viewer | The addon only ships a small depth image and two matrices |
 | Transport | Shared-memory ring buffer (addon → viewer) | Zero-copy, non-blocking, same machine |
 | Viewer | Native C++, D3D11 (compute + indirect draw), no third-party deps | Same API and toolchain as the addon and fake game, and it handles tens of millions of points. Dear ImGui can be added later for UI. |
@@ -122,13 +122,32 @@ the game writes to without map/unmap calls, so there's no event to hook. D3D12 (
   list, applied at submit) and restored after the copy.
 - Root/push constants arrive via `push_constants` and are easy (not implemented yet).
 
-### 3.4 Shared-memory protocol
+### 3.4 D3D9
+D3D9 has neither constant buffers nor readable depth buffers (`addon/d3d9/`):
+- **Camera:** shaders read float constant registers (c#), set with
+  `Set{Vertex,Pixel}ShaderConstantF`, which ReShade reports as `push_constants`. Each stage's
+  register file is shadowed, so at a draw it holds exactly what that draw sees, and profiles
+  address it as one buffer: slot 0, byte offset = register × 16. `size`/`space` don't apply.
+  Registers never set since the device started (or was Reset) don't latch.
+- **Depth:** screen-sized depth-stencils are created as INTZ textures instead (`create_resource`,
+  filtered like `generic_depth`: no MSAA, no small or PCF-shadow-map ones). This also covers the
+  auto depth-stencil, because the addon's handlers register in `init_device`, which ReShade fires
+  before creating it. At present, a ps_3_0 pass point-samples INTZ into a small R32F target with
+  the same mapping as §3.1 (float math, quotient corrected to be exact). After an event query
+  reports it finished, `GetRenderTargetData` + `LockRect` read it back. The game's state is saved
+  in a state block (plus render targets, depth-stencil, viewport) and restored.
+- **Reset:** D3DPOOL_DEFAULT resources must be gone before `Reset`. ReShade destroys the command
+  queue first, and that is when the capture drops its targets; they're recreated at the next
+  capture.
+- Depth is 24-bit (INTZ), so D3D9 is checked against a D3D11 reference with a D24 buffer.
+
+### 3.5 Shared-memory protocol
 `Local\game_lidar_frames`: a versioned header plus N slots. Each slot holds: frame#,
 timestamp, depth w/h/format, `view` (4×4), `proj` (4×4), flags (paused, pose-valid, …),
 depth data, and optional color. Writes never block: if the viewer falls behind, older
 slots are overwritten.
 
-### 3.5 Viewer (C++)
+### 3.6 Viewer (C++)
 - A compute shader linearizes depth using `proj`, unprojects with `proj⁻¹`, transforms
   by `view⁻¹`, and appends into a GPU point pool.
 - **Dedup:** a GPU voxel hash (default 5 cm cells) inserts a point only if its cell is
@@ -145,7 +164,7 @@ slots are overwritten.
   lighting. The live player frustum and trail are drawn on top.
 - **Controls:** free-fly, follow-player, clear, save `.ply`.
 
-### 3.6 Game profile (`profiles/<game>.toml`)
+### 3.7 Game profile (`profiles/<game>.toml`)
 ```toml
 [depth]
 buffer_hint   = "auto"          # or resolution / index override

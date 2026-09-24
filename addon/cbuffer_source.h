@@ -63,9 +63,9 @@ public:
 // The implementation for `dev`'s API, or nullptr if the API isn't supported yet.
 std::unique_ptr<CbufferSource> create_cbuffer_source(reshade::api::device* dev);
 
-// Registers the event handlers of every backend. Backends only act on devices of their own API.
-void register_source_events();
-void unregister_source_events();
+// Registers the event handlers of `api`'s backend (once per API: registering events can change
+// how ReShade hooks an API, so nothing is registered for one the game doesn't use).
+void register_source_events(reshade::api::device_api api);
 void init_source_device(reshade::api::device* dev);  // for a device created before registration
 
 }  // namespace lidar::cam

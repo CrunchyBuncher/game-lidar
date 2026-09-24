@@ -72,7 +72,7 @@ struct Targets {
     static constexpr int kStaging = 3;
     ComPtr<ID3D11Texture2D> stage_depth[kStaging], stage_color[kStaging];
 
-    void create(ID3D11Device* dev, int w, int h, uint32_t capture_width) {
+    void create(ID3D11Device* dev, int w, int h, uint32_t capture_width, bool d24) {
         D3D11_TEXTURE2D_DESC d{};
         d.Width = w;
         d.Height = h;
@@ -84,12 +84,14 @@ struct Targets {
         check(dev->CreateRenderTargetView(color.Get(), nullptr, &color_rtv), "color rtv");
         check(dev->CreateShaderResourceView(color.Get(), nullptr, &color_srv), "color srv");
 
-        d.Format = DXGI_FORMAT_R32_TYPELESS;
+        d.Format = d24 ? DXGI_FORMAT_R24G8_TYPELESS : DXGI_FORMAT_R32_TYPELESS;
         d.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
         check(dev->CreateTexture2D(&d, nullptr, &depth), "depth");
-        D3D11_DEPTH_STENCIL_VIEW_DESC dsv{DXGI_FORMAT_D32_FLOAT, D3D11_DSV_DIMENSION_TEXTURE2D};
+        D3D11_DEPTH_STENCIL_VIEW_DESC dsv{d24 ? DXGI_FORMAT_D24_UNORM_S8_UINT : DXGI_FORMAT_D32_FLOAT,
+                                          D3D11_DSV_DIMENSION_TEXTURE2D};
         check(dev->CreateDepthStencilView(depth.Get(), &dsv, &depth_dsv), "dsv");
-        D3D11_SHADER_RESOURCE_VIEW_DESC srv{DXGI_FORMAT_R32_FLOAT, D3D11_SRV_DIMENSION_TEXTURE2D};
+        D3D11_SHADER_RESOURCE_VIEW_DESC srv{d24 ? DXGI_FORMAT_R24_UNORM_X8_TYPELESS : DXGI_FORMAT_R32_FLOAT,
+                                            D3D11_SRV_DIMENSION_TEXTURE2D};
         srv.Texture2D.MipLevels = 1;
         check(dev->CreateShaderResourceView(depth.Get(), &srv, &depth_srv), "depth srv");
 
@@ -186,7 +188,7 @@ int run_d3d11(const Options& opt) {
     auto dims_cb = make_cbuffer<DimsCB>(dev);
 
     Targets tg;
-    tg.create(dev, app.width, app.height, opt.capture_width);
+    tg.create(dev, app.width, app.height, opt.capture_width, opt.d24);
     std::deque<PendingCapture> pending;
     int next_stage = 0;
 
@@ -202,7 +204,7 @@ int run_d3d11(const Options& opt) {
         if (app.resized) {
             pending.clear();  // staging textures are about to be replaced
             tg = Targets{};
-            tg.create(dev, app.width, app.height, opt.capture_width);
+            tg.create(dev, app.width, app.height, opt.capture_width, opt.d24);
         }
         QueryPerformanceCounter(&now);
         const double t = double(now.QuadPart - t0.QuadPart) / double(qpf.QuadPart);
@@ -314,8 +316,8 @@ int run_d3d11(const Options& opt) {
             title_timer = 0;
             const wchar_t* modes[] = {L"standard", L"reversed", L"reversed-infinite"};
             wchar_t buf[256];
-            swprintf(buf, 256, L"fake_game D3D11  [%s]  depth=%s  capture %ux%u  published=%llu skipped=%llu%s",
-                     rig.manual ? L"manual" : L"auto", modes[int(opt.depth)], tg.cap_w, tg.cap_h, published, skipped,
+            swprintf(buf, 256, L"fake_game D3D11%s  [%s]  depth=%s  capture %ux%u  published=%llu skipped=%llu%s",
+                     opt.d24 ? L" (D24)" : L"", rig.manual ? L"manual" : L"auto", modes[int(opt.depth)], tg.cap_w, tg.cap_h, published, skipped,
                      paused ? L"  PAUSED" : L"");
             app.set_title(buf);
         }

@@ -1,4 +1,4 @@
-// Game profiles (profiles/<game>.toml, see spec.md §3.6) and turning the latched cbuffer bytes
+// Game profiles (profiles/<game>.toml, see spec.md §3.7) and turning the latched cbuffer bytes
 // into the protocol's matrices (row-major, row-vector: p_clip = p_world * view * proj).
 #pragma once
 #include <cstdint>

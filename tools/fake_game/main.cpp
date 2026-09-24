@@ -7,8 +7,11 @@
 // D3D12 (--api d3d12): render only (implies --no-publish). The cbuffers live in a persistently
 // mapped upload heap with a region per frame in flight, bound as root CBVs, or through a
 // descriptor table with --cbv-tables.
+// D3D9 (--api d3d9): render only. The camera sits in vertex shader constant registers c0-c12
+// (same bytes as b0), the decoy in c13-c17. --own-depth uses a CreateDepthStencilSurface depth
+// buffer instead of the device's auto depth-stencil.
 //
-// Usage: fake_game [--api d3d11|d3d12] [--cbv-tables] [--d3d12-debug]
+// Usage: fake_game [--api d3d11|d3d12|d3d9] [--cbv-tables] [--d3d12-debug] [--own-depth] [--d24]
 //                  [--depth standard|reversed|reversed-infinite] [--capture-width 480]
 //                  [--capture-every 1] [--fov 70] [--no-npc] [--no-color]
 //                  [--size 1280x720] [--duration seconds] [--no-publish]
@@ -17,6 +20,7 @@
 //        --ring: publish to another mapping (e.g. a reference for `lidar_verify addon`).
 //        --freeze: hold the scripted camera at path time T seconds.
 //        --d3d12-debug: D3D12 debug layer on; its warnings/errors go to stderr (exit code 3 on errors).
+//        --d24: D3D11 with a D24S8 depth buffer instead of D32F, the reference for D3D9's 24-bit depth.
 // Keys:  M toggle manual camera (WASD/QE + right-drag), Space pause capture, Esc quit.
 #include "fake_game.h"
 
@@ -61,11 +65,15 @@ Options parse(int argc, char** argv) {
         auto next = [&]() -> const char* { return i + 1 < argc ? argv[++i] : ""; };
         if (a == "--api") {
             const std::string api = next();
-            o.api = api == "d3d12" ? Api::D3D12 : Api::D3D11;
+            o.api = api == "d3d12" ? Api::D3D12 : api == "d3d9" ? Api::D3D9 : Api::D3D11;
         } else if (a == "--cbv-tables") {
             o.cbv_tables = true;
         } else if (a == "--d3d12-debug") {
             o.d3d12_debug = true;
+        } else if (a == "--own-depth") {
+            o.own_depth = true;
+        } else if (a == "--d24") {
+            o.d24 = true;
         } else if (a == "--depth") {
             std::string d = next();
             o.depth = d == "standard" ? DepthMode::Standard
@@ -177,11 +185,14 @@ ObjectCB npc_object(double t) {
 int main(int argc, char** argv) {
     using namespace lidar::fake;
     Options opt = parse(argc, argv);
-    if (opt.api == Api::D3D12) {
-        if (opt.publish) std::fprintf(stderr, "D3D12 renders only: --no-publish implied\n");
+    if (opt.cbv_tables && opt.api != Api::D3D12) std::fprintf(stderr, "--cbv-tables only applies to --api d3d12\n");
+    if (opt.own_depth && opt.api != Api::D3D9) std::fprintf(stderr, "--own-depth only applies to --api d3d9\n");
+    if (opt.d24 && opt.api != Api::D3D11) std::fprintf(stderr, "--d24 only applies to --api d3d11\n");
+    if (opt.api != Api::D3D11 && opt.publish) {
+        std::fprintf(stderr, "%s renders only: --no-publish implied\n", opt.api == Api::D3D12 ? "D3D12" : "D3D9");
         opt.publish = false;
-        return run_d3d12(opt);
     }
-    if (opt.cbv_tables) std::fprintf(stderr, "--cbv-tables only applies to --api d3d12\n");
+    if (opt.api == Api::D3D12) return run_d3d12(opt);
+    if (opt.api == Api::D3D9) return run_d3d9(opt);
     return run_d3d11(opt);
 }

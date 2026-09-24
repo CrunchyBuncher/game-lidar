@@ -127,12 +127,30 @@ Test first on the **fake game with ReShade injected**, then on the real game.
     ReShade maps to states. D24S8/D32S8 depth copies are untested on D3D12. Descriptor
     shadows grow to the highest index written. Measure the cost of the descriptor events on
     a real D3D12 game.
-- [x] Unsupported APIs are harmless (2026-09-24): until a D3D11/D3D12 device appears, the addon
+- [x] Unsupported APIs are harmless (2026-09-24): until a D3D9/D3D11/D3D12 device appears, the addon
       registers only `init_device` (registering events changes how ReShade hooks D3D9), logs
       "Inactive" and does nothing else. `d3dcompiler_47.dll` is delay-loaded. Checked once with
       a throwaway D3D9 test (renders identically with and without the addon, "Inactive" logged).
       Found via A Hat in Time, whose "DX12" mode is D3D9On12.
-- D3D9: not supported, by decision (2026-09-24).
+- [x] **D3D9** (2026-09-24). Reverses the earlier "not D3D9" decision: many older games are D3D9.
+  - `fake_game --api d3d9`: same scene, camera and depth modes, render only. Camera in VS
+    constants c0-c12 (same bytes as b0, so the same profile works), decoy c13-c17 per draw.
+    Auto depth-stencil, or `--own-depth`. The half-pixel offset is corrected in the VS. Runs from
+    `sandbox/fake_game_d3d9/` with ReShade as `d3d9.dll`.
+  - `d3d9::` constants source: shadows the VS/PS float register files from `push_constants`.
+  - `D3D9Capture`: INTZ replacement at `create_resource`, ps_3_0 downsample, event query +
+    GetRenderTargetData readback, state block save/restore, targets dropped before Reset.
+  - Backends now register per API, so a D3D9 game doesn't get D3D11's map hooks (and vice versa).
+  - **Result:** `lidar_verify ring --frames 60` passes in all 3 depth modes, with the auto and own
+    depth-stencil (standard max 0.3 mm, reversed 0.1 mm, same as D3D11); the viewproj profile
+    passes too (max 1 mm). `lidar_verify addon` against an un-injected D3D11 `--d24` reference:
+    view and proj match exactly, and depth is bit-identical in standard mode. In reversed modes ~5%
+    of pixels are one 24-bit step apart (rasterizer rounding), within `--depth-tol 6e-8`. Three
+    window resizes (Resets) in a row keep capturing, and the game's Reset never fails.
+  - Known limits: MSAA depth can't be INTZ (error in the overlay). Fixed-function games
+    (`SetTransform`) have no shader constants. Depth buffers created before the addon loaded
+    stay unreadable. Not yet measured: the addon's CPU cost on a real D3D9 game
+    (GetRenderTargetData may sync), and D3D9On12 / D3D9Ex.
 - [ ] Vulkan: same shape as D3D12 (host-visible memory, descriptor sets, pipeline layouts).
 
 ## M6 — Scale & extras (as needed)

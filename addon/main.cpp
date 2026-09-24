@@ -14,6 +14,7 @@
 #include <DirectXMath.h>
 #include <windows.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -197,17 +198,23 @@ void register_active_handlers();  // below, next to the handlers it registers
 // Until a supported device shows up, the addon's only handler is init_device. Registering an
 // event can change how ReShade hooks the game (on D3D9, map events wrap every buffer Lock), so on
 // an API we don't support the addon must not register anything else: the game has to run exactly
-// as it does without the addon. On the first supported device, everything registers. That device
-// was created before the modules' handlers existed, so it's set up by hand.
+// as it does without the addon. On the first supported device, the shared modules register, plus
+// that API's backend (only it: D3D11's map events would cost a D3D9 game for nothing). That device
+// was created before the modules' handlers existed, so it's set up by hand. On D3D9 this runs
+// before the device's auto depth-stencil is created, so the backend can still make it readable.
 void attach_modules(device* dev) {
     static bool registered = false;
     if (!registered) {
         depth::register_events();
         cam::register_events();
-        cam::register_source_events();
-        register_capture_events();
         register_active_handlers();
         registered = true;
+    }
+    static std::vector<device_api> backends;
+    if (std::find(backends.begin(), backends.end(), dev->get_api()) == backends.end()) {
+        cam::register_source_events(dev->get_api());
+        register_capture_events(dev->get_api());
+        backends.push_back(dev->get_api());
     }
     depth::init_device(dev);
     cam::init_device(dev);
@@ -221,7 +228,7 @@ void on_init_device(device* dev) {
         static bool logged = false;
         if (!logged) {
             const std::string msg = std::string("Inactive: the game created a ") + api_name(dev->get_api()) +
-                                    " device, which isn't supported (D3D11 and D3D12 are). Nothing else is hooked.";
+                                    " device, which isn't supported (D3D9, D3D11 and D3D12 are). Nothing else is hooked.";
             reshade::log::message(reshade::log::level::warning, msg.c_str());
             logged = true;
         }
@@ -312,6 +319,8 @@ const char* format_name(format f) {
         case format::r32_typeless: return "R32 typeless";
         case format::d32_float_s8_uint: return "D32FS8";
         case format::r32_g8_typeless: return "R32G8 typeless";
+        case format::d24_unorm_x8_uint: return "D24X8";
+        case format::intz: return "INTZ";
         default: return "other";
     }
 }
@@ -347,18 +356,30 @@ bool draw_camera_section() {
     }
 
     const CameraProfile& c = g_profile.camera;
-    ImGui::TextDisabled("%s b%u%s%s, %s at %u / %u, %s-major, %s-handed, %s latch", stage_name(c.key.stage), c.key.slot,
-                        c.key.space ? (" space" + std::to_string(c.key.space)).c_str() : "",
-                        c.key.size ? (" (" + std::to_string(c.key.size) + " bytes)").c_str() : "",
-                        layout_name(c.layout), c.view_offset, c.proj_offset, c.column_major ? "column" : "row",
-                        c.right_handed ? "right" : "left", c.latch_last ? "last" : "first");
-    if (g_source) ImGui::TextDisabled("Tracking %zu constant buffers", g_source->tracked_buffers());
+    const bool d3d9 = g_device->get_api() == device_api::d3d9;
+    if (d3d9)  // one register file per stage, no buffers: offsets are registers (16 bytes each)
+        ImGui::TextDisabled("%s constants, %s at c%u%s / c%u%s, %s-major, %s-handed, %s latch", stage_name(c.key.stage),
+                            layout_name(c.layout), c.view_offset / 16, c.view_offset % 16 ? " (unaligned)" : "",
+                            c.proj_offset / 16, c.proj_offset % 16 ? " (unaligned)" : "",
+                            c.column_major ? "column" : "row", c.right_handed ? "right" : "left",
+                            c.latch_last ? "last" : "first");
+    else
+        ImGui::TextDisabled("%s b%u%s%s, %s at %u / %u, %s-major, %s-handed, %s latch", stage_name(c.key.stage),
+                            c.key.slot, c.key.space ? (" space" + std::to_string(c.key.space)).c_str() : "",
+                            c.key.size ? (" (" + std::to_string(c.key.size) + " bytes)").c_str() : "",
+                            layout_name(c.layout), c.view_offset, c.proj_offset, c.column_major ? "column" : "row",
+                            c.right_handed ? "right" : "left", c.latch_last ? "last" : "first");
+    if (g_source)
+        ImGui::TextDisabled(d3d9 ? "Tracking %zu constant registers" : "Tracking %zu constant buffers",
+                            g_source->tracked_buffers());
 
     switch (g_camera.state) {
         case CameraStatus::NoProfile: break;
         case CameraStatus::NoLatch:
             ImGui::TextColored(ImVec4(1, 0.8f, 0.2f, 1),
-                               "No latch: no draw into the captured depth buffer had that cbuffer bound.");
+                               d3d9 ? "No latch: those registers were never set before a draw into the captured depth "
+                                      "buffer (or slot isn't 0)."
+                                    : "No latch: no draw into the captured depth buffer had that cbuffer bound.");
             break;
         case CameraStatus::Rejected:
             ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1), "Latched, but rejected: %s", g_camera.why.c_str());
