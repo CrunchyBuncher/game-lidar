@@ -188,7 +188,8 @@ constexpr shader_stage kStages[] = {shader_stage::vertex, shader_stage::pixel,  
 
 bool read_camera(const Table& t, CameraProfile& c, std::string& error) {
     static const char* const kKeys[] = {"stage",  "slot",        "space",       "size",  "layout",
-                                        "view_offset", "proj_offset", "major", "handed", "latch"};
+                                        "view_offset", "proj_offset", "major", "handed", "latch",
+                                        "units_per_meter"};
     for (const auto& [key, v] : t)
         if (std::none_of(std::begin(kKeys), std::end(kKeys), [&](const char* k) { return key == k; }))
             return error = "line " + std::to_string(v.line) + ": unknown key '" + key + "' in [camera]", false;
@@ -218,6 +219,11 @@ bool read_camera(const Table& t, CameraProfile& c, std::string& error) {
     c.column_major = major == 1;
     c.right_handed = handed == 1;
     c.latch = Latch(latch);
+    if (const Value* v = r.find("units_per_meter", false)) {
+        const double u = v->type == Value::Float ? v->f : v->type == Value::Int ? double(v->i) : 0;
+        if (!(u > 0 && u < 1e6)) return error = r.where(*v) + "units_per_meter must be a positive number", false;
+        c.units_per_meter = float(u);
+    }
     if (c.view_offset % 4 != 0 || c.proj_offset % 4 != 0) return error = "offsets must be multiples of 4 bytes", false;
     if (!c.single_matrix()) {
         const uint32_t lo = std::min(c.view_offset, c.proj_offset), hi = std::max(c.view_offset, c.proj_offset);
@@ -306,6 +312,11 @@ std::string format_profile(const CameraProfile& c, std::string_view comment) {
     line("major", quoted(c.column_major ? "column" : "row"));
     line("handed", quoted(c.right_handed ? "right" : "left"));
     line("latch", quoted(latch_name(c.latch)));
+    if (c.units_per_meter != 1) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%.9g", double(c.units_per_meter));
+        line("units_per_meter", buf);
+    }
     return s;
 }
 
@@ -424,6 +435,26 @@ ProjectionInfo analyze_projection(const float p[16]) {
     info.aspect = std::abs(p[5] / p[0]);
     info.valid = true;
     return info;
+}
+
+void normalize_pose(float view[16], float proj[16], bool right_handed, float units_per_meter) {
+    // Handedness, with F = diag(1, 1, -1, 1): view' = F * view * F, proj' = F * proj. Points come out
+    // as p * F (z negated) in the world and in view space alike, so the depth still unprojects.
+    if (right_handed) {
+        for (int i = 0; i < 4; ++i) {
+            view[2 * 4 + i] = -view[2 * 4 + i];  // row 2
+            view[i * 4 + 2] = -view[i * 4 + 2];  // column 2 (view[10] flips back)
+            proj[2 * 4 + i] = -proj[2 * 4 + i];
+        }
+    }
+    // Units, with S = diag(k, k, k, 1), k = 1 / units_per_meter: view' = S^-1 * view * S scales the
+    // translation only; proj' = S^-1 * proj * k (the same projection: clip space is homogeneous)
+    // scales its last row only, so w stays z (analyze_projection's near/far come out in meters).
+    if (units_per_meter != 1) {
+        const float k = 1 / units_per_meter;
+        for (int i = 0; i < 3; ++i) view[12 + i] *= k;
+        for (int i = 12; i < 16; ++i) proj[i] *= k;
+    }
 }
 
 }  // namespace lidar

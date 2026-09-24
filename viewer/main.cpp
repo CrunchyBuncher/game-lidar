@@ -9,7 +9,8 @@
 //                     [--size 1600x900] [--out file.ply] [--save-after s] [--exit-after s]
 // Keys:  right-drag look, WASD move, Q/E down/up, Shift fast, wheel speed,
 //        F follow player, H color mode, T trail, X carving, +/- point size,
-//        C clear, P save .ply, Space pause ingest, Esc quit.
+//        C clear, P save .ply, Space pause ingest, F1 settings panel, Esc quit.
+// The settings panel changes voxel size, capacity, range, carving and colors while it runs.
 #include <DirectXMath.h>
 
 #include <algorithm>
@@ -22,13 +23,49 @@
 #include <vector>
 
 #include "app.h"
+#include "imgui.h"
+#include "imgui_impl_dx11.h"
+#include "imgui_impl_win32.h"
 #include "ring.h"
 #include "shaders.h"
+
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 
 using namespace DirectX;
 using namespace lidar;
 
 namespace {
+
+// Feeds the settings panel; keeps what it's using (typing, clicks, the wheel) from the viewer's
+// own controls. Key and button releases always go through so nothing sticks.
+bool ui_message(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, LRESULT& result) {
+    if ((result = ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp)) != 0) return true;
+    const ImGuiIO& io = ImGui::GetIO();
+    switch (msg) {
+        case WM_KEYDOWN:
+        case WM_SYSKEYDOWN:
+        case WM_CHAR: return io.WantCaptureKeyboard;
+        case WM_LBUTTONDOWN:
+        case WM_RBUTTONDOWN:
+        case WM_MOUSEWHEEL: return io.WantCaptureMouse;
+    }
+    return false;
+}
+
+// Hash table slots for a pool: at least twice the points, so probing stays short.
+uint32_t table_bits_for(uint32_t capacity) {
+    uint32_t bits = 16;
+    while (bits < 28 && (1ull << bits) < 2ull * capacity) ++bits;
+    return bits;
+}
+
+// Inverse of the shaders' height_key().
+float height_from_key(uint32_t key) {
+    const uint32_t u = (key & 0x80000000u) ? (key & 0x7FFFFFFFu) : ~key;
+    float f;
+    std::memcpy(&f, &u, sizeof(f));
+    return f;
+}
 
 struct Options {
     float voxel = 0.05f;
@@ -120,7 +157,8 @@ struct PointCloud {
     ComPtr<ID3D11UnorderedAccessView> counter_uav, table_uav, points_uav, free_list_uav, args_uav;
     ComPtr<ID3D11ShaderResourceView> points_srv;
 
-    void create(ID3D11Device* dev, uint32_t cap, uint32_t table_bits) {
+    // False if the GPU can't allocate it (e.g. a capacity set too high in the UI).
+    bool create(ID3D11Device* dev, uint32_t cap, uint32_t table_bits) {
         capacity = cap;
         table_size = 1u << table_bits;
 
@@ -128,38 +166,39 @@ struct PointCloud {
         d.ByteWidth = 16;
         d.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
         d.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
-        check(dev->CreateBuffer(&d, nullptr, &counter), "counter");
+        if (FAILED(dev->CreateBuffer(&d, nullptr, &counter))) return false;
         D3D11_UNORDERED_ACCESS_VIEW_DESC u{DXGI_FORMAT_R32_TYPELESS, D3D11_UAV_DIMENSION_BUFFER};
         u.Buffer.NumElements = 4;
         u.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
-        check(dev->CreateUnorderedAccessView(counter.Get(), &u, &counter_uav), "counter uav");
+        if (FAILED(dev->CreateUnorderedAccessView(counter.Get(), &u, &counter_uav))) return false;
 
         d.ByteWidth = table_size * 4;
         d.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
         d.StructureByteStride = 4;
-        check(dev->CreateBuffer(&d, nullptr, &table), "hash table");
-        check(dev->CreateUnorderedAccessView(table.Get(), nullptr, &table_uav), "table uav");
+        if (FAILED(dev->CreateBuffer(&d, nullptr, &table))) return false;
+        if (FAILED(dev->CreateUnorderedAccessView(table.Get(), nullptr, &table_uav))) return false;
 
         d.ByteWidth = capacity * 4;
-        check(dev->CreateBuffer(&d, nullptr, &free_list), "free list");
-        check(dev->CreateUnorderedAccessView(free_list.Get(), nullptr, &free_list_uav), "free list uav");
+        if (FAILED(dev->CreateBuffer(&d, nullptr, &free_list))) return false;
+        if (FAILED(dev->CreateUnorderedAccessView(free_list.Get(), nullptr, &free_list_uav))) return false;
 
         d.ByteWidth = capacity * sizeof(PointData);
         d.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
         d.StructureByteStride = sizeof(PointData);
-        check(dev->CreateBuffer(&d, nullptr, &points), "points");
-        check(dev->CreateUnorderedAccessView(points.Get(), nullptr, &points_uav), "points uav");
-        check(dev->CreateShaderResourceView(points.Get(), nullptr, &points_srv), "points srv");
+        if (FAILED(dev->CreateBuffer(&d, nullptr, &points))) return false;
+        if (FAILED(dev->CreateUnorderedAccessView(points.Get(), nullptr, &points_uav))) return false;
+        if (FAILED(dev->CreateShaderResourceView(points.Get(), nullptr, &points_srv))) return false;
 
         // [0..3] DrawInstancedIndirect, [4..6] DispatchIndirect (carving).
         d = {};
         d.ByteWidth = 32;
         d.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
         d.MiscFlags = D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS;
-        check(dev->CreateBuffer(&d, nullptr, &args), "args");
+        if (FAILED(dev->CreateBuffer(&d, nullptr, &args))) return false;
         u = {DXGI_FORMAT_R32_UINT, D3D11_UAV_DIMENSION_BUFFER};
         u.Buffer.NumElements = 8;
-        check(dev->CreateUnorderedAccessView(args.Get(), &u, &args_uav), "args uav");
+        if (FAILED(dev->CreateUnorderedAccessView(args.Get(), &u, &args_uav))) return false;
+        return true;
     }
 
     void clear(ID3D11DeviceContext* ctx) {
@@ -233,11 +272,24 @@ std::string default_scan_path() {
 }  // namespace
 
 int main(int argc, char** argv) {
-    const Options opt = parse(argc, argv);
+    Options opt = parse(argc, argv);  // the panel edits it live
     App app;
     if (!app.create(L"lidar_viewer", opt.width, opt.height)) return 1;
     ID3D11Device* dev = app.dev.Get();
     ID3D11DeviceContext* ctx = app.ctx.Get();
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui::GetIO().IniFilename = nullptr;  // nothing to remember between runs
+    ImGui::StyleColorsDark();
+    {
+        const float dpi = ImGui_ImplWin32_GetDpiScaleForHwnd(app.hwnd);
+        ImGui::GetStyle().ScaleAllSizes(dpi);
+        ImGui::GetStyle().FontScaleDpi = dpi;
+    }
+    ImGui_ImplWin32_Init(app.hwnd);
+    ImGui_ImplDX11_Init(dev, ctx);
+    app.message_hook = ui_message;
 
     // Shaders.
     auto carve_blob = compile_shader(shaders::kCompute, "cs_carve", "cs_5_0");
@@ -290,7 +342,10 @@ int main(int argc, char** argv) {
     }
 
     PointCloud cloud;
-    cloud.create(dev, opt.capacity, opt.table_bits);
+    if (!cloud.create(dev, opt.capacity, opt.table_bits)) {
+        std::fprintf(stderr, "can't allocate a %u-point pool: try a smaller --capacity-m\n", opt.capacity);
+        return 1;
+    }
     cloud.clear(ctx);
 
     auto frame_cb = make_cbuffer<FrameCB>(dev);
@@ -371,8 +426,10 @@ int main(int argc, char** argv) {
         D3D11_BUFFER_DESC d{16, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ};
         check(dev->CreateBuffer(&d, nullptr, &s), "stat staging");
     }
-    int stat_frame = 0;
+    int stat_frame = 0, stat_fresh_from = 0;   // copies made before stat_fresh_from predate a clear
     uint32_t point_count = 0, free_count = 0;  // slots ever allocated, slots freed by carving
+    float cloud_low = 0, cloud_high = 0;       // the cloud's height extremes (valid if have_bounds)
+    bool have_bounds = false;
 
     RingReader ring;
     Frame frame;
@@ -386,6 +443,41 @@ int main(int argc, char** argv) {
     float point_size = 2.0f;
     uint32_t color_mode = 0;
     bool follow = false, show_trail = true, paused = false, saved = false, carve = opt.carve;
+    // Settings panel (F1). Voxel size and capacity only apply with the button: both rebuild the pool.
+    bool show_ui = true, auto_height = true;
+    float ui_voxel = opt.voxel, ui_capacity_m = float(opt.capacity) / float(1 << 20);
+    std::string pool_message;
+
+    auto clear_cloud = [&]() {
+        cloud.clear(ctx);
+        update_args();
+        trail.clear();
+        point_count = free_count = 0;
+        have_bounds = false;
+        stat_fresh_from = stat_frame + kStatStages;
+    };
+    // Rebuilds the pool with the panel's voxel size and capacity. If the GPU can't allocate that
+    // much, the old size comes back.
+    auto apply_pool = [&]() {
+        const uint32_t old_capacity = cloud.capacity, old_bits = table_bits_for(old_capacity);
+        const uint32_t capacity = uint32_t(double(ui_capacity_m) * (1 << 20));
+        cloud = PointCloud();
+        ctx->Flush();
+        if (cloud.create(dev, capacity, table_bits_for(capacity))) {
+            pool_message.clear();
+        } else {
+            cloud = PointCloud();
+            pool_message = "Couldn't allocate " + std::to_string(int(ui_capacity_m)) + "M points: kept the old size.";
+            if (!cloud.create(dev, old_capacity, old_bits)) check(E_OUTOFMEMORY, "recreating the point pool");
+            ui_capacity_m = float(old_capacity) / float(1 << 20);
+        }
+        opt.voxel = ui_voxel;
+        opt.capacity = cloud.capacity;
+        FrameCB cb{};  // cs_args reads the capacity from it
+        cb.capacity = cloud.capacity;
+        upload(ctx, frame_cb.Get(), cb);
+        clear_cloud();
+    };
 
     LARGE_INTEGER qpf, t0, now;
     QueryPerformanceFrequency(&qpf);
@@ -402,7 +494,12 @@ int main(int argc, char** argv) {
         const float dt = float(std::min(t - last, 0.1));
         last = t;
 
+        ImGui_ImplDX11_NewFrame();
+        ImGui_ImplWin32_NewFrame();
+        ImGui::NewFrame();
+
         // Input.
+        if (app.key_pressed(VK_F1)) show_ui = !show_ui;
         if (app.key_pressed('F')) follow = !follow;
         if (app.key_pressed('H')) color_mode ^= 1;
         if (app.key_pressed('T')) show_trail = !show_trail;
@@ -411,11 +508,7 @@ int main(int argc, char** argv) {
         if (app.key_pressed(VK_OEM_PLUS) || app.key_pressed(VK_ADD)) point_size = std::min(point_size + 1, 16.0f);
         if (app.key_pressed(VK_OEM_MINUS) || app.key_pressed(VK_SUBTRACT))
             point_size = std::max(point_size - 1, 1.0f);
-        if (app.key_pressed('C')) {
-            cloud.clear(ctx);
-            update_args();
-            trail.clear();
-        }
+        if (app.key_pressed('C')) clear_cloud();
         if (app.key_pressed('P')) save_ply(dev, ctx, cloud, opt.out.empty() ? default_scan_path() : opt.out);
         if (opt.save_after > 0 && !saved && t > opt.save_after) {
             save_ply(dev, ctx, cloud, opt.out.empty() ? default_scan_path() : opt.out);
@@ -495,17 +588,106 @@ int main(int argc, char** argv) {
 
         // Stats readback (a couple of frames late, never stalls).
         ctx->CopyResource(stat_stage[stat_frame % kStatStages].Get(), cloud.counter.Get());
-        if (stat_frame >= kStatStages - 1) {
+        if (stat_frame >= kStatStages - 1 && stat_frame >= stat_fresh_from) {
             D3D11_MAPPED_SUBRESOURCE m;
             ID3D11Buffer* s = stat_stage[(stat_frame + 1) % kStatStages].Get();
             if (ctx->Map(s, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m) == S_OK) {
                 const uint32_t* c = static_cast<const uint32_t*>(m.pData);
                 point_count = c[0];
                 free_count = c[1];
+                have_bounds = c[3] != 0;
+                if (have_bounds) {
+                    cloud_low = height_from_key(~c[2]);
+                    cloud_high = height_from_key(c[3]);
+                }
                 ctx->Unmap(s, 0);
             }
         }
         ++stat_frame;
+
+        // Settings panel.
+        const uint32_t used = std::min(point_count, cloud.capacity);
+        const uint32_t live = used - std::min(free_count, used);
+        const bool full = point_count >= cloud.capacity && free_count == 0;
+        if (show_ui) {
+            ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
+            ImGui::Begin("lidar_viewer (F1 hides)", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+            ImGui::Text("%s, %llu frames (%llu dropped)", ring.is_open() ? "Connected" : "Waiting for the game",
+                        (unsigned long long)ingested, (unsigned long long)ring.dropped());
+            char overlay[64];
+            std::snprintf(overlay, sizeof(overlay), "%.2fM / %.1fM points%s", live / 1e6, cloud.capacity / 1e6,
+                          full ? " (FULL)" : "");
+            ImGui::ProgressBar(float(used) / float(cloud.capacity), ImVec2(-FLT_MIN, 0), overlay);
+            if (ImGui::Button("Clear points (C)")) clear_cloud();
+            ImGui::SameLine();
+            if (ImGui::Button("Save .ply (P)")) save_ply(dev, ctx, cloud, opt.out.empty() ? default_scan_path() : opt.out);
+            ImGui::SameLine();
+            ImGui::Checkbox("Pause (Space)", &paused);
+
+            ImGui::SeparatorText("Point pool");
+            ImGui::SetNextItemWidth(160);
+            ImGui::InputFloat("Voxel size (m)", &ui_voxel, 0.01f, 0.1f, "%.3f");
+            ui_voxel = std::clamp(ui_voxel, 0.001f, 100.0f);
+            ImGui::SetNextItemWidth(160);
+            ImGui::InputFloat("Capacity (M points)", &ui_capacity_m, 4, 16, "%.0f");
+            ui_capacity_m = std::clamp(std::round(ui_capacity_m), 1.0f, 128.0f);
+            const uint32_t ui_capacity = uint32_t(double(ui_capacity_m) * (1 << 20));
+            ImGui::TextDisabled("%.0f MB of GPU memory",
+                                (double(ui_capacity) * (sizeof(PointData) + 4) +
+                                 double(1ull << table_bits_for(ui_capacity)) * 4) / (1 << 20));
+            const bool pool_changed = ui_voxel != opt.voxel || ui_capacity != cloud.capacity;
+            ImGui::BeginDisabled(!pool_changed);
+            if (ImGui::Button("Apply (clears points)")) apply_pool();
+            ImGui::SameLine();
+            if (ImGui::Button("Revert")) {
+                ui_voxel = opt.voxel;
+                ui_capacity_m = float(cloud.capacity) / float(1 << 20);
+            }
+            ImGui::EndDisabled();
+            if (!pool_message.empty()) ImGui::TextColored(ImVec4(1, 0.4f, 0.3f, 1), "%s", pool_message.c_str());
+
+            ImGui::SeparatorText("Capture");
+            ImGui::SetNextItemWidth(160);
+            ImGui::SliderFloat("Max range (m)", &opt.max_range, 10, 20000, "%.0f", ImGuiSliderFlags_Logarithmic);
+            ImGui::SetNextItemWidth(160);
+            ImGui::SliderFloat("Near cut (m)", &opt.near_cut, 0, 10, "%.2f");
+            ImGui::Checkbox("Carve out moved things (X)", &carve);
+            if (carve) {
+                ImGui::SetNextItemWidth(160);
+                ImGui::SliderFloat("Carve margin (m)", &opt.carve_margin, 0.01f, 5, "%.2f", ImGuiSliderFlags_Logarithmic);
+            }
+
+            ImGui::SeparatorText("Color (H)");
+            int mode = int(color_mode);
+            ImGui::RadioButton("Height", &mode, 0);
+            ImGui::SameLine();
+            ImGui::RadioButton("Captured color", &mode, 1);
+            color_mode = uint32_t(mode);
+            ImGui::Checkbox("Height range from the cloud", &auto_height);
+            if (auto_height) {
+                if (have_bounds)
+                    ImGui::TextDisabled("lowest %.1f m, highest %.1f m", cloud_low, cloud_high);
+                else
+                    ImGui::TextDisabled("(no points yet)");
+            } else {
+                ImGui::SetNextItemWidth(220);
+                ImGui::DragFloatRange2("Height range (m)", &opt.height_min, &opt.height_max, 0.5f, -100000, 100000,
+                                       "%.1f", "%.1f");
+                if (have_bounds && ImGui::Button("Set to the cloud's")) {
+                    opt.height_min = cloud_low;
+                    opt.height_max = cloud_high;
+                }
+            }
+
+            ImGui::SeparatorText("View");
+            ImGui::SetNextItemWidth(160);
+            ImGui::SliderFloat("Point size (+/-)", &point_size, 1, 16, "%.0f");
+            ImGui::Checkbox("Follow the player (F)", &follow);
+            ImGui::SameLine();
+            ImGui::Checkbox("Trail (T)", &show_trail);
+            ImGui::TextDisabled("Right-drag look, WASD move, Q/E down/up, Shift fast, wheel speed");
+            ImGui::End();
+        }
 
         // Viewer camera.
         if (follow && have_player) {
@@ -550,8 +732,9 @@ int main(int argc, char** argv) {
         dcb.px_to_ndc[1] = 2.0f / float(app.height);
         dcb.point_size = point_size;
         dcb.color_mode = color_mode;
-        dcb.height_min = opt.height_min;
-        dcb.height_max = opt.height_max;
+        dcb.height_min = auto_height && have_bounds ? cloud_low : opt.height_min;
+        dcb.height_max = auto_height && have_bounds ? cloud_high : opt.height_max;
+        if (!(dcb.height_max - dcb.height_min > 0.01f)) dcb.height_max = dcb.height_min + 0.01f;  // flat cloud
         upload(ctx, draw_cb.Get(), dcb);
 
         // Lines: player frustum + trail.
@@ -622,6 +805,9 @@ int main(int argc, char** argv) {
             ctx->VSSetShader(vs_lines.Get(), nullptr, 0);
             ctx->Draw(UINT(lines.size()), 0);
         }
+        ImGui::Render();
+        ctx->OMSetRenderTargets(1, app.back_rtv.GetAddressOf(), nullptr);
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         app.present(true);
 
         ++fps_frames;
@@ -631,16 +817,17 @@ int main(int argc, char** argv) {
             fps_frames = 0;
             title_timer = 0;
             wchar_t buf[256];
-            const uint32_t used = std::min(point_count, cloud.capacity);
-            const uint32_t live = used - std::min(free_count, used);
             swprintf(buf, 256,
                      L"lidar_viewer  %.0f fps  |  %s  |  frames %llu (dropped %llu)  |  points %.2fM / %.1fM%s  |  "
                      L"carving %s%s",
                      fps, ring.is_open() ? L"connected" : L"waiting for producer", ingested, ring.dropped(),
-                     live / 1e6, cloud.capacity / 1e6, point_count >= cloud.capacity && free_count == 0 ? L" FULL" : L"",
+                     live / 1e6, cloud.capacity / 1e6, full ? L" FULL" : L"",
                      carve ? L"on" : L"off", paused ? L"  PAUSED" : L"");
             app.set_title(buf);
         }
     }
+    ImGui_ImplDX11_Shutdown();
+    ImGui_ImplWin32_Shutdown();
+    ImGui::DestroyContext();
     return 0;
 }

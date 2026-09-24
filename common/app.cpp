@@ -140,6 +140,8 @@ LRESULT CALLBACK App::wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
+    LRESULT hooked = 0;
+    if (message_hook != nullptr && message_hook(hwnd, msg, wp, lp, hooked)) return hooked;
     switch (msg) {
         case WM_CLOSE:
             quit_ = true;

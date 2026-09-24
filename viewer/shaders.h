@@ -30,7 +30,9 @@ struct PointData { float3 pos; uint color; };  // pos.x = NaN marks a deleted po
 
 Texture2D<float> depth_tex : register(t0);
 Texture2D<float4> color_tex : register(t1);
-RWByteAddressBuffer counter : register(u0);  // [0] slots ever allocated (may exceed capacity), [4] free-list size
+// [0] slots ever allocated (may exceed capacity), [4] free-list size, [8] ~lowest and [12] highest
+// point height as height_key()s (0 = no points yet; both only grow, so a clear resets them).
+RWByteAddressBuffer counter : register(u0);
 RWStructuredBuffer<uint> table : register(u1);
 RWStructuredBuffer<PointData> points : register(u2);
 RWStructuredBuffer<uint> free_list : register(u3);
@@ -53,6 +55,12 @@ uint voxel_hash(float3 w) {
     h = mix(h ^ asuint(k.y));
     h = mix(h ^ asuint(k.z));
     return (h == kEmpty || h == kTombstone) ? 1 : h;
+}
+
+// A float as a uint with the same order, so atomics can track the extremes (never 0 for a real number).
+uint height_key(float y) {
+    uint u = asuint(y);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
 }
 
 uint pack_rgba(float4 c) {
@@ -148,6 +156,9 @@ void cs_ingest(uint3 id : SV_DispatchThreadID) {
                 p.pos = w;
                 p.color = has_color ? pack_rgba(color_tex.Load(int3(id.xy, 0))) : 0xFFFFFFFFu;
                 points[idx] = p;
+                uint key = height_key(w.y), ignored;
+                counter.InterlockedMax(8, ~key, ignored);
+                counter.InterlockedMax(12, key, ignored);
             }
             return;
         }

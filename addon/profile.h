@@ -39,6 +39,7 @@ struct CameraProfile {
     bool column_major = false;
     bool right_handed = false;  // informational: unprojection doesn't depend on it
     Latch latch = Latch::First;
+    float units_per_meter = 1;  // the game's world units in a meter: published poses are in meters
 
     bool single_matrix() const { return layout == CameraLayout::ViewProj || layout == CameraLayout::InvViewProj; }
     bool model_view() const { return layout == CameraLayout::ModelView; }
@@ -77,6 +78,11 @@ struct ProjectionInfo {
     bool right_handed = false;    // camera looks down -z
 };
 ProjectionInfo analyze_projection(const float proj[16]);
+
+// Puts a decoded pose in the protocol's frame: left-handed (a right-handed game's world gets z
+// negated, or the viewer would show it mirrored) and in meters (world and view units divided by
+// units_per_meter). Unprojecting with the result gives the same points, converted likewise.
+void normalize_pose(float view[16], float proj[16], bool right_handed, float units_per_meter);
 
 // ModelView: the constant projection at proj_offset, from a window read at proj_offset.
 bool decode_projection(const CameraProfile& profile, const uint8_t* window, size_t window_size, float proj[16],

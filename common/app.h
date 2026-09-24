@@ -25,6 +25,11 @@ public:
     bool key_pressed(int vk) const { return pressed_[vk & 0xFF]; }  // this pump only
     bool rmb_down() const { return rmb_; }
 
+    // Sees every window message first (e.g. a UI). Returns true to consume it, with `result`
+    // as the message's result: the App's own input state doesn't see it then.
+    using MessageHook = bool (*)(HWND, UINT, WPARAM, LPARAM, LRESULT& result);
+    MessageHook message_hook = nullptr;
+
     HWND hwnd = nullptr;
     int width = 0, height = 0;
     bool resized = false;  // set by pump() when the window (and the D3D11 back buffer) was resized

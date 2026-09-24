@@ -47,6 +47,13 @@ FetchContent_Declare(reshade_imgui
   SOURCE_SUBDIR none)
 FetchContent_MakeAvailable(reshade_sdk reshade_imgui)
 
+# The viewer's settings panel uses the same ImGui, compiled in with its Win32 + D3D11 backends.
+set(IMGUI_DIR ${reshade_imgui_SOURCE_DIR})
+target_sources(lidar_viewer PRIVATE
+  ${IMGUI_DIR}/imgui.cpp ${IMGUI_DIR}/imgui_draw.cpp ${IMGUI_DIR}/imgui_tables.cpp ${IMGUI_DIR}/imgui_widgets.cpp
+  ${IMGUI_DIR}/backends/imgui_impl_win32.cpp ${IMGUI_DIR}/backends/imgui_impl_dx11.cpp)
+target_include_directories(lidar_viewer PRIVATE ${IMGUI_DIR} ${IMGUI_DIR}/backends)
+
 add_library(lidar_capture SHARED
   addon/main.cpp addon/backends.cpp addon/depth_tracker.cpp addon/camera_tracker.cpp addon/profile.cpp addon/watchdog.cpp
   addon/camera_math.cpp addon/discovery.cpp addon/modelview.cpp

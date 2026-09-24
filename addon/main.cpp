@@ -246,6 +246,24 @@ void log_discovery(const disc::Status& s) {
         log_info("  #" + std::to_string(i + 1) + " " + candidate_line(s.candidates[i]));
 }
 
+// Sets units_per_meter in a profile file, keeping the rest of it (comments too). Profiles have one
+// section, [camera], so the line goes at the end.
+void write_units_per_meter(const std::filesystem::path& path, float units_per_meter) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return;
+    std::string text, line;
+    while (std::getline(in, line)) {
+        const size_t start = line.find_first_not_of(" \t");
+        if (start == std::string::npos || line.compare(start, 15, "units_per_meter") != 0) text += line + "\n";
+    }
+    in.close();
+    while (text.size() >= 2 && text.ends_with("\n\n")) text.pop_back();
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "units_per_meter = %.9g\n", double(units_per_meter));
+    std::ofstream(path, std::ios::binary) << text << buf;
+    log_info(std::string("Profile: ") + buf);
+}
+
 // Writes the candidate as lidar_profile.toml next to the exe (keeping the old one as .bak), makes
 // it the profile and reloads. Caller holds g_mutex.
 bool save_candidate(const disc::CandidateInfo& c) {
@@ -257,8 +275,10 @@ bool save_candidate(const disc::CandidateInfo& c) {
     char date[32];
     std::strftime(date, sizeof(date), "%Y-%m-%d %H:%M", std::localtime(&now));
     std::string comment = std::string("Written by game-lidar discovery mode, ") + date + ".\n" + candidate_line(c);
+    CameraProfile camera = c.profile;
+    if (const CameraProfile* active = active_camera()) camera.units_per_meter = active->units_per_meter;
     std::ofstream f(path, std::ios::binary);
-    f << format_profile(c.profile, comment);
+    f << format_profile(camera, comment);
     f.close();
     if (!f) {
         g_disc_message = "Couldn't write " + path.string();
@@ -377,9 +397,10 @@ bool apply_camera(const cam::FrameLatches& latches, const cam::FrameDraws& draws
         return false;
     }
     g_camera.state = CameraStatus::Latched;
+    g_camera.info = analyze_projection(proj);  // in the game's units and handedness
+    normalize_pose(view, proj, g_camera.info.right_handed, camera->units_per_meter);
     std::memcpy(g_camera.view, view, sizeof(view));
     std::memcpy(g_camera.proj, proj, sizeof(proj));
-    g_camera.info = analyze_projection(proj);
     std::memcpy(h.view, view, sizeof(h.view));
     std::memcpy(h.proj, proj, sizeof(h.proj));
     h.flags |= kFlagPoseValid;
@@ -633,6 +654,20 @@ bool draw_camera_section() {
                             layout_name(c.layout), where.c_str(), c.column_major ? "column" : "row",
                             c.right_handed ? "right" : "left", latch_name(c.latch));
 
+    // Scale: live, and written to the profile file unless a preview is in use (Save carries it over).
+    float upm = c.units_per_meter;
+    ImGui::SetNextItemWidth(120);
+    if (ImGui::InputFloat("Game units per meter", &upm, 0, 0, "%.6g", ImGuiInputTextFlags_EnterReturnsTrue) &&
+        upm > 0 && std::isfinite(upm)) {
+        (g_preview ? *g_preview : g_profile.camera).units_per_meter = upm;
+        if (!g_preview) write_units_per_meter(g_profile_path, upm);
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("How many of the game's world units make one meter. The viewer assumes meters (voxel\n"
+                          "size, range, height colors). Press C in the viewer after changing it.");
+
     switch (g_camera.state) {
         case CameraStatus::NoProfile: break;
         case CameraStatus::NoLatch:
@@ -761,7 +796,9 @@ void draw_discovery_section() {
             ImGui::Text("%u/%u", c.temporal_agree, c.temporal_checks);
             ImGui::TableNextColumn();
             if (ImGui::SmallButton("Use")) {
+                const float upm = active_camera() ? active_camera()->units_per_meter : 1;
                 g_preview = c.profile;
+                g_preview->units_per_meter = upm;
                 configure_camera();
             }
             ImGui::SameLine();

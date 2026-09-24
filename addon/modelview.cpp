@@ -42,6 +42,12 @@ bool rotation_close(const mat::Mat& a, const mat::Mat& b, double tol_rad) {
     return d <= 2 * tol_rad * tol_rad;
 }
 
+double det3(const mat::Mat& a) {
+    return a.m[0][0] * (a.m[1][1] * a.m[2][2] - a.m[1][2] * a.m[2][1]) -
+           a.m[0][1] * (a.m[1][0] * a.m[2][2] - a.m[1][2] * a.m[2][0]) +
+           a.m[0][2] * (a.m[1][0] * a.m[2][1] - a.m[1][1] * a.m[2][0]);
+}
+
 }  // namespace
 
 Result Solver::solve(const std::vector<Draw>& draws) {
@@ -199,14 +205,18 @@ bool Solver::consensus(const std::vector<Hypothesis>& hyps, double tol_t, mat::M
 }
 
 // Forgets every placement. The heaviest draw anchors the new world frame: its model-view, without
-// its scale, is the view. Everything else in the frame is placed provisionally around it.
+// its scale, is the view. Everything else in the frame is placed provisionally around it. A
+// mirrored object (negative determinant: the view itself is a rotation) would mirror the whole
+// world, so it anchors only if nothing else can.
 void Solver::start_segment(const std::vector<const Draw*>& draws, Result& r) {
     objects_.clear();
     ++segment_;
     lost_ = 0;
     const Draw* anchor = draws.front();
-    for (const Draw* d : draws)
-        if (d->weight > anchor->weight) anchor = d;
+    for (const Draw* d : draws) {
+        const bool mirrored = det3(d->m) < 0, anchor_mirrored = det3(anchor->m) < 0;
+        if (mirrored != anchor_mirrored ? anchor_mirrored : d->weight > anchor->weight) anchor = d;
+    }
     const mat::Mat view = rigid_part(anchor->m);
     mat::Mat view_inv;
     mat::inverse(view, view_inv);

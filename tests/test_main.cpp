@@ -328,6 +328,61 @@ static void test_profile_decode() {
     EXPECT(!decode_camera(c, swapped, sizeof(swapped), v, p));
 }
 
+// A right-handed game in decimeters: normalized, the pose unprojects its depth to the world point
+// in meters with z negated (so the viewer's left-handed display isn't mirrored).
+static void test_normalize_pose() {
+    const XMMATRIX view = XMMatrixLookToRH(XMVectorSet(300, 170, 800, 1), XMVectorSet(0.4f, -0.2f, -1, 0),
+                                           XMVectorSet(0, 1, 0, 0));
+    const XMMATRIX proj = XMMatrixPerspectiveFovRH(1.0f, 16.0f / 9.0f, 1.0f, 100000.0f);
+    float v[16], p[16];
+    XMStoreFloat4x4(reinterpret_cast<XMFLOAT4X4*>(v), view);
+    XMStoreFloat4x4(reinterpret_cast<XMFLOAT4X4*>(p), proj);
+    const bool rh = analyze_projection(p).right_handed;
+    EXPECT(rh);
+    normalize_pose(v, p, rh, 10);
+    const ProjectionInfo info = analyze_projection(p);
+    EXPECT(info.valid && !info.right_handed);
+    EXPECT(std::abs(info.near_z - 0.1f) < 1e-5f);  // meters now
+    const XMMATRIX v2 = XMLoadFloat4x4(reinterpret_cast<const XMFLOAT4X4*>(v));
+    const XMMATRIX p2 = XMLoadFloat4x4(reinterpret_cast<const XMFLOAT4X4*>(p));
+    EXPECT(std::abs(XMVectorGetX(XMMatrixDeterminant(v2)) - 1) < 1e-4f);  // still a rotation, not a mirror
+
+    for (const XMVECTOR world : {XMVectorSet(320, 160, 700, 1), XMVectorSet(250, 175, 500, 1)}) {
+        const XMVECTOR clip = XMVector4Transform(world, view * proj);
+        const XMVECTOR ndc = XMVectorScale(clip, 1 / XMVectorGetW(clip));
+        XMVECTOR back = XMVector4Transform(ndc, XMMatrixInverse(nullptr, p2));
+        back = XMVectorScale(back, 1 / XMVectorGetW(back));
+        back = XMVector4Transform(back, XMMatrixInverse(nullptr, v2));
+        const XMVECTOR expect = XMVectorMultiply(world, XMVectorSet(0.1f, 0.1f, -0.1f, 1));
+        const float err = XMVectorGetX(XMVector3Length(back - expect));
+        // Float depth at 1..100000 resolves ~1 mm this far out (10-35 m).
+        if (!(err < 5e-3f)) std::printf("  normalize_pose: error %g m\n", err);
+        EXPECT(err < 5e-3f);
+    }
+
+    // Left-handed, in meters: untouched.
+    float lv[16], lp[16], lv0[16], lp0[16];
+    XMStoreFloat4x4(reinterpret_cast<XMFLOAT4X4*>(lv0), XMMatrixLookToLH(XMVectorSet(1, 2, 3, 1), XMVectorSet(0, 0, 1, 0),
+                                                                         XMVectorSet(0, 1, 0, 0)));
+    XMStoreFloat4x4(reinterpret_cast<XMFLOAT4X4*>(lp0), test_proj(0, 1.5f));
+    std::memcpy(lv, lv0, sizeof(lv));
+    std::memcpy(lp, lp0, sizeof(lp));
+    normalize_pose(lv, lp, false, 1);
+    EXPECT(std::memcmp(lv, lv0, sizeof(lv)) == 0 && std::memcmp(lp, lp0, sizeof(lp)) == 0);
+
+    // units_per_meter in profiles: parsed, validated, written back.
+    const std::string base = "[camera]\nstage=\"vertex\"\nslot=0\nlayout=\"modelview\"\nview_offset=0\nproj_offset=128\n";
+    Profile pr;
+    std::string err;
+    EXPECT(parse_profile(base, pr, err) && pr.camera.units_per_meter == 1);
+    EXPECT(parse_profile(base + "units_per_meter = 10\n", pr, err) && pr.camera.units_per_meter == 10);
+    EXPECT(parse_profile(base + "units_per_meter = 2.5\n", pr, err) && pr.camera.units_per_meter == 2.5f);
+    EXPECT(parse_fails((base + "units_per_meter = 0\n").c_str(), "positive number"));
+    Profile back;
+    pr.camera.units_per_meter = 12.5f;
+    EXPECT(parse_profile(format_profile(pr.camera, ""), back, err) && back.camera.units_per_meter == 12.5f);
+}
+
 // ---- Discovery: classifiers, view-projection decomposition, reprojection ----
 
 static void store_f(const XMMATRIX& m, bool column_major, float f[16]) {
@@ -782,6 +837,17 @@ static void test_modelview() {
     mv::Solver empty;
     const mv::Result r0 = empty.solve({{7, mvt::translate(0, 0, 10), 1}});
     EXPECT(!r0.posed && r0.segment == 0);
+
+    // A mirrored heaviest draw (negative scale) doesn't anchor: the world would come out mirrored.
+    mv::Solver mirror;
+    const mv::Result rm = mirror.solve({{20, mat::mul(mvt::scale(-1, 1, 1), mvt::translate(0, 0, 10)), 1000},
+                                        {21, mvt::translate(1, 0, 12), 10},
+                                        {22, mvt::translate(-1, 0, 14), 10}});
+    const mat::Mat& m = rm.view;
+    const double det = m.m[0][0] * (m.m[1][1] * m.m[2][2] - m.m[1][2] * m.m[2][1]) -
+                       m.m[0][1] * (m.m[1][0] * m.m[2][2] - m.m[1][2] * m.m[2][0]) +
+                       m.m[0][2] * (m.m[1][0] * m.m[2][1] - m.m[1][1] * m.m[2][0]);
+    EXPECT(rm.posed && rm.new_segment && det > 0);
 }
 
 int main() {
@@ -789,6 +855,7 @@ int main() {
     test_unproject();
     test_profile_parse();
     test_profile_decode();
+    test_normalize_pose();
     test_classify();
     test_decompose();
     test_reproject();
