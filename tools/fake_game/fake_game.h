@@ -64,10 +64,17 @@ struct Vertex {
 
 enum class DepthMode { Standard, Reversed, ReversedInfinite };
 enum class Api { D3D11, D3D12, D3D9 };
+// How the camera reaches the shader (the shader always computes world * view * proj):
+//  Separate: view, proj and view_proj in b0 (c0-c12), the usual case.
+//  ViewProj: only view_proj: b0 holds {view_proj, identity, view_proj}.
+//  Wvp:      only world * view * proj, per draw, in b1's world (c13); b0's matrices are identity.
+//            Like many D3D9 games. The level's draws have world = identity, the NPC's doesn't.
+enum class ConstantsLayout { Separate, ViewProj, Wvp };
 
 struct Options {
     Api api = Api::D3D11;
-    bool cbv_tables = false;   // D3D12: bind the cbuffers through a descriptor table instead of root CBVs
+    ConstantsLayout layout = ConstantsLayout::Separate;
+    bool cbv_tables = false;  // D3D12: bind the cbuffers through a descriptor table instead of root CBVs
     bool d3d12_debug = false;  // D3D12: enable the debug layer, print its messages, exit 3 on errors
     bool own_depth = false;    // D3D9: CreateDepthStencilSurface instead of the auto depth-stencil
     bool d24 = false;          // D3D11: 24-bit depth buffer (a reference for D3D9, whose depth is 24-bit)
@@ -108,6 +115,17 @@ struct CameraRig {
 // World matrix and tint of the NPC at time t.
 ObjectCB npc_object(double t);
 ObjectCB static_object();
+
+// The frame's draws: the NPC first (if on), then the level in three parts, so the level's
+// constants are what most draws see. Objects as uploaded for opt.layout.
+constexpr uint32_t kMaxDraws = 4;
+struct DrawItem {
+    ObjectCB object;
+    uint32_t first = 0, count = 0;  // vertices
+};
+std::vector<DrawItem> scene_draws(const Options& opt, const Geometry& geo, const CameraCB& cam, double t);
+// The camera constants as uploaded for opt.layout. `cam` (the true matrices) is what gets published.
+CameraCB gpu_camera(const Options& opt, const CameraCB& cam);
 
 int run_d3d11(const Options& opt);
 int run_d3d12(const Options& opt);

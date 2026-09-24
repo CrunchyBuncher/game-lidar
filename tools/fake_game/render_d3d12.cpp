@@ -28,7 +28,7 @@ namespace lidar::fake {
 namespace {
 
 constexpr UINT kFrames = 3;  // frames in flight, and swap chain buffers
-constexpr UINT kDraws = 2;   // static level + NPC
+constexpr UINT kDraws = kMaxDraws;  // NPC + level parts (scene_draws)
 constexpr UINT kCbAlign = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;  // 256
 // Per frame region: camera, then one object block per draw.
 constexpr UINT kFrameStride = kCbAlign * (1 + kDraws);
@@ -316,9 +316,11 @@ struct Renderer {
 
         // Constants for this frame's region: nothing tells the runtime (or ReShade) about these writes.
         uint8_t* region = constants_ptr + f * kFrameStride;
-        std::memcpy(region, &cam, sizeof(cam));
-        const ObjectCB objects[kDraws] = {static_object(), npc_object(t)};
-        for (UINT d = 0; d < kDraws; ++d) std::memcpy(region + kCbAlign * (1 + d), &objects[d], sizeof(ObjectCB));
+        const CameraCB gpu = gpu_camera(opt, cam);
+        std::memcpy(region, &gpu, sizeof(gpu));
+        const std::vector<DrawItem> draws = scene_draws(opt, geo, cam, t);
+        for (UINT d = 0; d < UINT(draws.size()); ++d)
+            std::memcpy(region + kCbAlign * (1 + d), &draws[d].object, sizeof(ObjectCB));
 
         check(alloc[f]->Reset(), "allocator Reset");
         check(cmd->Reset(alloc[f].Get(), pso.Get()), "Reset");
@@ -353,8 +355,7 @@ struct Renderer {
         } else {
             cmd->SetGraphicsRootConstantBufferView(1, base);  // b0: camera
         }
-        const UINT draw_count = opt.npc ? kDraws : 1;
-        for (UINT d = 0; d < draw_count; ++d) {
+        for (UINT d = 0; d < UINT(draws.size()); ++d) {
             if (opt.cbv_tables) {
                 // Table [object, camera], copied from this frame's CPU-only CBVs.
                 const UINT slot = (f * kDraws + d) * 2;
@@ -373,10 +374,7 @@ struct Renderer {
             } else {
                 cmd->SetGraphicsRootConstantBufferView(0, base + kCbAlign * (1 + d));  // b1: object
             }
-            if (d == 0)
-                cmd->DrawInstanced(geo.static_count, 1, 0, 0);
-            else
-                cmd->DrawInstanced(UINT(geo.verts.size()) - geo.static_count, 1, geo.static_count, 0);
+            cmd->DrawInstanced(draws[d].count, 1, draws[d].first, 0);
         }
 
         const D3D12_RESOURCE_BARRIER end[2] = {

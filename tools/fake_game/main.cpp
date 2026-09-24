@@ -11,7 +11,12 @@
 // (same bytes as b0), the decoy in c13-c17. --own-depth uses a CreateDepthStencilSurface depth
 // buffer instead of the device's auto depth-stencil.
 //
-// Usage: fake_game [--api d3d11|d3d12|d3d9] [--cbv-tables] [--d3d12-debug] [--own-depth] [--d24]
+// --camera-layout viewproj | wvp: only a view-projection in b0, or only world * view * proj per
+// draw (in b1), instead of separate view and proj; for discovery mode. The level is drawn in three
+// parts after the NPC in every layout.
+//
+// Usage: fake_game [--api d3d11|d3d12|d3d9] [--camera-layout separate|viewproj|wvp]
+//                  [--cbv-tables] [--d3d12-debug] [--own-depth] [--d24]
 //                  [--depth standard|reversed|reversed-infinite] [--capture-width 480]
 //                  [--capture-every 1] [--fov 70] [--no-npc] [--no-color]
 //                  [--size 1280x720] [--duration seconds] [--no-publish]
@@ -66,6 +71,13 @@ Options parse(int argc, char** argv) {
         if (a == "--api") {
             const std::string api = next();
             o.api = api == "d3d12" ? Api::D3D12 : api == "d3d9" ? Api::D3D9 : Api::D3D11;
+        } else if (a == "--camera-layout") {
+            const std::string l = next();
+            o.layout = l == "viewproj" ? ConstantsLayout::ViewProj
+                       : l == "wvp"    ? ConstantsLayout::Wvp
+                                       : ConstantsLayout::Separate;
+            if (l != "viewproj" && l != "wvp" && l != "separate")
+                std::fprintf(stderr, "unknown --camera-layout %s (separate | viewproj | wvp)\n", l.c_str());
         } else if (a == "--cbv-tables") {
             o.cbv_tables = true;
         } else if (a == "--d3d12-debug") {
@@ -178,6 +190,33 @@ ObjectCB npc_object(double t) {
     XMStoreFloat4x4(&obj.world, XMMatrixTranslation(20.0f * std::sin(float(t) * 0.3f), 0, -26.5f));
     obj.tint = {0.9f, 0.25f, 0.2f, 1};
     return obj;
+}
+
+CameraCB gpu_camera(const Options& opt, const CameraCB& cam) {
+    CameraCB g = cam;
+    if (opt.layout == ConstantsLayout::ViewProj) {
+        g.view = cam.view_proj;
+        XMStoreFloat4x4(&g.proj, XMMatrixIdentity());
+    } else if (opt.layout == ConstantsLayout::Wvp) {
+        XMStoreFloat4x4(&g.view, XMMatrixIdentity());
+        g.proj = g.view_proj = g.view;
+    }
+    return g;
+}
+
+std::vector<DrawItem> scene_draws(const Options& opt, const Geometry& geo, const CameraCB& cam, double t) {
+    std::vector<DrawItem> draws;
+    if (opt.npc) draws.push_back({npc_object(t), geo.static_count, uint32_t(geo.verts.size()) - geo.static_count});
+    constexpr uint32_t kBox = 36, kParts = kMaxDraws - 1;  // vertices per box
+    const uint32_t boxes = geo.static_count / kBox;
+    for (uint32_t i = 0; i < kParts; ++i) {
+        const uint32_t b0 = boxes * i / kParts, b1 = boxes * (i + 1) / kParts;
+        draws.push_back({static_object(), b0 * kBox, (b1 - b0) * kBox});
+    }
+    if (opt.layout == ConstantsLayout::Wvp)
+        for (DrawItem& d : draws)
+            XMStoreFloat4x4(&d.object.world, XMLoadFloat4x4(&d.object.world) * XMLoadFloat4x4(&cam.view_proj));
+    return draws;
 }
 
 }  // namespace lidar::fake

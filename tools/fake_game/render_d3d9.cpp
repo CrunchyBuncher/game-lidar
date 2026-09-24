@@ -158,19 +158,15 @@ struct Renderer {
         dev->SetVertexShader(vs.Get());
         dev->SetPixelShader(ps.Get());
 
-        dev->SetVertexShaderConstantF(0, reinterpret_cast<const float*>(&cam), kCameraRegs);
-        dev->SetPixelShaderConstantF(0, reinterpret_cast<const float*>(&cam), kCameraRegs);
+        const CameraCB gpu = gpu_camera(opt, cam);
+        dev->SetVertexShaderConstantF(0, reinterpret_cast<const float*>(&gpu), kCameraRegs);
+        dev->SetPixelShaderConstantF(0, reinterpret_cast<const float*>(&gpu), kCameraRegs);
         const float half_pixel[4] = {-1.0f / float(pp.BackBufferWidth), 1.0f / float(pp.BackBufferHeight), 0, 0};
         dev->SetVertexShaderConstantF(kHalfPixelReg, half_pixel, 1);
 
-        const ObjectCB level = static_object();
-        dev->SetVertexShaderConstantF(kObjectReg, reinterpret_cast<const float*>(&level), kObjectRegs);
-        dev->DrawPrimitive(D3DPT_TRIANGLELIST, 0, geo.static_count / 3);
-        if (opt.npc) {
-            const ObjectCB npc = npc_object(t);
-            dev->SetVertexShaderConstantF(kObjectReg, reinterpret_cast<const float*>(&npc), kObjectRegs);
-            dev->DrawPrimitive(D3DPT_TRIANGLELIST, geo.static_count,
-                               (UINT(geo.verts.size()) - geo.static_count) / 3);
+        for (const DrawItem& d : scene_draws(opt, geo, cam, t)) {
+            dev->SetVertexShaderConstantF(kObjectReg, reinterpret_cast<const float*>(&d.object), kObjectRegs);
+            dev->DrawPrimitive(D3DPT_TRIANGLELIST, d.first, d.count / 3);
         }
         dev->EndScene();
         const HRESULT hr = dev->Present(nullptr, nullptr, nullptr, nullptr);

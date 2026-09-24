@@ -215,7 +215,7 @@ int run_d3d11(const Options& opt) {
         if (app.key_pressed(VK_SPACE)) paused = !paused;
         rig.update(app, opt, dt);
         const CameraCB cam = rig.constants(opt, float(app.width) / float(app.height));
-        upload(ctx, camera_cb.Get(), cam);
+        upload(ctx, camera_cb.Get(), gpu_camera(opt, cam));
 
         // Draw the scene.
         const float sky[4] = {0.55f, 0.7f, 0.9f, 1.0f};
@@ -236,11 +236,9 @@ int run_d3d11(const Options& opt) {
         ctx->VSSetConstantBuffers(0, 2, cbs);
         ctx->PSSetConstantBuffers(0, 2, cbs);
 
-        upload(ctx, object_cb.Get(), static_object());
-        ctx->Draw(geo.static_count, 0);
-        if (opt.npc) {
-            upload(ctx, object_cb.Get(), npc_object(t));
-            ctx->Draw(UINT(geo.verts.size()) - geo.static_count, geo.static_count);
+        for (const DrawItem& d : scene_draws(opt, geo, cam, t)) {
+            upload(ctx, object_cb.Get(), d.object);
+            ctx->Draw(d.count, d.first);
         }
         ctx->OMSetRenderTargets(0, nullptr, nullptr);
 
