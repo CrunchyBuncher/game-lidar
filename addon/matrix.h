@@ -75,6 +75,23 @@ inline bool finite(const Mat& a) {
     return true;
 }
 
+// Angle between the rotations (upper 3x3) of two rigid transforms, in degrees: atan2 of R = a^T b's
+// antisymmetric part and trace. acos((tr - 1) / 2) alone bottoms out at ~0.02 deg with float input.
+inline double rotation_between_deg(const Mat& a, const Mat& b) {
+    double r[3][3] = {};
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            for (int k = 0; k < 3; ++k) r[i][j] += a.m[k][i] * b.m[k][j];
+    const double s = std::hypot(r[2][1] - r[1][2], r[0][2] - r[2][0], r[1][0] - r[0][1]) / 2;
+    const double c = (r[0][0] + r[1][1] + r[2][2] - 1) / 2;
+    return std::atan2(s, c) * 57.29577951308232;
+}
+
+// Distance between the translation rows.
+inline double translation_between(const Mat& a, const Mat& b) {
+    return std::hypot(a.m[3][0] - b.m[3][0], a.m[3][1] - b.m[3][1], a.m[3][2] - b.m[3][2]);
+}
+
 // p (x, y, z, w) * M
 inline void transform(const double p[4], const Mat& a, double out[4]) {
     for (int j = 0; j < 4; ++j) out[j] = p[0] * a.m[0][j] + p[1] * a.m[1][j] + p[2] * a.m[2][j] + p[3] * a.m[3][j];

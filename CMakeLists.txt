@@ -49,7 +49,7 @@ FetchContent_MakeAvailable(reshade_sdk reshade_imgui)
 
 add_library(lidar_capture SHARED
   addon/main.cpp addon/backends.cpp addon/depth_tracker.cpp addon/camera_tracker.cpp addon/profile.cpp addon/watchdog.cpp
-  addon/camera_math.cpp addon/discovery.cpp
+  addon/camera_math.cpp addon/discovery.cpp addon/modelview.cpp
   addon/d3d11/capture_d3d11.cpp addon/d3d11/cbuffer_d3d11.cpp
   addon/d3d12/capture_d3d12.cpp addon/d3d12/cbuffer_d3d12.cpp addon/d3d12/root_layout.cpp
   addon/d3d9/capture_d3d9.cpp addon/d3d9/constants_d3d9.cpp)
@@ -72,11 +72,13 @@ foreach(dir ${CMAKE_SOURCE_DIR}/sandbox/fake_game ${FAKE_GAME_D3D9_DIR})
     COMMAND ${CMAKE_COMMAND} -E make_directory ${dir}
     COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:lidar_capture> ${dir}/
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_SOURCE_DIR}/profiles/fake_game.toml ${dir}/lidar_profile.toml
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_SOURCE_DIR}/profiles/fake_game_viewproj.toml ${dir}/)
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_SOURCE_DIR}/profiles/fake_game_viewproj.toml ${dir}/
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_SOURCE_DIR}/profiles/fake_game_modelview.toml ${dir}/)
 endforeach()
 
 enable_testing()
-add_executable(lidar_tests tests/test_main.cpp addon/profile.cpp addon/camera_math.cpp addon/d3d12/root_layout.cpp)
+add_executable(lidar_tests tests/test_main.cpp addon/profile.cpp addon/camera_math.cpp addon/modelview.cpp
+  addon/d3d12/root_layout.cpp)
 target_include_directories(lidar_tests PRIVATE addon ${reshade_sdk_SOURCE_DIR}/include)
 target_link_libraries(lidar_tests PRIVATE lidar_common)
 add_test(NAME lidar_tests COMMAND lidar_tests)

@@ -199,7 +199,8 @@ bool read_camera(const Table& t, CameraProfile& c, std::string& error) {
         !r.uint("slot", c.key.slot, true, 255) || !r.uint("space", c.key.space, false, 0xFFFFFFEFu) ||
         !r.uint("size", c.key.size, false, 1u << 20) ||
         !r.choice("layout",
-                  {"view+proj", "viewproj+proj", "invview+proj", "invviewproj+proj", "viewproj", "invviewproj"},
+                  {"view+proj", "viewproj+proj", "invview+proj", "invviewproj+proj", "viewproj", "invviewproj",
+                   "modelview"},
                   layout, true) ||
         !r.uint("view_offset", c.view_offset, true, 1u << 20))
         return false;
@@ -316,6 +317,7 @@ const char* layout_name(CameraLayout layout) {
         case CameraLayout::InvViewProjAndProj: return "invviewproj+proj";
         case CameraLayout::ViewProj: return "viewproj";
         case CameraLayout::InvViewProj: return "invviewproj";
+        case CameraLayout::ModelView: return "modelview";
     }
     return "?";
 }
@@ -343,6 +345,7 @@ const char* stage_name(shader_stage stage) {
 
 bool decode_camera(const CameraProfile& c, const uint8_t* window, size_t window_size, float view[16], float proj[16],
                    std::string* why) {
+    if (c.model_view()) return fail(why, "a model-view camera needs the solver");
     if (window_size < c.window_size()) return fail(why, "latched window too small");
     const uint8_t* a = window + (c.view_offset - c.window_offset());
     const Mat first = load(a, c.column_major);
@@ -383,11 +386,22 @@ bool decode_camera(const CameraProfile& c, const uint8_t* window, size_t window_
             break;
         }
         case CameraLayout::ViewProj:
-        case CameraLayout::InvViewProj: break;  // handled above
+        case CameraLayout::InvViewProj:
+        case CameraLayout::ModelView: break;  // handled above
     }
     store(v, view);
     if (!analyze_projection(proj).valid) return fail(why, "proj is not a perspective projection");
     if (!plausible_view(view)) return fail(why, "view is not a rigid transform");
+    return true;
+}
+
+bool decode_projection(const CameraProfile& c, const uint8_t* window, size_t window_size, float proj[16],
+                       std::string* why) {
+    if (window_size < 64) return fail(why, "latched window too small");
+    const Mat p = load(window, c.column_major);
+    if (!finite(p)) return fail(why, "non-finite values");
+    store(p, proj);
+    if (!analyze_projection(proj).valid) return fail(why, "proj is not a perspective projection");
     return true;
 }
 

@@ -1,6 +1,7 @@
 #include "camera_tracker.h"
 
 #include <algorithm>
+#include <cstring>
 #include <mutex>
 #include <shared_mutex>
 #include <utility>
@@ -71,7 +72,12 @@ struct __declspec(uuid("8e3a51c7-2b94-4f6d-9c08-d4a7e61f3b25")) CmdState {
     FrameLatches latches;
     std::unordered_map<uint64_t, Tally> tallies;  // Latch::Common
     FrameSamples samples;                         // discovery
+    FrameDraws draws;                             // model-view camera, or discovery
     CbufferRead scratch;  // reused for reads, so steady state doesn't allocate
+    // The last recorded draw's geometry, until the source can complete it (UP draws), and a copy
+    // to update (the draw's sample, when it's also recorded).
+    DrawGeometry* pending_geometry = nullptr;
+    DrawGeometry* pending_copy = nullptr;
 };
 
 struct __declspec(uuid("f04c9d26-7a1e-4b83-8e5f-39c2d7a6b0e1")) DeviceData {
@@ -82,6 +88,10 @@ struct __declspec(uuid("f04c9d26-7a1e-4b83-8e5f-39c2d7a6b0e1")) DeviceData {
     CbufferSource* discovery = nullptr;
     uint32_t samples_per_frame = 0, max_bytes = 0;
     std::unordered_map<uint64_t, uint32_t> last_draws;  // per depth-stencil, last frame (sample spacing)
+    CbufferSource* recorder = nullptr;  // model-view camera: records every draw
+    DrawRequest draw_req;
+    // What records draws: the model-view camera's source, else discovery's.
+    CbufferSource* record_source() const { return recorder != nullptr ? recorder : discovery; }
 };
 
 // Unique: configure, merges and end_frame. Shared: draws, which only touch their own command
@@ -95,6 +105,18 @@ void merge_latches(CbufferSource* source, Latch latch, FrameLatches& dst, FrameL
             dst[ds] = std::move(read);
         else
             dst.try_emplace(ds, std::move(read));
+    }
+    src.clear();
+}
+
+void merge_draws(FrameDraws& dst, FrameDraws& src) {
+    for (auto& [ds, v] : src) {
+        std::vector<DrawRecord>& d = dst[ds];
+        const uint32_t base = uint32_t(d.size());
+        for (DrawRecord& r : v) {
+            r.draw += base;
+            d.push_back(r);
+        }
     }
     src.clear();
 }
@@ -116,11 +138,20 @@ void merge_samples(CbufferSource* source, FrameSamples& dst, FrameSamples& src) 
     src.clear();
 }
 
+void complete_geometry(const DeviceData& dd, CmdState& s) {
+    if (s.pending_geometry == nullptr) return;
+    if (CbufferSource* src = dd.record_source()) src->complete_geometry(*s.pending_geometry);
+    if (s.pending_copy != nullptr) *s.pending_copy = *s.pending_geometry;
+    s.pending_geometry = s.pending_copy = nullptr;
+}
+
 void merge(const DeviceData& dd, CmdState& dst, CmdState& src) {
+    complete_geometry(dd, src);
     merge_latches(dd.source, dd.req.latch, dst.latches, src.latches);
     for (auto& [ds, t] : src.tallies) dst.tallies[ds].merge(t, dd.source);
     src.tallies.clear();
     merge_samples(dd.discovery, dst.samples, src.samples);
+    merge_draws(dst.draws, src.draws);
 }
 
 void on_destroy_device(device* dev) { dev->destroy_private_data<DeviceData>(); }
@@ -166,8 +197,30 @@ void latch_profile(command_list* cmd, CmdState& s, const DeviceData& dd) {
     }
 }
 
+// Every draw's call, geometry and window (model-view camera, discovery). Only where the source reads
+// geometry (D3D9 so far): without it, draws can't be told apart. A window that isn't readable at the
+// draw (D3D12's deferred reads) is left out.
+const DrawRecord* record_draw(command_list* cmd, CmdState& s, const DeviceData& dd, const DrawCall& call) {
+    CbufferSource* src = dd.record_source();
+    std::vector<DrawRecord>& v = s.draws[s.current_ds.handle];
+    DrawRecord& r = v.emplace_back();
+    if (!src->read_geometry_at_draw(cmd, r.geometry)) {
+        v.pop_back();
+        return nullptr;
+    }
+    r.draw = uint32_t(v.size() - 1);
+    r.call = call;
+    if (src->read_at_draw(cmd, dd.draw_req.key, dd.draw_req.offset, sizeof(r.window), s.scratch) &&
+        s.scratch.ready && s.scratch.bytes.size() == sizeof(r.window)) {
+        std::memcpy(r.window, s.scratch.bytes.data(), sizeof(r.window));
+        r.has_window = true;
+    }
+    s.pending_geometry = &r.geometry;
+    return &r;
+}
+
 // The first few draws, then one every (last frame's draws / budget).
-void sample_draw(command_list* cmd, CmdState& s, const DeviceData& dd) {
+void sample_draw(command_list* cmd, CmdState& s, const DeviceData& dd, const DrawCall& call, const DrawRecord* rec) {
     DepthSamples& d = s.samples[s.current_ds.handle];
     const uint32_t index = d.draws++;
     if (d.samples.size() >= dd.samples_per_frame) return;
@@ -177,37 +230,50 @@ void sample_draw(command_list* cmd, CmdState& s, const DeviceData& dd) {
     if (index >= 4 && index % stride != 0) return;
     DrawSample& sample = d.samples.emplace_back();
     sample.draw = index;
+    sample.call = call;
+    if (rec != nullptr) {
+        sample.geometry = rec->geometry;
+        s.pending_copy = &sample.geometry;
+    } else if (dd.discovery->read_geometry_at_draw(cmd, sample.geometry)) {
+        s.pending_geometry = &sample.geometry;
+    }
     dd.discovery->read_all_at_draw(cmd, dd.max_bytes, sample.buffers);
 }
 
-void on_any_draw(command_list* cmd) {
+void on_any_draw(command_list* cmd, const DrawCall& call) {
     auto& s = *cmd->get_private_data<CmdState>();
-    if (s.current_ds == 0) return;
+    if (s.current_ds == 0 && s.pending_geometry == nullptr) return;
     const DeviceData* dd = cmd->get_device()->get_private_data<DeviceData>();
     const std::shared_lock lock(g_mutex);
+    complete_geometry(*dd, s);  // the previous recorded draw has reached the driver by now
+    if (s.current_ds == 0) return;
     if (dd->source != nullptr) latch_profile(cmd, s, *dd);
-    if (dd->discovery != nullptr) sample_draw(cmd, s, *dd);
+    const DrawRecord* rec = dd->record_source() != nullptr ? record_draw(cmd, s, *dd, call) : nullptr;
+    if (dd->discovery != nullptr) sample_draw(cmd, s, *dd, call, rec);
 }
 
-bool on_draw(command_list* cmd, uint32_t, uint32_t, uint32_t, uint32_t) {
-    on_any_draw(cmd);
+bool on_draw(command_list* cmd, uint32_t vertices, uint32_t instances, uint32_t first_vertex, uint32_t first_instance) {
+    on_any_draw(cmd, {DrawType::Draw, vertices, instances, first_vertex, 0, first_instance});
     return false;
 }
-bool on_draw_indexed(command_list* cmd, uint32_t, uint32_t, uint32_t, int32_t, uint32_t) {
-    on_any_draw(cmd);
+bool on_draw_indexed(command_list* cmd, uint32_t indices, uint32_t instances, uint32_t first_index,
+                     int32_t vertex_offset, uint32_t first_instance) {
+    on_any_draw(cmd, {DrawType::Indexed, indices, instances, first_index, vertex_offset, first_instance});
     return false;
 }
-bool on_draw_indirect(command_list* cmd, indirect_command type, resource, uint64_t, uint32_t, uint32_t) {
-    if (type != indirect_command::dispatch) on_any_draw(cmd);
+bool on_draw_indirect(command_list* cmd, indirect_command type, resource, uint64_t, uint32_t draws, uint32_t) {
+    if (type != indirect_command::dispatch) on_any_draw(cmd, {DrawType::Indirect, draws});
     return false;
 }
 
 void on_reset_command_list(command_list* cmd) {
     auto& s = *cmd->get_private_data<CmdState>();
     s.current_ds = {0};
+    s.pending_geometry = s.pending_copy = nullptr;
     s.latches.clear();
     s.tallies.clear();
     s.samples.clear();
+    s.draws.clear();
 }
 void on_execute_command_list(command_queue* q, command_list* cmd) {
     if (cmd == q->get_immediate_command_list()) return;  // just the immediate context flushing
@@ -223,13 +289,41 @@ void on_execute_command_list(command_queue* q, command_list* cmd) {
 void clear_queues(DeviceData& dd) {
     for (command_queue* q : dd.queues) {
         auto& s = *q->get_private_data<CmdState>();
+        s.pending_geometry = s.pending_copy = nullptr;
         s.latches.clear();
         s.tallies.clear();
         s.samples.clear();
+        s.draws.clear();
     }
 }
 
 }  // namespace
+
+uint64_t object_key(const DrawRecord& r, bool up_by_pointer) {
+    const DrawCall& c = r.call;
+    const DrawGeometry& g = r.geometry;
+    const uint64_t parts[] = {uint64_t(c.type) | (uint64_t(g.up) << 8),
+                              c.count,
+                              c.instances,
+                              c.first,
+                              uint64_t(uint32_t(c.vertex_offset)),
+                              g.vb,
+                              (uint64_t(g.vb_offset) << 32) | g.vb_stride,
+                              g.ib,
+                              g.vs,
+                              g.up ? (up_by_pointer ? g.up_vertices : g.up_hash) : 0,
+                              g.up && up_by_pointer ? g.up_indices : 0};
+    uint64_t h = 0xcbf29ce484222325ull;  // FNV-1a
+    for (uint64_t p : parts)
+        for (int i = 0; i < 8; ++i) h = (h ^ ((p >> (i * 8)) & 0xFF)) * 0x100000001b3ull;
+    return h;
+}
+
+void solver_draws(const std::vector<DrawRecord>& records, bool column_major, std::vector<mv::Draw>& out) {
+    out.clear();
+    for (const DrawRecord& r : records)
+        if (r.has_window) out.push_back({object_key(r), mat::load(r.window, column_major), double(r.call.count)});
+}
 
 void init_device(device* dev) {
     if (dev->get_private_data<DeviceData>() == nullptr) dev->create_private_data<DeviceData>();
@@ -244,6 +338,15 @@ void configure(device* dev, CbufferSource* source, const LatchRequest* req) {
     clear_queues(*dd);
 }
 
+void configure_draws(device* dev, CbufferSource* source, const DrawRequest* req) {
+    DeviceData* dd = dev->get_private_data<DeviceData>();
+    if (dd == nullptr) return;
+    const std::unique_lock lock(g_mutex);
+    dd->recorder = req != nullptr ? source : nullptr;
+    dd->draw_req = req != nullptr ? *req : DrawRequest{};
+    clear_queues(*dd);
+}
+
 void configure_discovery(device* dev, CbufferSource* source, uint32_t samples_per_frame, uint32_t max_bytes) {
     DeviceData* dd = dev->get_private_data<DeviceData>();
     if (dd == nullptr) return;
@@ -255,7 +358,7 @@ void configure_discovery(device* dev, CbufferSource* source, uint32_t samples_pe
     clear_queues(*dd);
 }
 
-FrameLatches end_frame(device* dev, FrameSamples* samples) {
+FrameLatches end_frame(device* dev, FrameSamples* samples, FrameDraws* draws) {
     FrameLatches out;
     DeviceData* dd = dev->get_private_data<DeviceData>();
     if (dd == nullptr) return out;
@@ -269,7 +372,18 @@ FrameLatches end_frame(device* dev, FrameSamples* samples) {
     }
     dd->last_draws.clear();
     for (const auto& [ds, s] : all.samples) dd->last_draws[ds] = s.draws;
-    if (samples != nullptr) *samples = std::move(all.samples);
+    if (samples != nullptr) {
+        for (auto& [ds, v] : all.draws) {
+            DepthSamples& d = all.samples[ds];
+            if (draws != nullptr)
+                d.all = v;
+            else
+                d.all = std::move(v);
+            d.window = dd->draw_req;
+        }
+        *samples = std::move(all.samples);
+    }
+    if (draws != nullptr) *draws = std::move(all.draws);
     return out;
 }
 

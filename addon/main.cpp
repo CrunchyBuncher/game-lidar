@@ -37,6 +37,7 @@
 #include "depth_capture.h"
 #include "depth_tracker.h"
 #include "discovery.h"
+#include "modelview.h"
 #include "profile.h"
 #include "ring.h"
 #include "watchdog.h"
@@ -123,6 +124,12 @@ std::filesystem::path g_profile_path;
 std::string g_profile_error;
 CameraStatus g_camera;
 
+// A model-view camera (plan_modelview.md): the solver over every draw into the captured depth buffer.
+mv::Solver g_solver;
+mv::Result g_mv;                    // last frame's
+std::vector<mv::Draw> g_mv_input;   // reused
+double g_mv_us = 0;                 // smoothed solve time
+
 std::vector<depth::Candidate> g_candidates;  // last frame's depth-stencils, best first
 uint64_t g_selected = 0;                     // handle captured last frame
 uint64_t g_override = 0;                     // manual pick from the overlay, 0 = auto
@@ -152,12 +159,22 @@ const CameraProfile* active_camera() {
 // Points the camera tracker at the active camera. Caller holds g_mutex.
 void configure_camera() {
     g_camera = {};
+    g_solver = mv::Solver();
+    g_mv = {};
     const CameraProfile* c = active_camera();
-    if (c != nullptr && g_source != nullptr) {
+    if (c != nullptr && g_source != nullptr && c->model_view()) {
+        // The constant projection is latched like any camera; the per-draw window is recorded at every draw.
+        const cam::LatchRequest req{c->key, c->proj_offset, 64, Latch::First};
+        cam::configure(g_device, g_source.get(), &req);
+        const cam::DrawRequest draws{c->key, c->view_offset};
+        cam::configure_draws(g_device, g_source.get(), &draws);
+    } else if (c != nullptr && g_source != nullptr) {
         const cam::LatchRequest req{c->key, c->window_offset(), c->window_size(), c->latch};
         cam::configure(g_device, g_source.get(), &req);
+        cam::configure_draws(g_device, nullptr, nullptr);
     } else {
         cam::configure(g_device, nullptr, nullptr);
+        cam::configure_draws(g_device, nullptr, nullptr);
     }
 }
 
@@ -311,8 +328,35 @@ void make_proj(const Settings& s, float aspect, float out[16]) {
     XMStoreFloat4x4(reinterpret_cast<XMFLOAT4X4*>(out), p);
 }
 
-// Fills the header's pose from this frame's latch for the captured depth-stencil.
-bool apply_camera(const cam::FrameLatches& latches, uint64_t depth_stencil, FrameHeader& h) {
+// A model-view camera's pose: the latched projection, and the view the solver finds in this frame's
+// draws into the captured depth-stencil.
+bool solve_model_view(const CameraProfile& camera, const cam::CbufferRead& proj_read, const cam::FrameDraws& draws,
+                      uint64_t depth_stencil, float view[16], float proj[16]) {
+    if (!decode_projection(camera, proj_read.bytes.data(), proj_read.bytes.size(), proj, &g_camera.why)) return false;
+    const auto d = draws.find(depth_stencil);
+    if (d == draws.end() || d->second.empty()) {
+        g_camera.why = "no draws recorded (model-view cameras need Direct3D 9 for now)";
+        return false;
+    }
+    LARGE_INTEGER t0, t1, freq;
+    QueryPerformanceCounter(&t0);
+    cam::solver_draws(d->second, camera.column_major, g_mv_input);
+    g_mv = g_solver.solve(g_mv_input);
+    QueryPerformanceCounter(&t1);
+    QueryPerformanceFrequency(&freq);
+    g_mv_us = g_mv_us * 0.9 + double(t1.QuadPart - t0.QuadPart) * 1e6 / double(freq.QuadPart) * 0.1;
+    if (!g_mv.posed) {
+        g_camera.why = "the draws don't agree on a camera this frame (" + std::to_string(g_mv.inliers) + " of " +
+                       std::to_string(g_mv.known) + " known objects agree)";
+        return false;
+    }
+    mat::store(g_mv.view, view);
+    return true;
+}
+
+// Fills the header's pose from this frame's latch (or model-view solve) for the captured depth-stencil.
+bool apply_camera(const cam::FrameLatches& latches, const cam::FrameDraws& draws, uint64_t depth_stencil,
+                  FrameHeader& h) {
     const CameraProfile* camera = active_camera();
     if (camera == nullptr) {
         g_camera.state = CameraStatus::NoProfile;
@@ -324,7 +368,11 @@ bool apply_camera(const cam::FrameLatches& latches, uint64_t depth_stencil, Fram
         return false;
     }
     float view[16], proj[16];
-    if (!decode_camera(*camera, it->second.bytes.data(), it->second.bytes.size(), view, proj, &g_camera.why)) {
+    const bool ok = camera->model_view()
+                        ? solve_model_view(*camera, it->second, draws, depth_stencil, view, proj)
+                        : decode_camera(*camera, it->second.bytes.data(), it->second.bytes.size(), view, proj,
+                                        &g_camera.why);
+    if (!ok) {
         g_camera.state = CameraStatus::Rejected;
         return false;
     }
@@ -336,6 +384,27 @@ bool apply_camera(const cam::FrameLatches& latches, uint64_t depth_stencil, Fram
     std::memcpy(h.proj, proj, sizeof(h.proj));
     h.flags |= kFlagPoseValid;
     return true;
+}
+
+// Logs the camera status when it changes (at most once a second), so ReShade.log tells why frames
+// go out without a pose even when nobody looks at the overlay.
+void log_camera_changes() {
+    static CameraStatus::State last_state = CameraStatus::NoProfile;
+    static std::string last_why;
+    static std::chrono::steady_clock::time_point last_time{};
+    const std::string why = g_camera.state == CameraStatus::Rejected ? g_camera.why : std::string();
+    const auto now = std::chrono::steady_clock::now();
+    if ((g_camera.state == last_state && why == last_why) || now - last_time < std::chrono::seconds(1)) return;
+    last_state = g_camera.state;
+    last_why = why;
+    last_time = now;
+    static const char* const kStates[] = {"no profile", "no latch", "rejected", "pose"};
+    std::string msg = std::string("Camera: ") + kStates[g_camera.state];
+    if (!why.empty()) msg += ": " + why;
+    if (const CameraProfile* c = active_camera(); c != nullptr && c->model_view())
+        msg += " (model-view: segment " + std::to_string(g_mv.segment) + ", " + std::to_string(g_mv.draws) +
+               " draws, " + std::to_string(g_mv.known) + " known, " + std::to_string(g_mv.inliers) + " agree)";
+    log_info(msg);
 }
 
 const char* api_name(device_api api) {
@@ -440,7 +509,10 @@ void on_present(command_queue* queue, swapchain* sc, const rect*, const rect*, u
 
     watchdog::exchange_step("present: camera end_frame");
     cam::FrameSamples samples;
-    const cam::FrameLatches latches = cam::end_frame(dev, g_discovering ? &samples : nullptr);
+    cam::FrameDraws draws;
+    const CameraProfile* camera = active_camera();
+    const cam::FrameLatches latches = cam::end_frame(dev, g_discovering ? &samples : nullptr,
+                                                     camera != nullptr && camera->model_view() ? &draws : nullptr);
     watchdog::exchange_step("present: depth end_frame");
     const resource_desc bb = dev->get_resource_desc(sc->get_current_back_buffer());
     std::vector<depth::Candidate> candidates = depth::end_frame(dev, bb.texture.width, bb.texture.height);
@@ -461,7 +533,9 @@ void on_present(command_queue* queue, swapchain* sc, const rect*, const rect*, u
         FrameHeader h{};
         h.frame_index = g_frame;
         h.timestamp_qpc = uint64_t(t0.QuadPart);
-        if (apply_camera(latches, pick->resource.handle, h)) {
+        const bool posed = apply_camera(latches, draws, pick->resource.handle, h);
+        log_camera_changes();
+        if (posed) {
             ++g_camera.with_pose;
         } else {
             ++g_camera.without_pose;
@@ -570,8 +644,15 @@ bool draw_camera_section() {
         case CameraStatus::Rejected:
             ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1), "Latched, but rejected: %s", g_camera.why.c_str());
             break;
-        case CameraStatus::Latched: ImGui::TextColored(ImVec4(0.3f, 1, 0.4f, 1), "Pose latched"); break;
+        case CameraStatus::Latched:
+            ImGui::TextColored(ImVec4(0.3f, 1, 0.4f, 1), c.model_view() ? "Pose solved" : "Pose latched");
+            break;
     }
+    if (c.model_view())
+        ImGui::Text("Model-view: segment %u, %u draws, %u known objects, %u agree; %u static, %u provisional, "
+                    "%u dynamic; %.0f us",
+                    g_mv.segment, g_mv.draws, g_mv.known, g_mv.inliers, g_mv.statics, g_mv.provisional, g_mv.dynamic,
+                    g_mv_us);
     ImGui::Text("Frames with pose %llu, without %llu", static_cast<unsigned long long>(g_camera.with_pose),
                 static_cast<unsigned long long>(g_camera.without_pose));
 
@@ -657,7 +738,9 @@ void draw_discovery_section() {
             ImGui::PushID(i);
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
-            if (ImGui::Selectable(std::to_string(i + 1).c_str(), expanded == i, ImGuiSelectableFlags_SpanAllColumns))
+            // AllowOverlap: without it the row-wide selectable swallows clicks on the Use/Save buttons.
+            if (ImGui::Selectable(std::to_string(i + 1).c_str(), expanded == i,
+                                  ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap))
                 expanded = expanded == i ? -1 : i;
             ImGui::TableNextColumn();
             ImGui::Text("%s%s%s", layout_name(c.profile.layout), c.profile.column_major ? " (column)" : "",

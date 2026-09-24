@@ -187,6 +187,7 @@ Test first on the **fake game with ReShade injected**, then on the real game.
 ---
 
 ## Immediate next steps
-1. Run discovery on the test game (Sonic Adventure 2, 32-bit D3D9), save its profile, and do
-   the 360° turn test (M3 exit).
+1. SA2 never uploads the camera alone: each draw gets world × view (VS c0, per draw), so no M3
+   latch can find it. Camera recovery from per-draw matrices is its own component:
+   **`plan_modelview.md`**. Then do the 360° turn test in SA2 (M3 exit) through it.
 2. Then M4.

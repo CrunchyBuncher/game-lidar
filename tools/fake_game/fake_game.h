@@ -69,7 +69,10 @@ enum class Api { D3D11, D3D12, D3D9 };
 //  ViewProj: only view_proj: b0 holds {view_proj, identity, view_proj}.
 //  Wvp:      only world * view * proj, per draw, in b1's world (c13); b0's matrices are identity.
 //            Like many D3D9 games. The level's draws have world = identity, the NPC's doesn't.
-enum class ConstantsLayout { Separate, ViewProj, Wvp };
+//  ModelView: D3D9 only. Only world * view, per draw, in c0 (b0's view), proj constant in c4, no
+//            view_proj. The level is split into many parts, each with its own placement (translated,
+//            yawed, some scaled), so no draw ever has the camera alone. Like Sonic Adventure 2.
+enum class ConstantsLayout { Separate, ViewProj, Wvp, ModelView };
 
 struct Options {
     Api api = Api::D3D11;
@@ -77,6 +80,7 @@ struct Options {
     bool cbv_tables = false;  // D3D12: bind the cbuffers through a descriptor table instead of root CBVs
     bool d3d12_debug = false;  // D3D12: enable the debug layer, print its messages, exit 3 on errors
     bool own_depth = false;    // D3D9: CreateDepthStencilSurface instead of the auto depth-stencil
+    bool up = false;           // D3D9: Draw[Indexed]PrimitiveUP from system memory instead of a vertex buffer
     bool d24 = false;          // D3D11: 24-bit depth buffer (a reference for D3D9, whose depth is 24-bit)
     DepthMode depth = DepthMode::Reversed;
     uint32_t capture_width = 480;
@@ -122,6 +126,8 @@ constexpr uint32_t kMaxDraws = 4;
 struct DrawItem {
     ObjectCB object;
     uint32_t first = 0, count = 0;  // vertices
+    DirectX::XMFLOAT4X4 model_view{};  // ModelView: placement * view, for c0; object.world then holds
+                                       // world * placement^-1, so the vertices still land in place
 };
 std::vector<DrawItem> scene_draws(const Options& opt, const Geometry& geo, const CameraCB& cam, double t);
 // The camera constants as uploaded for opt.layout. `cam` (the true matrices) is what gets published.

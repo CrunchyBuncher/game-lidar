@@ -51,6 +51,19 @@ struct BoundBuffer {
     CbufferRead read;
 };
 
+// Discovery diagnostics (model-view object keys, plan_modelview.md): what a draw reads its vertices
+// from. Native pointers; 0 = nothing bound.
+struct DrawGeometry {
+    uint64_t vb = 0, ib = 0, vs = 0;  // vertex stream 0, index buffer, vertex shader
+    uint32_t vb_offset = 0, vb_stride = 0;
+    // D3D9 Draw[Indexed]PrimitiveUP: vertices (and indices) come from game memory, not a buffer.
+    // Filled by complete_geometry(), once the draw has reached the driver.
+    bool up = false;
+    uint64_t up_vertices = 0, up_indices = 0;  // the game's pointers
+    uint32_t up_bytes = 0;                     // vertex + index bytes hashed
+    uint64_t up_hash = 0;
+};
+
 class CbufferSource {
 public:
     virtual ~CbufferSource() = default;
@@ -69,6 +82,13 @@ public:
     // Completes a read that wasn't ready at the draw. Called once the draw's command list has been
     // submitted (or at present for the immediate context). Returns out.ready.
     virtual bool resolve(CbufferRead& read) { return read.ready; }
+
+    // Discovery diagnostics: fills `out` for this draw, or returns false if the API isn't covered
+    // (only D3D9 so far). Called on the draw's thread, before the draw reaches the driver.
+    virtual bool read_geometry_at_draw(reshade::api::command_list* /*cmd*/, DrawGeometry& /*out*/) { return false; }
+    // For a draw read_geometry_at_draw marked `up`: records the game's vertex data. Call at the next
+    // draw on the same command list, or at present, whichever comes first.
+    virtual void complete_geometry(DrawGeometry& /*g*/) {}
 
     // Constant buffers currently tracked (overlay readout).
     virtual size_t tracked_buffers() const = 0;

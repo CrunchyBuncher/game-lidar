@@ -17,6 +17,10 @@ enum class CameraLayout {
     InvViewProjAndProj,  // "invviewproj+proj":  view = invViewProj^-1 * proj^-1
     ViewProj,            // "viewproj":          view and proj split out of viewProj (no proj_offset)
     InvViewProj,         // "invviewproj":       the same, from invViewProj^-1
+    ModelView,           // "modelview":         view_offset holds world * view, different per draw (no
+                         //                      draw has the camera alone); proj_offset a constant
+                         //                      projection. The view comes from mv::Solver over all of
+                         //                      the frame's draws (plan_modelview.md); latch doesn't apply.
 };
 
 // Which scene-depth draw of the frame supplies the camera.
@@ -37,6 +41,7 @@ struct CameraProfile {
     Latch latch = Latch::First;
 
     bool single_matrix() const { return layout == CameraLayout::ViewProj || layout == CameraLayout::InvViewProj; }
+    bool model_view() const { return layout == CameraLayout::ModelView; }
     // The contiguous byte window covering both matrices, relative to the bound range.
     uint32_t window_offset() const;
     uint32_t window_size() const;
@@ -59,7 +64,7 @@ const char* latch_name(Latch latch);
 const char* stage_name(reshade::api::shader_stage stage);
 
 // Decodes a latched window (starting at window_offset()) into protocol matrices. Returns false,
-// with a reason, for anything that isn't a plausible camera.
+// with a reason, for anything that isn't a plausible camera. Not for ModelView (see decode_projection).
 bool decode_camera(const CameraProfile& profile, const uint8_t* window, size_t window_size, float view[16],
                    float proj[16], std::string* why = nullptr);
 
@@ -72,5 +77,9 @@ struct ProjectionInfo {
     bool right_handed = false;    // camera looks down -z
 };
 ProjectionInfo analyze_projection(const float proj[16]);
+
+// ModelView: the constant projection at proj_offset, from a window read at proj_offset.
+bool decode_projection(const CameraProfile& profile, const uint8_t* window, size_t window_size, float proj[16],
+                       std::string* why = nullptr);
 
 }  // namespace lidar

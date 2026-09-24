@@ -71,6 +71,7 @@ struct Renderer {
     ComPtr<IDirect3DDevice9> dev;
     D3DPRESENT_PARAMETERS pp{};
     ComPtr<IDirect3DSurface9> own_depth;  // --own-depth
+    std::vector<uint32_t> up_indices;     // --up: 0, 1, 2, ...
     ComPtr<IDirect3DVertexBuffer9> vb;
     ComPtr<IDirect3DVertexDeclaration9> decl;
     ComPtr<IDirect3DVertexShader9> vs;
@@ -164,9 +165,21 @@ struct Renderer {
         const float half_pixel[4] = {-1.0f / float(pp.BackBufferWidth), 1.0f / float(pp.BackBufferHeight), 0, 0};
         dev->SetVertexShaderConstantF(kHalfPixelReg, half_pixel, 1);
 
+        uint32_t n = 0;
         for (const DrawItem& d : scene_draws(opt, geo, cam, t)) {
             dev->SetVertexShaderConstantF(kObjectReg, reinterpret_cast<const float*>(&d.object), kObjectRegs);
-            dev->DrawPrimitive(D3DPT_TRIANGLELIST, d.first, d.count / 3);
+            if (opt.layout == ConstantsLayout::ModelView)
+                dev->SetVertexShaderConstantF(0, reinterpret_cast<const float*>(&d.model_view), 4);
+            if (!opt.up) {
+                dev->DrawPrimitive(D3DPT_TRIANGLELIST, d.first, d.count / 3);
+            } else if (n++ % 2 == 0) {
+                dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, d.count / 3, &geo.verts[d.first], sizeof(Vertex));
+            } else {
+                if (up_indices.size() < d.count)
+                    for (uint32_t i = uint32_t(up_indices.size()); i < d.count; ++i) up_indices.push_back(i);
+                dev->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, d.count, d.count / 3, up_indices.data(),
+                                            D3DFMT_INDEX32, &geo.verts[d.first], sizeof(Vertex));
+            }
         }
         dev->EndScene();
         const HRESULT hr = dev->Present(nullptr, nullptr, nullptr, nullptr);

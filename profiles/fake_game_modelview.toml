@@ -1,0 +1,12 @@
+# fake_game --api d3d9 --camera-layout modelview: world * view per draw in c0, the projection in c4.
+# The view comes from the model-view solver (plan_modelview.md). To use it, set Profile in
+# ReShade.ini's [LIDAR] section, or type the name in the overlay.
+
+[camera]
+stage       = "vertex"
+slot        = 0
+layout      = "modelview"
+view_offset = 0
+proj_offset = 64
+major       = "row"
+handed      = "left"

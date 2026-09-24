@@ -9,10 +9,13 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <memory>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 
 #include "camera_math.h"
+#include "modelview.h"
 
 using reshade::api::shader_stage;
 
@@ -27,6 +30,7 @@ constexpr size_t kMaxCandidates = 96;
 constexpr size_t kPublished = 16;        // candidates in the status snapshot
 constexpr size_t kDepthFrames = 16;
 constexpr uint32_t kRebuildEvery = 30;   // analyzed frames between candidate rebuilds
+constexpr uint64_t kCensusEvery = 30;    // frames between the report's censuses of every draw
 constexpr double kStill = 0.005;         // depth change below this: the camera didn't move
 constexpr double kMoving = 0.05;         // above: it did
 constexpr double kReprojMotion = 0.08;   // a reprojection test needs at least this much change
@@ -98,6 +102,9 @@ struct Candidate {
     uint32_t reproj_tests = 0, reproj_passes = 0;
     std::deque<float> errors;  // recent test errors
     uint32_t temporal_checks = 0, temporal_agree = 0;
+    // ModelView: the solver over every frame's draws, and the views it found (nullopt: no pose).
+    std::shared_ptr<mv::Solver> solver;
+    std::deque<std::pair<uint64_t, std::optional<mat::Mat>>> views;
 
     double temporal() const { return temporal_checks ? double(temporal_agree) / temporal_checks : 0.5; }
     double error() const {
@@ -124,6 +131,7 @@ int layout_preference(CameraLayout l) {
         case CameraLayout::InvViewProjAndProj: return 3;
         case CameraLayout::ViewProj: return 4;
         case CameraLayout::InvViewProj: return 5;
+        case CameraLayout::ModelView: return 6;
     }
     return 9;
 }
@@ -151,12 +159,236 @@ bool view_changed(const mat::Mat& a, const mat::Mat& b) {
     return false;
 }
 
+// Every distinct raw value of a window over one frame's sampled draws (report only): shows what a
+// latch would have to pick from when the value differs per draw.
+struct Snapshot {
+    struct Value {
+        float f[16];
+        uint32_t bits = 0;            // classify_matrix
+        std::vector<uint32_t> draws;  // draw numbers that saw it
+    };
+    struct Window {
+        BufId buf;
+        uint32_t offset = 0;
+        std::vector<Value> values;  // in order of first use
+    };
+    struct Draw {
+        uint32_t draw = 0;
+        cam::DrawCall call;
+        cam::DrawGeometry geometry;
+    };
+    uint64_t frame = 0;
+    uint32_t draws = 0, sampled = 0;
+    std::vector<Window> windows;
+    std::vector<Draw> calls;  // the sampled draws' calls and geometry
+};
+
+std::string kinds_text(uint32_t bits) {
+    std::string s;
+    for (uint32_t k = 0; k < 8; ++k)
+        if (bits & (1u << k)) {
+            if (!s.empty()) s += ' ';
+            s += kind_name(MatrixKind(k >> 1));
+            s += (k & 1) ? "(col)" : "(row)";
+        }
+    return s.empty() ? "-" : s;
+}
+
+// ---- Census: model-view diagnostics (plan_modelview.md) ----------------------------------------
+// Can the same object be found again in a later frame, and do matched objects agree on one camera
+// motion? For a static object, M(t0)^-1 * M(t1) = V(t0)^-1 * V(t1) (row vectors, M = W * V).
+
+struct Census {
+    uint64_t frame = 0;
+    uint32_t draws = 0;
+    std::vector<cam::DrawRecord> records;
+};
+
+const char* draw_kind(const cam::DrawCall& c, const cam::DrawGeometry& g) {
+    if (c.type == cam::DrawType::Indirect) return "indirect";
+    if (g.up) return c.type == cam::DrawType::Indexed ? "indexed-UP" : "UP";
+    return c.type == cam::DrawType::Indexed ? "indexed" : "draw";
+}
+
+std::string draw_text(const cam::DrawCall& c, const cam::DrawGeometry& g) {
+    char buf[256];
+    int n = std::snprintf(buf, sizeof(buf), "%-10s n=%u", draw_kind(c, g), c.count);
+    auto add = [&](const char* fmt, auto... args) {
+        if (n >= 0 && size_t(n) < sizeof(buf)) n += std::snprintf(buf + n, sizeof(buf) - size_t(n), fmt, args...);
+    };
+    if (c.instances != 1) add(" inst=%u", c.instances);
+    if (c.first) add(" first=%u", c.first);
+    if (c.vertex_offset) add(" base=%d", c.vertex_offset);
+    if (g.up) {
+        add(" | up %llx", (unsigned long long)g.up_vertices);
+        if (g.up_indices) add(" idx %llx", (unsigned long long)g.up_indices);
+        add(" %u B hash %016llx", g.up_bytes, (unsigned long long)g.up_hash);
+    } else {
+        add(" | vb %llx+%u/%u", (unsigned long long)g.vb, g.vb_offset, g.vb_stride);
+        if (g.ib) add(" ib %llx", (unsigned long long)g.ib);
+    }
+    if (g.vs) add(" vs %llx", (unsigned long long)g.vs);
+    return buf;
+}
+
+// UP draws by the hash of their data (`content`, what the solver uses), or by the game's pointers.
+uint64_t report_key(const cam::DrawRecord& r, bool content) { return cam::object_key(r, !content); }
+
+using mat::translation_between;
+double rotation_between(const mat::Mat& a, const mat::Mat& b) { return mat::rotation_between_deg(a, b); }
+
+bool same_motion(const mat::Mat& a, const mat::Mat& b) {
+    const double scale = std::max({1.0, std::abs(a.m[3][0]), std::abs(a.m[3][1]), std::abs(a.m[3][2])});
+    return rotation_between(a, b) < 0.05 && translation_between(a, b) < 0.01 + 1e-4 * scale;
+}
+
+using KeyMap = std::unordered_map<uint64_t, std::vector<const cam::DrawRecord*>>;
+KeyMap group_by_key(const Census& c, bool content) {
+    KeyMap m;
+    for (const cam::DrawRecord& r : c.records) m[report_key(r, content)].push_back(&r);
+    return m;
+}
+
+void write_census(std::ofstream& f, const Census& c, bool list) {
+    char line[512];
+    uint32_t kinds[5] = {}, windows = 0, rigid_col = 0, rigid_row = 0;
+    std::unordered_set<uint64_t> distinct;
+    for (const cam::DrawRecord& r : c.records) {
+        const cam::DrawCall& call = r.call;
+        ++kinds[call.type == cam::DrawType::Indirect      ? 4
+                : r.geometry.up                           ? (call.type == cam::DrawType::Indexed ? 3 : 2)
+                : call.type == cam::DrawType::Indexed     ? 1
+                                                          : 0];
+        if (!r.has_window) continue;
+        ++windows;
+        distinct.insert(hash_bytes(r.window, sizeof(r.window)));
+        const uint32_t bits = classify_matrix(r.window);
+        rigid_col += (bits & kind_bit(MatrixKind::Rigid, true)) != 0;
+        rigid_row += (bits & kind_bit(MatrixKind::Rigid, false)) != 0;
+    }
+    std::snprintf(line, sizeof(line),
+                  "\n== Census, frame %llu: %zu draws (draw %u, indexed %u, UP %u, indexed-UP %u, indirect %u) ==\n"
+                  "vertex c0-c3: read at %u draws, %zu distinct values, rigid column-major %u, row-major %u\n",
+                  (unsigned long long)c.frame, c.records.size(), kinds[0], kinds[1], kinds[2], kinds[3], kinds[4],
+                  windows, distinct.size(), rigid_col, rigid_row);
+    f << line;
+    for (bool content : {false, true}) {
+        const KeyMap keys = group_by_key(c, content);
+        uint32_t once = 0, repeated_same = 0, repeated_diff = 0;
+        for (const auto& [k, rs] : keys) {
+            if (rs.size() == 1) {
+                ++once;
+                continue;
+            }
+            bool same = true;
+            for (const cam::DrawRecord* r : rs)
+                same = same && r->has_window == rs[0]->has_window &&
+                       std::memcmp(r->window, rs[0]->window, sizeof(r->window)) == 0;
+            ++(same ? repeated_same : repeated_diff);
+        }
+        std::snprintf(line, sizeof(line),
+                      "%s keys: %zu distinct, %u drawn once, %u drawn repeatedly with one c0-c3, %u with several "
+                      "(ambiguous)\n",
+                      content ? "content (UP by data hash)" : "pointer (UP by game pointer)", keys.size(), once,
+                      repeated_same, repeated_diff);
+        f << line;
+    }
+    if (!list) return;
+    f << "draw  call | geometry | c0-c3 hash, kinds | pointer key / content key\n";
+    size_t n = 0;
+    for (const cam::DrawRecord& r : c.records) {
+        if (++n > 2500) {
+            f << "...\n";
+            break;
+        }
+        std::snprintf(line, sizeof(line), "%5u %s | %08x %s | %08x / %08x\n", r.draw,
+                      draw_text(r.call, r.geometry).c_str(),
+                      r.has_window ? uint32_t(hash_bytes(r.window, sizeof(r.window))) : 0u,
+                      r.has_window ? kinds_text(classify_matrix(r.window)).c_str() : "(unread)",
+                      uint32_t(report_key(r, false)), uint32_t(report_key(r, true)));
+        f << line;
+    }
+}
+
+// Objects drawn exactly once in both frames, and the camera motion each implies.
+void write_census_pair(std::ofstream& f, const Census& a, const Census& b) {
+    char line[512];
+    std::snprintf(line, sizeof(line), "\n== Census frames %llu -> %llu: objects matched by key ==\n",
+                  (unsigned long long)a.frame, (unsigned long long)b.frame);
+    f << line;
+    struct Match {
+        const cam::DrawRecord *a, *b;
+        mat::Mat d;
+        bool inlier = false;
+    };
+    std::vector<Match> listed;
+    size_t listed_inliers = 0;
+    for (bool content : {false, true}) {
+        const KeyMap ka = group_by_key(a, content), kb = group_by_key(b, content);
+        std::vector<std::pair<const cam::DrawRecord*, const cam::DrawRecord*>> common;
+        for (const auto& [k, ra] : ka) {
+            const auto it = kb.find(k);
+            if (ra.size() != 1 || it == kb.end() || it->second.size() != 1) continue;
+            if (ra[0]->has_window && it->second[0]->has_window) common.emplace_back(ra[0], it->second[0]);
+        }
+        std::sort(common.begin(), common.end(), [](const auto& x, const auto& y) { return x.first->draw < y.first->draw; });
+        uint32_t identical = 0;
+        for (const auto& [ra, rb] : common) identical += std::memcmp(ra->window, rb->window, sizeof(ra->window)) == 0;
+        std::snprintf(line, sizeof(line), "%s keys: %zu objects drawn once in both frames, %u with identical c0-c3\n",
+                      content ? "content" : "pointer", common.size(), identical);
+        f << line;
+        for (bool column_major : {true, false}) {
+            std::vector<Match> ms;
+            for (const auto& [ra, rb] : common) {
+                mat::Mat ia;
+                if (!mat::inverse(mat::load(ra->window, column_major), ia)) continue;
+                Match m{ra, rb, mat::mul(ia, mat::load(rb->window, column_major))};
+                if (mat::finite(m.d)) ms.push_back(m);
+            }
+            size_t best = 0, best_n = 0;
+            for (size_t i = 0; i < ms.size(); ++i) {
+                size_t n = 0;
+                for (const Match& m : ms) n += same_motion(ms[i].d, m.d);
+                if (n > best_n) best = i, best_n = n;
+            }
+            if (ms.empty()) continue;
+            for (Match& m : ms) m.inlier = same_motion(ms[best].d, m.d);
+            const mat::Mat& d = ms[best].d;
+            std::snprintf(line, sizeof(line),
+                          "  %s-major: %zu invertible, motion consensus %zu (%.0f%%): rotation %.3f deg, "
+                          "translation (%.3f %.3f %.3f)\n",
+                          column_major ? "column" : "row", ms.size(), best_n, 100.0 * best_n / ms.size(),
+                          rotation_between(d, mat::identity()), d.m[3][0], d.m[3][1], d.m[3][2]);
+            f << line;
+            if (best_n > listed_inliers) listed = std::move(ms), listed_inliers = best_n;
+        }
+    }
+    if (listed.empty()) return;
+    f << "best consensus, per object: draw A -> B, call, inlier, rotation/translation off the consensus\n";
+    const mat::Mat* ref = nullptr;
+    for (const Match& m : listed)
+        if (m.inlier) ref = &m.d;
+    size_t n = 0;
+    for (const Match& m : listed) {
+        if (++n > 400) {
+            f << "...\n";
+            break;
+        }
+        std::snprintf(line, sizeof(line), "  %5u -> %5u %s  %s  %.4f deg  %.4f\n", m.a->draw, m.b->draw,
+                      draw_text(m.a->call, m.a->geometry).c_str(), m.inlier ? "in " : "OUT",
+                      rotation_between(m.d, *ref), translation_between(m.d, *ref));
+        f << line;
+    }
+}
+
 std::string describe(const CameraProfile& c, bool registers) {
     char buf[160];
     const char* stage = stage_name(c.key.stage);
     if (registers) {
         if (c.single_matrix())
             std::snprintf(buf, sizeof(buf), "%s c%u", stage, c.view_offset / 16);
+        else if (c.model_view())
+            std::snprintf(buf, sizeof(buf), "%s c%u per draw / c%u", stage, c.view_offset / 16, c.proj_offset / 16);
         else
             std::snprintf(buf, sizeof(buf), "%s c%u / c%u", stage, c.view_offset / 16, c.proj_offset / 16);
     } else {
@@ -189,6 +421,11 @@ struct Discovery::State {
     uint64_t last_frame = 0;  // latest analyzed sample frame
     std::vector<uint8_t> window;
     std::unordered_map<uint64_t, uint32_t> window_bits;  // classify_matrix by window content
+    Snapshot snapshots[2];                               // latest, and the one before (report)
+    std::deque<Census> censuses;                         // latest last (report)
+    bool have_draws = false;                             // the tracker records every draw (D3D9)
+    cam::DrawRequest draw_window;                        // ... reading their window here
+    std::vector<mv::Draw> solver_input;
 
     // ---- 1. Scan --------------------------------------------------------------------------
 
@@ -205,6 +442,15 @@ struct Discovery::State {
         last_frame = sf.frame;
         stats.last_samples = uint32_t(sf.samples.samples.size());
         stats.last_draws = sf.samples.draws;
+        if (!sf.samples.all.empty()) {
+            have_draws = true;
+            draw_window = sf.samples.window;
+            if (censuses.empty() || sf.frame >= censuses.back().frame + kCensusEvery) {
+                censuses.push_back({sf.frame, sf.samples.draws, sf.samples.all});
+                if (censuses.size() > 3) censuses.pop_front();
+            }
+            solve_model_views(sf);
+        }
 
         // Every window's classification, once per distinct buffer content.
         std::unordered_map<uint64_t, std::vector<std::pair<uint32_t, uint32_t>>> classified;
@@ -274,7 +520,67 @@ struct Discovery::State {
         if (stats.frames_analyzed % kRebuildEvery == 0) {
             prune();
             rebuild_candidates();
+            snapshot(sf);
         }
+    }
+
+    // Every model-view candidate's solver takes this frame's draws; its view (or no pose) is kept
+    // for scoring like any other candidate's matrices.
+    void solve_model_views(const SampleFrame& sf) {
+        for (auto& [k, c] : candidates) {
+            if (!c.profile.model_view()) continue;
+            if (!c.solver) c.solver = std::make_shared<mv::Solver>();
+            cam::solver_draws(sf.samples.all, c.profile.column_major, solver_input);
+            const mv::Result r = c.solver->solve(solver_input);
+            c.views.emplace_back(sf.frame, r.posed ? std::optional<mat::Mat>(r.view) : std::nullopt);
+            if (c.views.size() > kHistory) c.views.pop_front();
+        }
+    }
+
+    // The windows of every hypothesis, plus the first four of each buffer (where a world-view or
+    // world-view-projection that never classifies would sit), over this frame's sampled draws.
+    void snapshot(const SampleFrame& sf) {
+        constexpr size_t kMaxValues = 24;
+        snapshots[1] = std::move(snapshots[0]);
+        Snapshot& s = snapshots[0];
+        s = {};
+        s.frame = sf.frame;
+        s.draws = sf.samples.draws;
+        s.sampled = uint32_t(sf.samples.samples.size());
+        for (const cam::DrawSample& d : sf.samples.samples) s.calls.push_back({d.draw, d.call, d.geometry});
+        auto slot = [&](const BufId& id, uint32_t off) -> Snapshot::Window& {
+            for (Snapshot::Window& w : s.windows)
+                if (w.buf == id && w.offset == off) return w;
+            return s.windows.emplace_back(Snapshot::Window{id, off, {}});
+        };
+        for (const auto& [loc, h] : hyps) slot(loc.buf, loc.offset);
+        for (const cam::DrawSample& d : sf.samples.samples)
+            for (const cam::BoundBuffer& b : d.buffers)
+                for (uint32_t off = 0; off < 256; off += 64) slot({b.key.stage, b.key.slot, b.key.space, b.key.size}, off);
+        std::sort(s.windows.begin(), s.windows.end(), [](const Snapshot::Window& x, const Snapshot::Window& y) {
+            if (x.buf.stage != y.buf.stage) return uint32_t(x.buf.stage) < uint32_t(y.buf.stage);
+            if (x.buf.slot != y.buf.slot) return x.buf.slot < y.buf.slot;
+            return x.offset < y.offset;
+        });
+
+        for (const cam::DrawSample& d : sf.samples.samples)
+            for (const cam::BoundBuffer& b : d.buffers) {
+                const BufId id{b.key.stage, b.key.slot, b.key.space, b.key.size};
+                const std::vector<uint8_t>& bytes = b.read.bytes;
+                for (Snapshot::Window& w : s.windows) {
+                    if (!(w.buf == id) || w.offset + 64 > bytes.size()) continue;
+                    const uint8_t* p = bytes.data() + w.offset;
+                    auto it = std::find_if(w.values.begin(), w.values.end(),
+                                           [&](const Snapshot::Value& v) { return std::memcmp(v.f, p, 64) == 0; });
+                    if (it == w.values.end()) {
+                        if (w.values.size() >= kMaxValues) continue;
+                        it = w.values.emplace(w.values.end());
+                        std::memcpy(it->f, p, 64);
+                        it->bits = classify_matrix(it->f);
+                    }
+                    it->draws.push_back(d.draw);
+                }
+            }
     }
 
     // Hypotheses that mostly don't hold (e.g. a matrix that only sometimes looks rigid) go, and so
@@ -344,6 +650,13 @@ struct Discovery::State {
                 auto apart = [&](const Hypothesis* h) {
                     return std::max(h->loc.offset, p->loc.offset) - std::min(h->loc.offset, p->loc.offset) >= 64;
                 };
+                // A rigid matrix that differs per draw, next to a constant projection: world * view.
+                // Only where the tracker records every draw's window.
+                for (const Hypothesis* h : rigid)
+                    if (apart(h) && per_draw(*h) && p->changes * 5 < p->frames_valid && have_draws &&
+                        h->loc.buf.stage == draw_window.key.stage && h->loc.buf.slot == draw_window.key.slot &&
+                        h->loc.offset == draw_window.offset)
+                        add_candidate(CameraLayout::ModelView, *h, p, Latch::First);
                 for (const Hypothesis* h : vp)
                     if (apart(h)) add(CameraLayout::ViewProjAndProj, *h, p);
                 for (const Hypothesis* h : ivp)
@@ -362,6 +675,7 @@ struct Discovery::State {
     // didn't decode.
     int decode(const Candidate& c, uint64_t frame, mat::Mat& view, mat::Mat& proj, float* view_f = nullptr,
                float* proj_f = nullptr) {
+        if (c.profile.model_view()) return decode_model_view(c, frame, view, proj, view_f, proj_f);
         const auto ha = hyps.find(c.a);
         if (ha == hyps.end()) return 1;
         const Record* ra = ha->second.at(frame);
@@ -382,6 +696,23 @@ struct Discovery::State {
         view = mat::load(v, false);
         proj = mat::load(pr, false);
         if (view_f) std::memcpy(view_f, v, sizeof(v));
+        if (proj_f) std::memcpy(proj_f, pr, sizeof(pr));
+        return 0;
+    }
+
+    // The solver's view at `frame`, and the projection hypothesis' value.
+    int decode_model_view(const Candidate& c, uint64_t frame, mat::Mat& view, mat::Mat& proj, float* view_f,
+                          float* proj_f) {
+        const auto v = std::find_if(c.views.rbegin(), c.views.rend(), [&](const auto& e) { return e.first == frame; });
+        const auto hb = hyps.find(c.b);
+        const Record* rb = hb != hyps.end() ? hb->second.at(frame) : nullptr;
+        if (v == c.views.rend() || rb == nullptr) return 1;
+        if (!v->second) return 2;
+        float pr[16];
+        if (!decode_projection(c.profile, reinterpret_cast<const uint8_t*>(rb->common), 64, pr)) return 2;
+        view = *v->second;
+        proj = mat::load(pr, false);
+        if (view_f) mat::store(view, view_f);
         if (proj_f) std::memcpy(proj_f, pr, sizeof(pr));
         return 0;
     }
@@ -551,6 +882,43 @@ struct Discovery::State {
                 }
             }
         }
+
+        for (const Snapshot& s : snapshots) {
+            if (s.frame == 0) continue;
+            std::snprintf(line, sizeof(line),
+                          "\n== Per-draw values, frame %llu (%u draws, %u sampled; raw memory order, draws "
+                          "listed by number) ==\n",
+                          (unsigned long long)s.frame, s.draws, s.sampled);
+            f << line;
+            for (const Snapshot::Window& w : s.windows) {
+                if (w.values.empty()) continue;
+                std::snprintf(line, sizeof(line), "%s slot %u offset %u (c%u): %zu distinct%s\n", stage_name(w.buf.stage),
+                              w.buf.slot, w.offset, w.offset / 16, w.values.size(),
+                              w.values.size() >= 24 ? " (capped)" : "");
+                f << line;
+                for (const Snapshot::Value& v : w.values) {
+                    std::string draws;
+                    for (size_t i = 0; i < v.draws.size() && i < 16; ++i) draws += ' ' + std::to_string(v.draws[i]);
+                    if (v.draws.size() > 16) draws += " ...";
+                    std::snprintf(line, sizeof(line), "  %zu draws [%s ] %s\n", v.draws.size(), draws.c_str() + 1,
+                                  kinds_text(v.bits).c_str());
+                    f << line;
+                    for (int r = 0; r < 4; ++r) {
+                        std::snprintf(line, sizeof(line), "    %12.5g %12.5g %12.5g %12.5g\n", v.f[r * 4],
+                                      v.f[r * 4 + 1], v.f[r * 4 + 2], v.f[r * 4 + 3]);
+                        f << line;
+                    }
+                }
+            }
+            f << "sampled draws (call | geometry):\n";
+            for (const Snapshot::Draw& d : s.calls) {
+                std::snprintf(line, sizeof(line), "  %5u %s\n", d.draw, draw_text(d.call, d.geometry).c_str());
+                f << line;
+            }
+        }
+
+        for (size_t i = 0; i < censuses.size(); ++i) write_census(f, censuses[i], i + 1 == censuses.size());
+        for (size_t i = 1; i < censuses.size(); ++i) write_census_pair(f, censuses[i - 1], censuses[i]);
     }
 };
 
