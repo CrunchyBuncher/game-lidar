@@ -94,6 +94,23 @@ public:
         return true;
     }
 
+    // Each stage's register file as one buffer, up to the highest register written (never-set ones
+    // read as zero).
+    void read_all_at_draw(command_list*, uint32_t max_bytes, std::vector<BoundBuffer>& out) override {
+        DeviceData* dd = dev_->get_private_data<DeviceData>();
+        const std::lock_guard lock(dd->mutex);
+        for (int si = 0; si < 2; ++si) {
+            const RegisterFile& f = dd->stages[si];
+            const size_t n = std::min(f.values.size() * sizeof(float), size_t(max_bytes) & ~size_t(15));
+            if (n == 0) continue;
+            BoundBuffer& b = out.emplace_back();
+            b.key.stage = si == 0 ? shader_stage::vertex : shader_stage::pixel;
+            const auto* bytes = reinterpret_cast<const uint8_t*>(f.values.data());
+            b.read.bytes.assign(bytes, bytes + n);
+            b.read.ready = true;
+        }
+    }
+
     // Registers ever set, vertex + pixel (overlay readout).
     size_t tracked_buffers() const override {
         DeviceData* dd = dev_->get_private_data<DeviceData>();

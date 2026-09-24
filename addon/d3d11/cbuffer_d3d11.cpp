@@ -183,7 +183,37 @@ public:
         out.offset = r.offset + offset;
         out.bytes.assign(data.begin() + ptrdiff_t(out.offset), data.begin() + ptrdiff_t(out.offset + size));
         out.ready = true;
+        out.source_size = uint32_t(data.size());
         return true;
+    }
+
+    void read_all_at_draw(command_list* cmd, uint32_t max_bytes, std::vector<BoundBuffer>& out) override {
+        static constexpr shader_stage kGraphics[] = {shader_stage::vertex, shader_stage::hull, shader_stage::domain,
+                                                     shader_stage::geometry, shader_stage::pixel};
+        const Bindings* b = cmd->get_private_data<Bindings>();
+        if (b == nullptr) return;
+        DeviceData* dd = dev_->get_private_data<DeviceData>();
+        const std::lock_guard lock(dd->mutex);
+        for (const shader_stage stage : kGraphics) {
+            const int si = stage_index(stage);
+            for (uint32_t slot = 0; slot < kSlots; ++slot) {
+                const buffer_range& r = b->cb[si][slot];
+                if (r.buffer == 0) continue;
+                const auto it = dd->buffers.find(r.buffer.handle);
+                if (it == dd->buffers.end() || !it->second.valid) continue;
+                const std::vector<uint8_t>& data = it->second.data;
+                if (r.offset >= data.size()) continue;
+                const uint64_t n = std::min<uint64_t>({r.size, data.size() - r.offset, max_bytes}) & ~uint64_t(15);
+                if (n == 0) continue;
+                BoundBuffer& bb = out.emplace_back();
+                bb.key = {stage, slot, 0, uint32_t(data.size())};
+                bb.read.buffer = r.buffer.handle;
+                bb.read.offset = r.offset;
+                bb.read.bytes.assign(data.begin() + ptrdiff_t(r.offset), data.begin() + ptrdiff_t(r.offset + n));
+                bb.read.ready = true;
+                bb.read.source_size = uint32_t(data.size());
+            }
+        }
     }
 
     size_t tracked_buffers() const override {

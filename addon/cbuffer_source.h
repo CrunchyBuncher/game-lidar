@@ -32,6 +32,7 @@ struct CbufferRead {
     uint64_t offset = 0;          // absolute byte offset in the buffer
     std::vector<uint8_t> bytes;   // the data, once ready
     bool ready = false;
+    uint32_t source_size = 0;     // what CbufferKey::size compares to (buffer or CBV size), 0 if unknown
 
     // What resolve() needs when the source couldn't read at the draw. Only that source uses these.
     struct Deferred {
@@ -40,7 +41,14 @@ struct CbufferRead {
         uint64_t descriptor_heap = 0;  // D3D12 descriptor table: the CBV's heap + index, looked up at
         uint32_t descriptor = 0;       // submit (descriptors may be written after the draw). `buffer` is
                                        // then 0 and `offset` relative to the view until resolved.
+        bool clamp = false;            // read up to `size` bytes, fewer if the buffer/view ends first
     } deferred;
+};
+
+// A constant buffer bound at a draw, as discovery sees it: where it's bound and its contents.
+struct BoundBuffer {
+    CbufferKey key;  // key.size = read.source_size
+    CbufferRead read;
 };
 
 class CbufferSource {
@@ -51,6 +59,12 @@ public:
     // nothing matching is bound (or its contents aren't known yet). `out.bytes` keeps its capacity.
     virtual bool read_at_draw(reshade::api::command_list* cmd, const CbufferKey& key, uint32_t offset, uint32_t size,
                               CbufferRead& out) = 0;
+
+    // Discovery: appends a read of every constant buffer bound to a graphics stage at this draw, from
+    // the start of its bound range, up to `max_bytes` each. Reads that aren't ready go through resolve()
+    // like read_at_draw's.
+    virtual void read_all_at_draw(reshade::api::command_list* cmd, uint32_t max_bytes,
+                                  std::vector<BoundBuffer>& out) = 0;
 
     // Completes a read that wasn't ready at the draw. Called once the draw's command list has been
     // submitted (or at present for the immediate context). Returns out.ready.

@@ -209,6 +209,14 @@ void on_reset_command_list(command_list* cmd) {
     if (Bindings* b = cmd->get_private_data<Bindings>()) b->clear();
 }
 
+// The stage a profile names for a CBV visible to `visibility` (find_cbv matches any visible stage).
+shader_stage first_graphics_stage(shader_stage visibility) {
+    for (const shader_stage s : {shader_stage::vertex, shader_stage::pixel, shader_stage::geometry,
+                                 shader_stage::hull, shader_stage::domain})
+        if ((visibility & s) != 0) return s;
+    return shader_stage::vertex;
+}
+
 bool same_key(const CbufferKey& a, const CbufferKey& b) {
     return a.stage == b.stage && a.slot == b.slot && a.space == b.space;
 }
@@ -254,16 +262,56 @@ public:
         return true;
     }
 
+    // Every CBV the current root signature binds for graphics: root CBVs and table ranges (the first
+    // 16 registers of each). Sizes are only known at resolve, so the reads are clamped there.
+    void read_all_at_draw(command_list* cmd, uint32_t max_bytes, std::vector<BoundBuffer>& out) override {
+        Bindings* b = cmd->get_private_data<Bindings>();
+        if (b == nullptr || b->layout == 0) return;
+        const std::shared_lock lock(dd_->layout_mutex);
+        const auto it = dd_->layouts.find(b->layout.handle);
+        if (it == dd_->layouts.end()) return;
+        const RootLayout& layout = it->second;
+        auto add = [&](shader_stage visibility, uint32_t reg, uint32_t space) -> CbufferRead& {
+            BoundBuffer& bb = out.emplace_back();
+            bb.key = {first_graphics_stage(visibility), reg, space, 0};
+            bb.read.deferred = {max_bytes, 0, 0, 0, true};
+            return bb.read;
+        };
+        for (uint32_t i = 0; i < uint32_t(layout.size()) && i < b->params.size(); ++i) {
+            const RootParam& p = layout[i];
+            const Bound& bound = b->params[i];
+            if (p.kind == RootParam::RootCbv && bound.cbv.buffer != 0 && graphics(p.visibility)) {
+                CbufferRead& r = add(p.visibility, p.reg, p.space);
+                r.buffer = bound.cbv.buffer.handle;
+                r.offset = bound.cbv.offset;
+            } else if (p.kind == RootParam::Table && bound.table != 0) {
+                for (const CbvRange& range : p.ranges) {
+                    if (!graphics(range.visibility)) continue;
+                    for (uint32_t k = 0; k < std::min(range.count, 16u); ++k) {
+                        descriptor_heap heap{0};
+                        uint32_t index = 0;
+                        dev_->get_descriptor_heap_offset(descriptor_table{bound.table}, range.table_offset + k, 0,
+                                                         &heap, &index);
+                        if (heap == 0) continue;
+                        CbufferRead& r = add(range.visibility, range.reg + k, range.space);
+                        r.deferred.descriptor_heap = heap.handle;
+                        r.deferred.descriptor = index;
+                    }
+                }
+            }
+        }
+    }
+
     bool resolve(CbufferRead& read) override {
         if (read.ready) return true;
-        const uint32_t size = read.deferred.size;
+        uint32_t size = read.deferred.size;
         resource buffer{read.buffer};
         uint64_t offset = read.offset;
-        read.bytes.resize(size);
         {
             const std::lock_guard lock(dd_->mutex);
-            const UploadBuffer* ub = locate(read.deferred, buffer, offset);
+            const UploadBuffer* ub = locate(read, buffer, offset, size);
             if (ub == nullptr) return false;
+            read.bytes.resize(size);
             if (ub->mapped != nullptr) {
                 std::memcpy(read.bytes.data(), ub->mapped + offset, size);
                 return finish(read, buffer, offset);
@@ -287,19 +335,28 @@ public:
 
 private:
     // The upload buffer the read refers to, with `buffer`/`offset` made absolute for descriptor
-    // reads, or nullptr if it's gone or the window doesn't fit. Caller holds dd_->mutex.
-    const UploadBuffer* locate(const CbufferRead::Deferred& d, resource& buffer, uint64_t& offset) const {
+    // reads, or nullptr if it's gone or the window doesn't fit (clamped reads shrink `size` instead).
+    // Caller holds dd_->mutex.
+    const UploadBuffer* locate(CbufferRead& read, resource& buffer, uint64_t& offset, uint32_t& size) const {
+        const CbufferRead::Deferred& d = read.deferred;
+        // Whether [pos, pos + size) fits in `avail` bytes.
+        auto fit = [&](uint64_t pos, uint64_t avail) {
+            if (pos >= avail) return false;
+            if (d.clamp) size = uint32_t(std::min<uint64_t>(size, avail - pos));
+            return pos + size <= avail;
+        };
         if (d.descriptor_heap != 0) {
             const auto it = dd_->descriptors.find(d.descriptor_heap);
             if (it == dd_->descriptors.end() || d.descriptor >= it->second.size()) return nullptr;
             const buffer_range& view = it->second[d.descriptor];
-            if (view.buffer == 0 || offset + d.size > view.size) return nullptr;
+            if (view.buffer == 0 || !fit(offset, view.size)) return nullptr;
             if (d.key_size != 0 && align256(view.size) != align256(d.key_size)) return nullptr;
+            read.source_size = uint32_t(view.size);
             buffer = view.buffer;
             offset += view.offset;
         }
         const auto it = dd_->buffers.find(buffer.handle);
-        if (it == dd_->buffers.end() || offset + d.size > it->second.size) return nullptr;
+        if (it == dd_->buffers.end() || !fit(offset, it->second.size) || size == 0) return nullptr;
         return &it->second;
     }
 
