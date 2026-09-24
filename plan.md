@@ -89,12 +89,38 @@ Test first on the **fake game with ReShade injected**, then on the real game.
 **Exit:** the fake game scans perfectly through ReShade using only the addon. ✅ (2026-09-24)
 
 ## M3 — Discovery mode → first real game scan
-- [ ] Candidate scanner: 4×4 windows in cbuffers bound during scene-depth draws,
-      classified as view / proj / viewProj / inverse.
-- [ ] Temporal scoring (still vs moving) and ranked candidate list in the overlay.
-- [ ] Reprojection auto-validation (depth frame N → N+k error).
-- [ ] "Use candidate" (live preview in the viewer) and "Save to profile".
+- [x] Candidate scanner (2026-09-24): the camera tracker samples up to `DiscoverySamples` (48)
+      draws per frame into the captured depth-stencil and reads every bound constant buffer
+      (`CbufferSource::read_all_at_draw`: D3D9 register files, D3D11 bound cbuffers, D3D12 root
+      CBVs and tables, up to 8 KB each). A below-normal-priority worker classifies each 16-byte
+      aligned 64-byte window, both majors, as rigid / projection / view-projection / inverse
+      view-projection (`camera_math`, cached per window), and pairs them into hypotheses:
+      view+proj, viewproj+proj, invview+proj, invviewproj+proj, and the new single-matrix
+      `viewproj` / `invviewproj`, which are split into view and projection
+      (`decompose_view_proj`, jitter and either handedness). Per-object WVP constants become a
+      `viewproj` candidate with **latch "common"** (the value most draws into the depth-stencil
+      had), since the first/last draw may be an object with its own world matrix.
+- [x] Temporal scoring (still vs moving: constant while depth doesn't change, changing when it
+      does) and a ranked candidate list in the overlay's Discovery section, with live values,
+      FOV/near/far/depth convention, and a status/cost readout (≈0.04 ms of worker time per frame
+      on fake_game). A summary goes to `ReShade.log` every 10 s; **Write report** dumps
+      everything to `lidar_discovery.txt`.
+- [x] Reprojection auto-validation: depth frame N → N+k with each candidate, counting only
+      "informative" pixels (depth changed > 1%, so a frozen matrix can't pass on flat ground),
+      bilinear 1/z, median relative error; a round needs ≥ 50 such pixels to count.
+- [x] **Use** (unsaved preview profile, live in the viewer) and **Save** (writes
+      `lidar_profile.toml` next to the exe with the candidate as a comment, keeps a `.bak`, reloads).
+      `DiscoveryAutoStart` / `DiscoveryAutoSave=<s>` in the ini do the same unattended.
+- [x] Validated on the **fake game**, with no profile: discovery auto-saves after 20 s (NPC on),
+      then `lidar_verify ring --frames 60` with the saved profile passes (max ≤ 0.1 mm) for
+      `fake_game --camera-layout separate|viewproj|wvp` on D3D11, D3D12 (root CBVs and
+      `--cbv-tables`), D3D9 64-bit (auto and `--own-depth`), and the 32-bit D3D9 addon (separate,
+      wvp). separate → view+proj at b0/c0, 0 / 64; wvp → viewproj at b1/c13, latch common.
+      Wrong candidates (the NPC's world matrix, decoys) score 0 on reprojection.
 - [ ] Run it on the real test game and write its profile.
+- Known limits: needs a captured scene depth buffer and camera movement; only windows at
+  16-byte alignment and within the first 8 KB of each buffer; D3D12 root constants aren't
+  scanned; a view-projection with a scaling world matrix isn't recognized.
 
 **Exit:** the 360° turn test passes in a real game. **First live scan.** 🎉
 
@@ -161,5 +187,6 @@ Test first on the **fake game with ReShade injected**, then on the real game.
 ---
 
 ## Immediate next steps
-1. Pick a single-player **D3D11** test game with working ReShade depth.
-2. Start M0: CMake skeleton, `protocol.h`, D3D11 fake game, viewer.
+1. Run discovery on the test game (Sonic Adventure 2, 32-bit D3D9), save its profile, and do
+   the 360° turn test (M3 exit).
+2. Then M4.

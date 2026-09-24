@@ -4,10 +4,10 @@ A live "LiDAR" scan of PC games. A ReShade addon captures depth and the game's c
 matrices, and a viewer builds a point cloud of the level while you play. See
 [spec.md](spec.md) for the design and [plan.md](plan.md) for milestones.
 
-Current state: **M2 + D3D12 + D3D9**. The ReShade addon captures depth and sniffs the camera from
-the game's constant buffers (D3D9: shader constant registers) using a per-game profile, on D3D9,
-D3D11 and D3D12, verified against the fake game in all three APIs. Discovery mode (finding a new
-game's camera without knowing its offsets) comes next (M3).
+Current state: **M3 (discovery) + D3D12 + D3D9**. The ReShade addon captures depth and sniffs the
+camera from the game's constant buffers (D3D9: shader constant registers) using a per-game profile,
+on D3D9, D3D11 and D3D12, 64- and 32-bit. Discovery mode finds a new game's camera and writes that
+profile. Everything is verified against the fake game in all three APIs; the first real game is next.
 
 ## Build
 Requires Visual Studio 2022 or 2026 with the C++ workload (it bundles CMake). There are no
@@ -21,6 +21,13 @@ cmake --build build --config Release
 
 Binaries land in `build/bin/Release/`, except `fake_game.exe`, which goes to
 `sandbox/fake_game/` so ReShade can be installed next to it without hooking the viewer.
+
+32-bit games need a 32-bit addon (`lidar_capture.addon32`), from a separate build folder. Build only
+the addon (and tests) there: building `fake_game` would overwrite the 64-bit `sandbox\fake_game\fake_game.exe`.
+```powershell
+cmake -S . -B build-win32 -G "Visual Studio 18 2026" -A Win32
+cmake --build build-win32 --config Release --target lidar_capture lidar_tests
+```
 
 ## Try it
 ```powershell
@@ -41,6 +48,9 @@ auto depth-stencil, or a `CreateDepthStencilSurface` one with `--own-depth`. `--
 D3D11 renderer a 24-bit depth buffer, as a reference for D3D9. Run the D3D9 build from
 `sandbox\fake_game_d3d9\`: the build copies `fake_game.exe` there, and ReShade goes in as
 `d3d9.dll` (the same DLL as `dxgi.dll`, renamed; both in one folder would load ReShade twice).
+`--camera-layout separate|viewproj|wvp` changes what the shaders get, for testing discovery:
+separate view and proj (the default), only a view-projection in b0/c0, or only a per-draw
+world·view·proj in b1/c13 (the level is drawn in three parts after the NPC in every layout).
 
 **lidar_viewer**: right-drag to look, WASD/QE to move, Shift for speed, the wheel changes base speed.
 `F` follow player, `H` height/color mode, `T` trail, `X` toggle carving, `+/-` point size,
@@ -93,6 +103,21 @@ D3D9 uses the same profile (slot 0, view at byte 0 = c0, proj at 64 = c4):
 sandbox\fake_game_d3d9\fake_game.exe --api d3d9 --no-npc --depth reversed
 build\bin\Release\lidar_verify.exe ring --frames 60
 ```
+Discovery on the fake game: with no profile, set these under `[LIDAR]` in the rig's ReShade.ini
+(game closed), run the game with the NPC on, then check `ReShade.log` and the saved `lidar_profile.toml`:
+```ini
+[LIDAR]
+Profile=no_profile.toml
+DiscoveryAutoStart=1
+DiscoveryAutoSave=20
+```
+```powershell
+sandbox\fake_game\fake_game.exe --camera-layout wvp --no-publish --duration 30
+```
+Then set `Profile=lidar_profile.toml` and `DiscoveryAutoStart=0`, and run the ring check above with
+the same `--camera-layout`. Remove the `[LIDAR]` section afterwards; the next addon build restores
+the rig's `lidar_profile.toml`.
+
 D3D9 depth is 24-bit, so compare it against a `--d24` reference. Standard depth matches exactly.
 In reversed modes about 5% of pixels are one 24-bit step apart (the rasterizers round differently
 when D3D9's half-pixel offset is corrected), so allow that step:
@@ -129,6 +154,7 @@ pipeline (`SetTransform`, mostly pre-2004) have no shader constants to sniff.
    ```powershell
    copy build\bin\Release\lidar_capture.addon64 "<game folder>\"
    ```
+   For a 32-bit game, copy `build-win32\bin\Release\lidar_capture.addon32` instead (see Build).
    Some games keep the exe in a subfolder (e.g. `bin\x64\` or `Binaries\Win64\`). Use the one
    holding the exe.
 3. **Start the game**, then press **Home** to open the ReShade overlay. The **Add-ons** tab should
@@ -144,10 +170,26 @@ pipeline (`SetTransform`, mostly pre-2004) have no shader constants to sniff.
      game clears it.
    - **With a profile:** save it as `lidar_profile.toml` next to the exe, or point the tab's
      **Profile** field at it. The format is described in spec.md §3.7, and
-     `profiles/fake_game.toml` is an example. Finding a game's profile is what discovery mode
-     (M3) is for; until then it means reading the cbuffers in a RenderDoc capture.
+     `profiles/fake_game.toml` is an example.
+6. **Discovery** (to find a game's profile): with the depth buffer right, open the **Discovery**
+   section, press **Start**, then move and turn the camera for about 20 seconds (in game, not in a
+   menu or cutscene). Candidates are ranked by score: whether they stay constant while the view
+   doesn't change and change when it does, and how well they reproject one depth frame into a
+   later one. A good one has its score in green (confident), most reprojection rounds passing and a
+   plausible FOV/near. **Use** previews a candidate without saving it (check the scan in the
+   viewer, e.g. by turning 360° in place: the level should line up with itself). **Save** writes it
+   as `lidar_profile.toml` next to the exe (the old one becomes `lidar_profile.toml.bak`) and loads
+   it. **Write report** writes `lidar_discovery.txt` next to the exe with everything discovery
+   found; it's also written on Save. A summary goes to `ReShade.log` every 10 seconds.
+
+   Discovery also finds cameras stored as a single matrix: layouts `viewproj` / `invviewproj`
+   (split into view and projection) next to the paired ones. When the matrix is per object
+   (world·view·proj), it saves `latch = "common"`: the value most draws into the depth buffer had,
+   rather than the first or last draw's.
 
 Settings live under `[LIDAR]` in the game's `ReShade.ini` (`Enabled`, `CaptureWidth`,
-`Profile`, `FovY`, `Near`, `Far`, `DepthMode`). Only edit the ini while the game is closed:
-ReShade rewrites it from memory. To remove everything, run the ReShade installer again and
+`Profile`, `FovY`, `Near`, `Far`, `DepthMode`). For unattended discovery runs there are also
+`DiscoveryAutoStart=1` (start with the game), `DiscoveryAutoSave=<seconds>` (save the top
+candidate once after that long, if it's confident) and `DiscoverySamples` (sampled draws per
+frame, default 48). Only edit the ini while the game is closed: ReShade rewrites it from memory. To remove everything, run the ReShade installer again and
 uninstall, then delete `lidar_capture.addon64`.

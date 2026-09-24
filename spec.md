@@ -75,11 +75,14 @@ A frame usually contains several "cameras": shadow cascades, reflections, UI. Th
 want is the camera **used while drawing into the selected scene depth buffer**. On draw
 events where the bound depth-stencil is the scene depth buffer, the addon reads the
 profile's cbuffer (identified by stage + slot + size) from the shadow copy and latches
-the matrices for this frame. The first valid latch per frame wins. The last one is available as an option.
+the matrices for this frame. The first valid latch per frame wins. The last one is available as an
+option, and so is the most common value among the frame's draws (for per-object world·view·proj).
 
 **What gets extracted** (the profile says which layout the game uses):
 - `view` + `proj` separately (best case), or
 - `viewProj` + known projection, where `view = proj⁻¹ · viewProj`, or
+- `viewProj` (or its inverse) alone, split into a rigid view and a projection: its w column is
+  ±(the view's z axis), a unit vector, which fixes the rest, or
 - `invView` / `invViewProj` (common in deferred renderers), which are just inverted.
 - Row-major vs column-major, and handedness, are set in the profile.
 - The projection matrix also yields **near/far, FOV and the depth convention**
@@ -177,11 +180,13 @@ slot    = 0                     # cbuffer register (b0)
 space   = 0                     # register space (D3D12), default 0
 size    = 1024                  # buffer (D3D11) / CBV (D3D12) size, to disambiguate
 layout  = "view+proj"           # view+proj | viewproj+proj | invview+proj | invviewproj+proj
+                                # | viewproj | invviewproj (one matrix, split into view and proj)
 view_offset = 0                 # bytes
-proj_offset = 64
+proj_offset = 64                # not for the single-matrix layouts
 major   = "row"                 # row | column
 handed  = "left"                # left | right
-latch   = "first"               # first | last scene-depth draw of the frame
+latch   = "first"               # first | last scene-depth draw of the frame, or common: the
+                                # value most of its draws had (per-object world*view*proj)
 ```
 
 ## 4. Handling the known quirks
