@@ -361,13 +361,17 @@ bool draw_camera_section() {
     }
     ImGui::SameLine();
     if (ImGui::Button("Reload")) reload_profile();
+    // Shown without a profile too: it's what tells whether the game's camera is in constants at all.
+    const bool d3d9 = g_device->get_api() == device_api::d3d9;
+    if (g_source)
+        ImGui::TextDisabled(d3d9 ? "Tracking %zu constant registers" : "Tracking %zu constant buffers",
+                            g_source->tracked_buffers());
     if (!g_profile_error.empty()) {
         ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1), "%s", g_profile_error.c_str());
         return changed;
     }
 
     const CameraProfile& c = g_profile.camera;
-    const bool d3d9 = g_device->get_api() == device_api::d3d9;
     if (d3d9)  // one register file per stage, no buffers: offsets are registers (16 bytes each)
         ImGui::TextDisabled("%s constants, %s at c%u%s / c%u%s, %s-major, %s-handed, %s latch", stage_name(c.key.stage),
                             layout_name(c.layout), c.view_offset / 16, c.view_offset % 16 ? " (unaligned)" : "",
@@ -380,9 +384,6 @@ bool draw_camera_section() {
                             c.key.size ? (" (" + std::to_string(c.key.size) + " bytes)").c_str() : "",
                             layout_name(c.layout), c.view_offset, c.proj_offset, c.column_major ? "column" : "row",
                             c.right_handed ? "right" : "left", c.latch_last ? "last" : "first");
-    if (g_source)
-        ImGui::TextDisabled(d3d9 ? "Tracking %zu constant registers" : "Tracking %zu constant buffers",
-                            g_source->tracked_buffers());
 
     switch (g_camera.state) {
         case CameraStatus::NoProfile: break;
