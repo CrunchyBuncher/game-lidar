@@ -47,10 +47,20 @@ runs at 120 fps (vsync).
 
 ## M1 — Addon: depth out of a game
 Test first on the **fake game with ReShade injected**, then on the real game.
-- [ ] Addon skeleton (CMake, ReShade addon headers) and overlay tab.
-- [ ] Depth buffer selection (port `generic_depth` logic, with a manual override).
-- [ ] GPU downsample → staging ring → non-blocking readback → shared memory.
-- [ ] Measure FPS impact.
+- [x] Addon skeleton (CMake, ReShade addon headers) and overlay tab. SDK pinned to ReShade
+      6.8.0 (API 20). Test rig: `sandbox/fake_game/` with ReShade installed, run with `--no-publish`.
+- [x] Depth buffer selection (`generic_depth` heuristics: draws/vertices per depth-stencil,
+      frame-size fit, deferred-context merging), with a manual override in the overlay.
+      Our own tracker, not the built-in one: M2 needs the real depth-stencil at draw time.
+- [x] Copy → GPU downsample → staging ring → non-blocking readback → shared memory.
+      Until M2, frames go out without a pose, using a projection built from overlay settings
+      (FOV / near / far / depth mode). The viewer shows them as a live camera-relative snapshot.
+- [x] `lidar_verify addon`: the addon's frames vs. an un-injected reference fake_game frozen at
+      the same camera. **Bit-identical depth and 0.0 mm error in all 3 depth modes.**
+      This caught a real bug: the protocol's pixel mapping was computed in float, so compilers
+      could disagree at exact boundaries. It now uses exact integer math in every producer and consumer.
+- [ ] Measure FPS impact (on the real game; fake_game is vsync-capped).
+- [ ] Run on the real test game.
 
 **Exit:** the viewer shows live unprojected depth (camera-relative, no world pose yet).
 

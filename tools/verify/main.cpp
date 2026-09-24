@@ -2,12 +2,17 @@
 //
 //   lidar_verify ring [--frames 30] [--tol 0.02]   read live frames from the ring (CPU unprojection)
 //   lidar_verify ply <file> [--tol 0.02]           check a viewer-saved .ply (GPU pipeline)
+//   lidar_verify addon [--frames 30] [--tol 0.02]  check the ReShade addon's camera-relative frames
+//       Needs two fake_games' worth of setup: the ReShade-injected one run with
+//       `--no-npc --no-publish --freeze T`, plus a plain `fake_game --no-npc --freeze T
+//       --ring Local\game_lidar_ref` as reference. Same T, same window size.
 //
 // Run the fake game with --no-npc, since the moving NPC isn't in the reference scene.
 // Exits non-zero if fewer than 99% of points lie within tolerance of a surface.
 #include <windows.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -71,6 +76,78 @@ int verify_ring(int frames_wanted, float tol) {
     return report(err, tol);
 }
 
+// The addon publishes depth without a pose (M1). With both fake_games frozen at the same
+// camera, borrow the reference's pose: the depth must match it pixel for pixel, and the
+// addon's own projection must unproject onto the true scene.
+int verify_addon(int frames_wanted, float tol) {
+    RingReader ref_ring, ring;
+    Frame ref, f;
+    const ULONGLONG deadline = GetTickCount64() + 15000;
+    bool have_ref = false;
+    while (!have_ref && GetTickCount64() < deadline) {
+        if (ref_ring.is_open() || ref_ring.try_open(L"Local\\game_lidar_ref"))
+            have_ref = ref_ring.read_next(ref);
+        if (!have_ref) Sleep(20);
+    }
+    if (!have_ref) {
+        std::printf("no reference frame (run fake_game --ring Local\\game_lidar_ref)\n");
+        return 2;
+    }
+
+    const auto boxes = scene::build();
+    std::vector<float> err;
+    int frames = 0;
+    float max_diff = 0;
+    size_t mismatched = 0, compared = 0;
+    while (frames < frames_wanted && GetTickCount64() < deadline) {
+        if (!ring.is_open() && !ring.try_open()) {
+            Sleep(100);
+            continue;
+        }
+        if (!ring.read_next(f)) {
+            Sleep(5);
+            continue;
+        }
+        if (f.header.flags & kFlagPoseValid) {
+            std::printf("frame has a pose: this is fake_game publishing, not the addon\n");
+            return 2;
+        }
+        if (f.header.width != ref.header.width || f.header.height != ref.header.height ||
+            f.header.src_width != ref.header.src_width || f.header.src_height != ref.header.src_height) {
+            std::printf("size mismatch: addon %ux%u of %ux%u, reference %ux%u of %ux%u\n", f.header.width,
+                        f.header.height, f.header.src_width, f.header.src_height, ref.header.width, ref.header.height,
+                        ref.header.src_width, ref.header.src_height);
+            return 2;
+        }
+        for (size_t i = 0; i < f.depth.size(); ++i) {
+            const float d = std::abs(f.depth[i] - ref.depth[i]);
+            max_diff = std::max(max_diff, d);
+            mismatched += d != 0;
+            ++compared;
+        }
+        std::memcpy(f.header.view, ref.header.view, sizeof(f.header.view));
+        const Unprojector up(f.header);
+        for (uint32_t v = 0; v < f.header.height; v += 2) {
+            for (uint32_t u = 0; u < f.header.width; u += 2) {
+                float p[3];
+                if (up.unproject(u, v, f.depth[size_t(v) * f.header.width + u], 0.3f, 500.0f, p))
+                    err.push_back(scene::distance(boxes, p));
+            }
+        }
+        ++frames;
+    }
+    std::printf("frames: %d\n", frames);
+    if (frames == 0) {
+        std::printf("no addon frames received (is the ReShade-injected fake_game running?)\n");
+        return 2;
+    }
+    float proj_diff = 0;
+    for (int i = 0; i < 16; ++i) proj_diff = std::max(proj_diff, std::abs(f.header.proj[i] - ref.header.proj[i]));
+    std::printf("depth vs reference: %zu of %zu pixels differ, max |diff| %.3g\n", mismatched, compared, max_diff);
+    std::printf("projection vs reference: max |diff| %.3g\n", proj_diff);
+    return report(err, tol) != 0 || mismatched != 0 ? 1 : 0;
+}
+
 int verify_ply(const char* path, float tol) {
     FILE* f = std::fopen(path, "rb");
     if (!f) {
@@ -100,7 +177,7 @@ int verify_ply(const char* path, float tol) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::printf("usage: lidar_verify ring [--frames N] [--tol m] | ply <file> [--tol m]\n");
+        std::printf("usage: lidar_verify ring [--frames N] [--tol m] | ply <file> [--tol m] | addon [--frames N] [--tol m]\n");
         return 2;
     }
     const std::string mode = argv[1];
@@ -115,6 +192,7 @@ int main(int argc, char** argv) {
     }
     if (mode == "ring") return verify_ring(frames, tol);
     if (mode == "ply" && file) return verify_ply(file, tol);
+    if (mode == "addon") return verify_addon(frames, tol);
     std::printf("bad arguments\n");
     return 2;
 }

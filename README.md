@@ -17,16 +17,17 @@ cmake -S . -B build -G "Visual Studio 18 2026" -A x64
 cmake --build build --config Release
 ```
 
-Binaries land in `build/bin/Release/`.
+Binaries land in `build/bin/Release/`, except `fake_game.exe`, which goes to
+`sandbox/fake_game/` so ReShade can be installed next to it without hooking the viewer.
 
 ## Try it
 ```powershell
-build\bin\Release\fake_game.exe
+sandbox\fake_game\fake_game.exe
 build\bin\Release\lidar_viewer.exe
 ```
 
 **fake_game**: `--depth standard|reversed|reversed-infinite`, `--capture-width 480`,
-`--no-npc`, `--no-color`, `--fov 70`. Keys: `M` manual camera (WASD/QE + right-drag),
+`--no-npc`, `--no-color`, `--fov 70`, `--no-publish` (leave the ring to the addon). Keys: `M` manual camera (WASD/QE + right-drag),
 `Space` pause capture.
 
 **lidar_viewer**: right-drag to look, WASD/QE to move, Shift for speed, the wheel changes base speed.
@@ -46,3 +47,13 @@ build\bin\Release\lidar_tests.exe
 build\bin\Release\lidar_verify.exe ring --frames 60
 build\bin\Release\lidar_verify.exe ply scans\some_scan.ply
 ```
+
+**Addon (M1):** run the ReShade-injected game and an un-injected reference, both frozen at
+the same camera. The reference must be a copy of `fake_game.exe` outside `sandbox/`, or
+ReShade would hook it too.
+```powershell
+sandbox\fake_game\fake_game.exe --no-npc --no-publish --freeze 3
+<copy>\fake_game.exe --no-npc --freeze 3 --ring Local\game_lidar_ref
+build\bin\Release\lidar_verify.exe addon --frames 60
+```
+For `--depth standard|reversed-infinite`, set the addon's depth mode to match in the overlay.

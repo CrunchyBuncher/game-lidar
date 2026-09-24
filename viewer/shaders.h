@@ -62,7 +62,7 @@ uint pack_rgba(float4 c) {
 
 // View-space position of stored pixel p, sampled at its source pixel center.
 float4 unproject_pixel(uint2 p) {
-    uint2 s = min((uint2)(((float2)p + 0.5) * (float2)src_dims / (float2)dims), src_dims - 1);
+    uint2 s = min(((2 * p + 1) * src_dims) / (2 * dims), src_dims - 1);  // exact, see protocol.h
     float2 ndc = float2(((float)s.x + 0.5) / (float)src_dims.x * 2.0 - 1.0,
                         1.0 - ((float)s.y + 0.5) / (float)src_dims.y * 2.0);
     float4 v = mul(float4(ndc, depth_tex.Load(int3(p, 0)), 1), inv_proj);
