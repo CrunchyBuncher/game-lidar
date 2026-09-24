@@ -15,17 +15,28 @@ enum class CameraLayout {
     ViewProjAndProj,     // "viewproj+proj":     view = viewProj * proj^-1
     InvViewAndProj,      // "invview+proj":      view = invView^-1
     InvViewProjAndProj,  // "invviewproj+proj":  view = invViewProj^-1 * proj^-1
+    ViewProj,            // "viewproj":          view and proj split out of viewProj (no proj_offset)
+    InvViewProj,         // "invviewproj":       the same, from invViewProj^-1
+};
+
+// Which scene-depth draw of the frame supplies the camera.
+enum class Latch {
+    First,   // "first"
+    Last,    // "last"
+    Common,  // "common": the value most draws saw. For games that upload world * view * proj per
+             // draw: the level geometry's draws (world = identity) usually outnumber any object's.
 };
 
 struct CameraProfile {
     cam::CbufferKey key;  // stage, slot, space, size (0 = any)
     CameraLayout layout = CameraLayout::ViewAndProj;
     uint32_t view_offset = 0;  // bytes: the matrix the layout names first
-    uint32_t proj_offset = 64;
+    uint32_t proj_offset = 64;  // unused by the single-matrix layouts
     bool column_major = false;
     bool right_handed = false;  // informational: unprojection doesn't depend on it
-    bool latch_last = false;
+    Latch latch = Latch::First;
 
+    bool single_matrix() const { return layout == CameraLayout::ViewProj || layout == CameraLayout::InvViewProj; }
     // The contiguous byte window covering both matrices, relative to the bound range.
     uint32_t window_offset() const;
     uint32_t window_size() const;
@@ -40,8 +51,11 @@ struct Profile {
 // and # comments. Unknown keys in known sections are errors (typos would silently do nothing).
 bool parse_profile(std::string_view text, Profile& out, std::string& error);
 bool load_profile(const std::filesystem::path& path, Profile& out, std::string& error);
+// The profile as TOML, `comment` (may be multi-line) as # lines on top. parse_profile reads it back.
+std::string format_profile(const CameraProfile& camera, std::string_view comment);
 
 const char* layout_name(CameraLayout layout);
+const char* latch_name(Latch latch);
 const char* stage_name(reshade::api::shader_stage stage);
 
 // Decodes a latched window (starting at window_offset()) into protocol matrices. Returns false,
