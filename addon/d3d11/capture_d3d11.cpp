@@ -177,8 +177,10 @@ bool D3D11Capture::ensure_targets(const D3D11_TEXTURE2D_DESC& src, uint32_t capt
     return true;
 }
 
-bool D3D11Capture::capture(ID3D11DeviceContext* ctx, ID3D11Resource* depth, uint32_t capture_width,
-                           const FrameHeader& header) {
+bool D3D11Capture::capture(reshade::api::command_queue* queue, reshade::api::resource depth_res,
+                           uint32_t capture_width, const FrameHeader& header) {
+    auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(queue->get_native());
+    auto* depth = reinterpret_cast<ID3D11Resource*>(depth_res.handle);
     ComPtr<ID3D11Texture2D> tex;
     if (FAILED(depth->QueryInterface(IID_PPV_ARGS(&tex)))) {
         error_ = "depth buffer is not a 2D texture";
@@ -223,7 +225,8 @@ bool D3D11Capture::capture(ID3D11DeviceContext* ctx, ID3D11Resource* depth, uint
     return true;
 }
 
-void D3D11Capture::publish(ID3D11DeviceContext* ctx, RingWriter& ring) {
+void D3D11Capture::publish(reshade::api::command_queue* queue, RingWriter& ring) {
+    auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(queue->get_native());
     while (!pending_.empty()) {
         const Pending& p = pending_.front();
         D3D11_MAPPED_SUBRESOURCE m;

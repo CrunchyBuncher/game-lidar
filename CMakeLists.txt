@@ -41,16 +41,24 @@ FetchContent_Declare(reshade_imgui
   SOURCE_SUBDIR none)
 FetchContent_MakeAvailable(reshade_sdk reshade_imgui)
 
-add_library(lidar_capture SHARED addon/main.cpp addon/depth_tracker.cpp addon/capture_d3d11.cpp)
+add_library(lidar_capture SHARED
+  addon/main.cpp addon/backends.cpp addon/depth_tracker.cpp addon/camera_tracker.cpp addon/profile.cpp
+  addon/d3d11/capture_d3d11.cpp addon/d3d11/cbuffer_d3d11.cpp)
 target_include_directories(lidar_capture PRIVATE addon ${reshade_sdk_SOURCE_DIR}/include ${reshade_imgui_SOURCE_DIR})
 target_compile_definitions(lidar_capture PRIVATE ImTextureID=ImU64)
 target_link_libraries(lidar_capture PRIVATE lidar_common)
 set_target_properties(lidar_capture PROPERTIES PREFIX "" SUFFIX ".addon64")
-# ReShade loads addons from the game's folder, so drop a copy next to the fake game.
+# ReShade loads addons from the game's folder, so drop a copy next to the fake game, along with
+# its profile under the name the addon looks for by default.
 add_custom_command(TARGET lidar_capture POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:lidar_capture> ${CMAKE_SOURCE_DIR}/sandbox/fake_game/)
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:lidar_capture> ${CMAKE_SOURCE_DIR}/sandbox/fake_game/
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_SOURCE_DIR}/profiles/fake_game.toml
+          ${CMAKE_SOURCE_DIR}/sandbox/fake_game/lidar_profile.toml
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_SOURCE_DIR}/profiles/fake_game_viewproj.toml
+          ${CMAKE_SOURCE_DIR}/sandbox/fake_game/)
 
 enable_testing()
-add_executable(lidar_tests tests/test_main.cpp)
+add_executable(lidar_tests tests/test_main.cpp addon/profile.cpp)
+target_include_directories(lidar_tests PRIVATE addon ${reshade_sdk_SOURCE_DIR}/include)
 target_link_libraries(lidar_tests PRIVATE lidar_common)
 add_test(NAME lidar_tests COMMAND lidar_tests)

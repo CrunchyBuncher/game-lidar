@@ -1,0 +1,12 @@
+# Same fake_game camera, read as view_proj + proj to exercise the view = viewProj * proj^-1 path.
+# To use it, set Profile in ReShade.ini's [LIDAR] section, or type the name in the overlay.
+
+[camera]
+stage       = "vertex"
+slot        = 0
+size        = 208
+layout      = "viewproj+proj"
+view_offset = 128
+proj_offset = 64
+major       = "row"
+handed      = "left"

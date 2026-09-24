@@ -1,0 +1,13 @@
+# tools/fake_game: cbuffer Camera : register(b0) { row_major view, proj, view_proj; float4 cam_pos; }
+# bound to the vertex and pixel stages. b1 is a per-object buffer that changes between draws.
+
+[camera]
+stage       = "vertex"
+slot        = 0
+size        = 208           # 3 matrices + float4
+layout      = "view+proj"
+view_offset = 0
+proj_offset = 64
+major       = "row"
+handed      = "left"
+latch       = "first"
