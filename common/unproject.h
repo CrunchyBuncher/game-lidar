@@ -26,8 +26,8 @@ struct Unprojector {
 
     // NDC of the source pixel that stored pixel (u, v) was sampled from.
     void ndc(uint32_t u, uint32_t v, float& x, float& y) const {
-        uint32_t sx = uint32_t((float(u) + 0.5f) * float(src_width) / float(width));
-        uint32_t sy = uint32_t((float(v) + 0.5f) * float(src_height) / float(height));
+        uint32_t sx = ((2 * u + 1) * src_width) / (2 * width);
+        uint32_t sy = ((2 * v + 1) * src_height) / (2 * height);
         if (sx > src_width - 1) sx = src_width - 1;
         if (sy > src_height - 1) sy = src_height - 1;
         x = (float(sx) + 0.5f) / float(src_width) * 2.0f - 1.0f;

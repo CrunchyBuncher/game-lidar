@@ -47,24 +47,46 @@ runs at 120 fps (vsync).
 
 ## M1 — Addon: depth out of a game
 Test first on the **fake game with ReShade injected**, then on the real game.
-- [ ] Addon skeleton (CMake, ReShade addon headers) and overlay tab.
-- [ ] Depth buffer selection (port `generic_depth` logic, with a manual override).
-- [ ] GPU downsample → staging ring → non-blocking readback → shared memory.
-- [ ] Measure FPS impact.
+- [x] Addon skeleton (CMake, ReShade addon headers) and overlay tab. SDK pinned to ReShade
+      6.8.0 (API 20). Test rig: `sandbox/fake_game/` with ReShade installed, run with `--no-publish`.
+- [x] Depth buffer selection (`generic_depth` heuristics: draws/vertices per depth-stencil,
+      frame-size fit, deferred-context merging), with a manual override in the overlay.
+      Our own tracker, not the built-in one: M2 needs the real depth-stencil at draw time.
+- [x] Copy → GPU downsample → staging ring → non-blocking readback → shared memory.
+      Until M2, frames go out without a pose, using a projection built from overlay settings
+      (FOV / near / far / depth mode). The viewer shows them as a live camera-relative snapshot.
+- [x] `lidar_verify addon`: the addon's frames vs. an un-injected reference fake_game frozen at
+      the same camera. **Bit-identical depth and 0.0 mm error in all 3 depth modes.**
+      This caught a real bug: the protocol's pixel mapping was computed in float, so compilers
+      could disagree at exact boundaries. It now uses exact integer math in every producer and consumer.
+- [ ] Measure FPS impact (on the real game; fake_game is vsync-capped).
+- [ ] Run on the real test game.
 
 **Exit:** the viewer shows live unprojected depth (camera-relative, no world pose yet).
 
 ## M2 — Addon: constant-buffer sniffer (manual profile)
-- [ ] Track cbuffer resources, and shadow-copy on map/unmap + update_buffer_region.
-- [ ] Track cbuffer bindings per stage/slot.
-- [ ] At draws into the scene depth buffer, latch the matrices from the profile's
-      stage/slot/size/offsets. Pair them with the depth frame.
-- [ ] Layout handling: view+proj, viewproj+proj, inverse variants, row/column-major,
-      and handedness.
-- [ ] Profile TOML loader, plus an overlay readout of the live latched matrices.
-- [ ] Validate end-to-end on the **fake game** (known offsets), where it must be exact.
+- [x] API seams, so M5 only adds implementations: `DepthCapture` (depth readback) and
+      `CbufferSource` (cbuffer bytes at a draw), created per device API in `addon/backends.cpp`.
+      The depth tracker, camera tracker, profile decoding, pairing and ring are shared.
+- [x] D3D11 source: shadow copies of every cbuffer (init data, Unmap, UpdateSubresource on
+      immediate and deferred contexts), bindings per stage/slot from `push_descriptors`.
+- [x] At draws, latch the profile's byte window **per depth-stencil** (first or last draw).
+      At present, the latch for the depth-stencil actually captured becomes the frame's pose,
+      so selection and manual overrides pair with the same frame.
+- [x] Layouts: view+proj, viewproj+proj, invview+proj, invviewproj+proj; row/column-major.
+      Decoding in double; view+proj passes the game's floats through bit-exact. Handedness
+      doesn't affect unprojection, so it's parsed and checked against the projection only.
+- [x] Profile TOML loader (`[LIDAR] Profile=`, default `lidar_profile.toml` next to the exe),
+      overlay readout of the latched matrices and the near/far/FOV/depth convention they imply.
+- [x] Validated on the **fake game** (`profiles/fake_game.toml`):
+      `lidar_verify addon` is bit-identical in all 3 depth modes: depth, proj **and view** 0 diff.
+      `lidar_verify ring` matches fake_game's own publishing in every mode (reversed modes
+      max ≤ 0.3 mm; standard depth p99 ≈ 3 mm, max ≈ 12 mm for both: float32 standard-depth
+      precision, not the pose). `viewproj+proj` gives the same results.
+- Known limits: a deferred-context Map is shadowed at record time, not execute time. TAA
+  jitter isn't stripped. Every Unmap copies the whole cbuffer; measure on a real game (M4).
 
-**Exit:** the fake game scans perfectly through ReShade using only the addon.
+**Exit:** the fake game scans perfectly through ReShade using only the addon. ✅ (2026-09-24)
 
 ## M3 — Discovery mode → first real game scan
 - [ ] Candidate scanner: 4×4 windows in cbuffers bound during scene-depth draws,
@@ -83,8 +105,10 @@ Test first on the **fake game with ReShade injected**, then on the real game.
 
 ## M5 — More APIs
 - [ ] D3D9 via `push_constants`.
-- [ ] D3D12/Vulkan: track persistently mapped upload buffers, resolve root CBVs and
-      descriptors at scene-depth draws, and read memory at draw time.
+- [ ] D3D12/Vulkan: a `DepthCapture` on the ReShade API (copies, barriers, fenced readback)
+      and a `CbufferSource` that tracks persistently mapped upload buffers, resolves root CBVs
+      and descriptors at scene-depth draws (`ready = false`), and reads the memory in
+      `resolve()` at submit. Profiles need a binding key beyond stage + slot.
 
 ## M6 — Scale & extras (as needed)
 - [ ] Chunked pool with eviction/streaming for huge levels. Resume saved scans.

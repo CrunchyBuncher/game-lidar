@@ -433,16 +433,24 @@ int main(int argc, char** argv) {
         }
         for (uint32_t i = 0; i < kSlotCount && ring.is_open() && ring.read_next(frame); ++i) {
             const FrameHeader& h = frame.header;
-            if (!(h.flags & kFlagPoseValid) || (h.flags & kFlagPaused)) continue;
-            const XMMATRIX view = XMLoadFloat4x4(reinterpret_cast<const XMFLOAT4X4*>(h.view));
+            if (h.flags & kFlagPaused) continue;
+            // Without a pose (addon before M2) the frame is camera-relative: show it as a live
+            // snapshot at the origin instead of accumulating it.
+            const bool posed = (h.flags & kFlagPoseValid) != 0;
+            const XMMATRIX view =
+                posed ? XMLoadFloat4x4(reinterpret_cast<const XMFLOAT4X4*>(h.view)) : XMMatrixIdentity();
             const XMMATRIX proj = XMLoadFloat4x4(reinterpret_cast<const XMFLOAT4X4*>(h.proj));
             XMStoreFloat4x4(&player_inv_view, XMMatrixInverse(nullptr, view));
             XMStoreFloat4x4(&player_inv_proj, XMMatrixInverse(nullptr, proj));
             have_player = true;
             const XMFLOAT3 p{player_inv_view._41, player_inv_view._42, player_inv_view._43};
-            if (trail.empty() || XMVectorGetX(XMVector3Length(XMLoadFloat3(&p) - XMLoadFloat3(&trail.back()))) > 0.25f)
+            if (posed && (trail.empty() || XMVectorGetX(XMVector3Length(XMLoadFloat3(&p) - XMLoadFloat3(&trail.back()))) > 0.25f))
                 trail.push_back(p);
             if (paused) continue;
+            if (!posed) {
+                cloud.clear(ctx);
+                trail.clear();
+            }
 
             D3D11_BOX box{0, 0, 0, h.width, h.height, 1};
             ctx->UpdateSubresource(depth_tex.Get(), 0, &box, frame.depth.data(), h.width * 4, 0);

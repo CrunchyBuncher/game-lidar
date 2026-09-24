@@ -18,6 +18,10 @@ target_link_libraries(lidar_common PUBLIC d3d11 dxgi d3dcompiler)
 
 add_executable(fake_game tools/fake_game/main.cpp)
 target_link_libraries(fake_game PRIVATE lidar_common)
+# Own folder outside build/ so ReShade's dxgi.dll next to it doesn't hook the viewer and
+# survives clean rebuilds. The $<1:> stops VS from appending a per-config subdirectory.
+set_target_properties(fake_game PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY $<1:${CMAKE_SOURCE_DIR}/sandbox/fake_game>)
 
 add_executable(lidar_viewer viewer/main.cpp)
 target_link_libraries(lidar_viewer PRIVATE lidar_common)
@@ -26,7 +30,35 @@ add_executable(lidar_verify tools/verify/main.cpp)
 target_include_directories(lidar_verify PRIVATE tools/fake_game)
 target_link_libraries(lidar_verify PRIVATE lidar_common)
 
+# ReShade addon. SDK headers are pinned to the installed ReShade (6.8.0 => API 20), and ImGui
+# to the exact commit that release was built with (reshade_overlay.hpp checks IMGUI_VERSION_NUM).
+include(FetchContent)
+FetchContent_Declare(reshade_sdk
+  URL https://github.com/crosire/reshade/archive/refs/tags/v6.8.0.zip
+  SOURCE_SUBDIR none)  # headers only: don't add ReShade's own CMake project
+FetchContent_Declare(reshade_imgui
+  URL https://github.com/ocornut/imgui/archive/3912b3d9a9c1b3f17431aebafd86d2f40ee6e59c.zip
+  SOURCE_SUBDIR none)
+FetchContent_MakeAvailable(reshade_sdk reshade_imgui)
+
+add_library(lidar_capture SHARED
+  addon/main.cpp addon/backends.cpp addon/depth_tracker.cpp addon/camera_tracker.cpp addon/profile.cpp
+  addon/d3d11/capture_d3d11.cpp addon/d3d11/cbuffer_d3d11.cpp)
+target_include_directories(lidar_capture PRIVATE addon ${reshade_sdk_SOURCE_DIR}/include ${reshade_imgui_SOURCE_DIR})
+target_compile_definitions(lidar_capture PRIVATE ImTextureID=ImU64)
+target_link_libraries(lidar_capture PRIVATE lidar_common)
+set_target_properties(lidar_capture PROPERTIES PREFIX "" SUFFIX ".addon64")
+# ReShade loads addons from the game's folder, so drop a copy next to the fake game, along with
+# its profile under the name the addon looks for by default.
+add_custom_command(TARGET lidar_capture POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:lidar_capture> ${CMAKE_SOURCE_DIR}/sandbox/fake_game/
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_SOURCE_DIR}/profiles/fake_game.toml
+          ${CMAKE_SOURCE_DIR}/sandbox/fake_game/lidar_profile.toml
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_SOURCE_DIR}/profiles/fake_game_viewproj.toml
+          ${CMAKE_SOURCE_DIR}/sandbox/fake_game/)
+
 enable_testing()
-add_executable(lidar_tests tests/test_main.cpp)
+add_executable(lidar_tests tests/test_main.cpp addon/profile.cpp)
+target_include_directories(lidar_tests PRIVATE addon ${reshade_sdk_SOURCE_DIR}/include)
 target_link_libraries(lidar_tests PRIVATE lidar_common)
 add_test(NAME lidar_tests COMMAND lidar_tests)

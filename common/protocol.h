@@ -10,7 +10,8 @@
 //   * depth[] holds the raw depth-buffer value (NDC z) as float32.
 //   * Stored pixel (u,v) was point-sampled from source depth-buffer pixel
 //     sx = min(floor((u + 0.5) * src_width / width), src_width - 1)
-//     (same for y). Consumers compute NDC from the SOURCE pixel center, so
+//     (same for y), computed EXACTLY in integers as ((2u + 1) * src_width) / (2 * width).
+//     Float math rounds differently at exact boundaries depending on how it was compiled. Consumers compute NDC from the SOURCE pixel center, so
 //     downsampling introduces no geometric error.
 //   * color[] is RGBA8 (R in the lowest byte), same layout as depth.
 #pragma once

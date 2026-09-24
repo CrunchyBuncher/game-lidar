@@ -5,7 +5,11 @@
 //
 // Usage: fake_game [--depth standard|reversed|reversed-infinite] [--capture-width 480]
 //                  [--capture-every 1] [--fov 70] [--no-npc] [--no-color]
-//                  [--size 1280x720] [--duration seconds]
+//                  [--size 1280x720] [--duration seconds] [--no-publish]
+//                  [--ring NAME] [--freeze T]
+//        --no-publish: render only, leave the ring to the ReShade addon.
+//        --ring: publish to another mapping (e.g. a reference for `lidar_verify addon`).
+//        --freeze: hold the scripted camera at path time T seconds.
 // Keys:  M toggle manual camera (WASD/QE + right-drag), Space pause capture, Esc quit.
 #include <DirectXMath.h>
 
@@ -72,7 +76,7 @@ cbuffer Dims : register(b0) { uint2 src_dims; uint2 dst_dims; };
 [numthreads(8, 8, 1)]
 void cs_main(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= dst_dims)) return;
-    uint2 s = min((uint2)(((float2)id.xy + 0.5) * (float2)src_dims / (float2)dst_dims), src_dims - 1);
+    uint2 s = min(((2 * id.xy + 1) * src_dims) / (2 * dst_dims), src_dims - 1);  // exact, see protocol.h
     dst_depth[id.xy] = src_depth.Load(int3(s, 0));
     dst_color[id.xy] = src_color.Load(int3(s, 0));
 }
@@ -105,6 +109,9 @@ struct Options {
     bool color = true;
     int width = 1280, height = 720;
     float duration = 0;  // 0 = run until closed
+    bool publish = true;
+    std::wstring ring = kFramesMappingName;
+    float freeze = -1;  // < 0: camera follows the path
 };
 
 Options parse(int argc, char** argv) {
@@ -131,6 +138,13 @@ Options parse(int argc, char** argv) {
             std::sscanf(next(), "%dx%d", &o.width, &o.height);
         } else if (a == "--duration") {
             o.duration = float(std::atof(next()));
+        } else if (a == "--no-publish") {
+            o.publish = false;
+        } else if (a == "--ring") {
+            const std::string n = next();
+            o.ring.assign(n.begin(), n.end());
+        } else if (a == "--freeze") {
+            o.freeze = float(std::atof(next()));
         } else {
             std::fprintf(stderr, "unknown argument: %s\n", a.c_str());
         }
@@ -268,7 +282,7 @@ int main(int argc, char** argv) {
     ID3D11DeviceContext* ctx = app.ctx.Get();
 
     RingWriter ring;
-    if (!ring.open()) {
+    if (opt.publish && !ring.open(opt.ring.c_str())) {
         std::fprintf(stderr, "failed to create shared memory ring\n");
         return 1;
     }
@@ -372,7 +386,7 @@ int main(int argc, char** argv) {
             if (app.key_down('E')) pose.pos[1] += speed;
             if (app.key_down('Q')) pose.pos[1] -= speed;
         } else {
-            path_time += dt;
+            path_time = opt.freeze >= 0 ? opt.freeze : path_time + dt;
             pose = scene::camera_path(float(path_time));
         }
 
@@ -423,7 +437,7 @@ int main(int argc, char** argv) {
         ctx->OMSetRenderTargets(0, nullptr, nullptr);
 
         // Capture: downsample on the GPU, copy to a staging texture, read back later.
-        const bool want_capture = !paused && frame_index % opt.capture_every == 0;
+        const bool want_capture = opt.publish && !paused && frame_index % opt.capture_every == 0;
         if (want_capture && pending.size() < Targets::kStaging) {
             upload(ctx, dims_cb.Get(), DimsCB{uint32_t(app.width), uint32_t(app.height), tg.cap_w, tg.cap_h});
             ID3D11ShaderResourceView* srvs[2] = {tg.depth_srv.Get(), tg.color_srv.Get()};

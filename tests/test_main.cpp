@@ -1,10 +1,14 @@
-// Unit tests: ring buffer semantics and unprojection across depth conventions.
+// Unit tests: ring buffer semantics, unprojection across depth conventions, and the addon's
+// camera profiles (parsing, matrix layouts, projection analysis).
 #include <DirectXMath.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <string>
 
+#include "profile.h"
 #include "ring.h"
 #include "unproject.h"
 
@@ -131,9 +135,162 @@ static void test_unproject() {
     }
 }
 
+static const char kFakeGameProfile[] = R"(
+# comment
+[camera]
+stage       = "vertex"
+slot        = 0
+size        = 208   # bytes
+layout      = "view+proj"
+view_offset = 0
+proj_offset = 0x40
+major       = "row"
+handed      = "left"
+latch       = "last"
+
+[depth]
+buffer_hint = "auto"
+)";
+
+static bool parse_fails(const char* text, const char* expect_in_error) {
+    Profile p;
+    std::string err;
+    if (parse_profile(text, p, err)) return false;
+    if (std::strstr(err.c_str(), expect_in_error) == nullptr) {
+        std::printf("  unexpected error: %s\n", err.c_str());
+        return false;
+    }
+    return true;
+}
+
+static void test_profile_parse() {
+    Profile p;
+    std::string err;
+    EXPECT(parse_profile(kFakeGameProfile, p, err));
+    EXPECT(err.empty());
+    EXPECT(p.has_camera);
+    const CameraProfile& c = p.camera;
+    EXPECT(c.key.stage == reshade::api::shader_stage::vertex);
+    EXPECT(c.key.slot == 0 && c.key.size == 208);
+    EXPECT(c.layout == CameraLayout::ViewAndProj);
+    EXPECT(c.view_offset == 0 && c.proj_offset == 64);
+    EXPECT(!c.column_major && !c.right_handed && c.latch_last);
+    EXPECT(c.window_offset() == 0 && c.window_size() == 128);
+
+    const char* base = "[camera]\nstage=\"pixel\"\nslot=1\nlayout=\"invviewproj+proj\"\n";
+    EXPECT(parse_profile(std::string(base) + "view_offset=128\nproj_offset=0\n", p, err));
+    EXPECT(p.camera.key.stage == reshade::api::shader_stage::pixel && p.camera.key.size == 0);
+    EXPECT(p.camera.window_offset() == 0 && p.camera.window_size() == 192);
+
+    EXPECT(parse_fails("[camera]\nstage=\"vertex\"\n", "needs 'slot'"));
+    EXPECT(parse_fails("[camera]\nstage=\"vertx\"\n", "stage must be one of"));
+    EXPECT(parse_fails((std::string(base) + "view_offset=0\nproj_offset=64\nviewoffset=3\n").c_str(),
+                       "unknown key 'viewoffset'"));
+    EXPECT(parse_fails((std::string(base) + "view_offset=0\nproj_offset=32\n").c_str(), "overlap"));
+    EXPECT(parse_fails((std::string(base) + "view_offset=0\nproj_offset=64\nsize=100\n").c_str(),
+                       "past the buffer size"));
+    EXPECT(parse_fails("[camera]\nstage=vertex\n", "line 2: can't parse value"));
+    EXPECT(parse_fails("[depth]\nx=1\n", "no [camera]"));
+    EXPECT(parse_fails("[camera]\nslot=1\nslot=2\n", "duplicate key"));
+}
+
+static XMMATRIX test_proj(int mode, float aspect) {
+    const float fov = XMConvertToRadians(70.0f), n = 0.1f, f = 1000.0f;
+    if (mode == 0) return XMMatrixPerspectiveFovLH(fov, aspect, n, f);
+    if (mode == 1) return XMMatrixPerspectiveFovLH(fov, aspect, f, n);
+    const float ys = 1.0f / std::tan(fov * 0.5f), xs = ys / aspect;
+    return XMMATRIX(xs, 0, 0, 0, 0, ys, 0, 0, 0, 0, 0, 1, 0, 0, n, 0);
+}
+
+static void put(uint8_t* buf, uint32_t offset, const XMMATRIX& m, bool column_major) {
+    XMFLOAT4X4 f;
+    XMStoreFloat4x4(&f, column_major ? XMMatrixTranspose(m) : m);
+    std::memcpy(buf + offset, &f, sizeof(f));
+}
+
+static float max_diff(const float a[16], const XMMATRIX& b) {
+    XMFLOAT4X4 f;
+    XMStoreFloat4x4(&f, b);
+    float d = 0;
+    for (int i = 0; i < 16; ++i) d = std::max(d, std::abs(a[i] - (&f._11)[i]));
+    return d;
+}
+
+static void test_profile_decode() {
+    const XMMATRIX view = XMMatrixLookToLH(XMVectorSet(12.5f, 3.2f, -40.0f, 1), XMVectorSet(0.3f, -0.2f, 0.9f, 0),
+                                           XMVectorSet(0, 1, 0, 0));
+    for (int mode = 0; mode < 3; ++mode) {
+        const XMMATRIX proj = test_proj(mode, 16.0f / 9.0f);
+        const XMMATRIX view_proj = view * proj;
+        for (bool column_major : {false, true}) {
+            for (int layout = 0; layout < 4; ++layout) {
+                CameraProfile c;
+                c.layout = CameraLayout(layout);
+                c.column_major = column_major;
+                c.view_offset = 128;
+                c.proj_offset = 64;
+                uint8_t buf[208] = {};
+                put(buf, 64, proj, column_major);
+                const XMMATRIX first = layout == 0   ? view
+                                       : layout == 1 ? view_proj
+                                       : layout == 2 ? XMMatrixInverse(nullptr, view)
+                                                     : XMMatrixInverse(nullptr, view_proj);
+                put(buf, 128, first, column_major);
+
+                float v[16], p[16];
+                std::string why;
+                const bool ok = decode_camera(c, buf + c.window_offset(), c.window_size(), v, p, &why);
+                if (!ok) std::printf("  mode %d layout %d: %s\n", mode, layout, why.c_str());
+                EXPECT(ok);
+                EXPECT(max_diff(p, proj) == 0.0f);  // proj passes through bit-exact
+                const float dv = max_diff(v, view);
+                if (layout == 0) EXPECT(dv == 0.0f);  // so does view in the view+proj layout
+                // Derived views: float inputs, double math, camera ~40 m out. The one loose case is
+                // a float inverse of a standard-depth viewProj: the stored input itself is only good
+                // to ~2e-5 relative (0.7 mm here), which no decoding can recover.
+                const float tol = layout == 3 && mode == 0 ? 1e-3f : 1e-4f;
+                if (!(dv < tol)) std::printf("  mode %d layout %d view diff %g\n", mode, layout, dv);
+                EXPECT(dv < tol);
+            }
+        }
+
+        const ProjectionInfo info = analyze_projection([&] {
+            static float f[16];
+            XMStoreFloat4x4(reinterpret_cast<XMFLOAT4X4*>(f), proj);
+            return f;
+        }());
+        EXPECT(info.valid);
+        EXPECT(std::abs(info.fov_y_deg - 70.0f) < 1e-3f);
+        EXPECT(std::abs(info.aspect - 16.0f / 9.0f) < 1e-4f);
+        EXPECT(std::abs(info.near_z - 0.1f) < 1e-4f);
+        EXPECT(info.reversed == (mode != 0));
+        EXPECT(!info.right_handed);
+        if (mode == 2) EXPECT(std::isinf(info.far_z));
+        else EXPECT(std::abs(info.far_z - 1000.0f) < 1.0f);
+    }
+
+    // Right-handed projections are recognized; garbage (e.g. the wrong offset) is rejected.
+    float rh[16];
+    XMStoreFloat4x4(reinterpret_cast<XMFLOAT4X4*>(rh), XMMatrixPerspectiveFovRH(1.0f, 1.5f, 0.5f, 200.0f));
+    const ProjectionInfo ri = analyze_projection(rh);
+    EXPECT(ri.valid && ri.right_handed && !ri.reversed);
+    EXPECT(std::abs(ri.near_z - 0.5f) < 1e-4f && std::abs(ri.far_z - 200.0f) < 0.1f);
+
+    CameraProfile c;
+    uint8_t zeros[128] = {};
+    float v[16], p[16];
+    EXPECT(!decode_camera(c, zeros, sizeof(zeros), v, p));
+    uint8_t swapped[128];
+    put(swapped, 0, test_proj(1, 1.5f), false);  // proj where the view should be, and vice versa
+    put(swapped, 64, view, false);
+    EXPECT(!decode_camera(c, swapped, sizeof(swapped), v, p));
+}
+
 int main() {
     test_ring();
     test_unproject();
+    test_profile_parse();
+    test_profile_decode();
     if (g_failures == 0) std::printf("all tests passed\n");
     return g_failures == 0 ? 0 : 1;
 }
