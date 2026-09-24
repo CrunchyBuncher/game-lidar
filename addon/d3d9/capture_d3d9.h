@@ -3,6 +3,9 @@
 // screen-sized depth-stencils as INTZ textures (create_resource), like ReShade's generic_depth.
 // At capture, a ps_3_0 pass point-samples the INTZ texture into a small R32F render target, and
 // once an event query says the GPU is done with it, GetRenderTargetData + LockRect read it back.
+// Nothing here waits on the GPU: LockRect of a surface with a copy in flight hung Sonic Adventure 2
+// for good while it loaded a level (D3DLOCK_DONOTWAIT didn't help: NVIDIA's driver blocks anyway),
+// so a second event query follows the copy, and the lock only happens once that one has finished.
 //
 // Native calls on the unwrapped device fire no addon events. The game's state is captured in a
 // state block and restored (render targets and viewport by hand, which state blocks don't cover).
@@ -50,15 +53,22 @@ private:
     DWORD num_rts_ = 1;
     DWORD vertex_processing_ = 0;  // creation flags, for mixed vertex processing
 
-    // D3DPOOL_DEFAULT: per readback slot, the capture render target, a system-memory copy and a query.
+    // D3DPOOL_DEFAULT: per readback slot, the capture render target, a system-memory copy, and event
+    // queries behind the capture draw and behind the copy.
     uint32_t src_w_ = 0, src_h_ = 0;
     ComPtr<IDirect3DSurface9> rt_[kReadback];
     ComPtr<IDirect3DSurface9> sys_[kReadback];
     ComPtr<IDirect3DQuery9> done_[kReadback];
+    ComPtr<IDirect3DQuery9> copied_[kReadback];
+
+    // Presents a copy may stay unfinished before its capture is dropped.
+    static constexpr int kMaxCopyWaits = 30;
 
     struct Pending {
         int slot;
         FrameHeader header;
+        bool copied = false;  // GetRenderTargetData issued into sys_[slot], copied_[slot] behind it
+        int copy_waits = 0;   // presents copied_[slot] was found still running
     };
     std::deque<Pending> pending_;
     int next_slot_ = 0;

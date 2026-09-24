@@ -48,7 +48,7 @@ FetchContent_Declare(reshade_imgui
 FetchContent_MakeAvailable(reshade_sdk reshade_imgui)
 
 add_library(lidar_capture SHARED
-  addon/main.cpp addon/backends.cpp addon/depth_tracker.cpp addon/camera_tracker.cpp addon/profile.cpp
+  addon/main.cpp addon/backends.cpp addon/depth_tracker.cpp addon/camera_tracker.cpp addon/profile.cpp addon/watchdog.cpp
   addon/d3d11/capture_d3d11.cpp addon/d3d11/cbuffer_d3d11.cpp
   addon/d3d12/capture_d3d12.cpp addon/d3d12/cbuffer_d3d12.cpp addon/d3d12/root_layout.cpp
   addon/d3d9/capture_d3d9.cpp addon/d3d9/constants_d3d9.cpp)
@@ -57,7 +57,13 @@ target_compile_definitions(lidar_capture PRIVATE ImTextureID=ImU64)
 target_link_libraries(lidar_capture PRIVATE lidar_common delayimp)
 # Only load the shader compiler once a capture actually starts, not in every game the addon is in.
 target_link_options(lidar_capture PRIVATE /DELAYLOAD:d3dcompiler_47.dll)
-set_target_properties(lidar_capture PROPERTIES PREFIX "" SUFFIX ".addon64")
+# ReShade only looks for the suffix matching its own bitness (32-bit games need .addon32).
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+  set(ADDON_SUFFIX ".addon32")
+else()
+  set(ADDON_SUFFIX ".addon64")
+endif()
+set_target_properties(lidar_capture PROPERTIES PREFIX "" SUFFIX ${ADDON_SUFFIX})
 # ReShade loads addons from the game's folder, so drop a copy next to both fake games, along with
 # the profile under the name the addon looks for by default.
 foreach(dir ${CMAKE_SOURCE_DIR}/sandbox/fake_game ${FAKE_GAME_D3D9_DIR})

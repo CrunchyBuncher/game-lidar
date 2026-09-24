@@ -200,6 +200,7 @@ void D3D9Capture::release_targets() {
         rt_[i].Reset();
         sys_[i].Reset();
         done_[i].Reset();
+        copied_[i].Reset();
     }
     src_w_ = src_h_ = 0;
     cap_w_ = cap_h_ = 0;
@@ -216,7 +217,8 @@ bool D3D9Capture::ensure_targets(uint32_t src_w, uint32_t src_h, uint32_t captur
                                             nullptr)) ||
             FAILED(dev_->CreateOffscreenPlainSurface(cap_w, cap_h, D3DFMT_R32F, D3DPOOL_SYSTEMMEM, &sys_[i],
                                                      nullptr)) ||
-            FAILED(dev_->CreateQuery(D3DQUERYTYPE_EVENT, &done_[i]))) {
+            FAILED(dev_->CreateQuery(D3DQUERYTYPE_EVENT, &done_[i])) ||
+            FAILED(dev_->CreateQuery(D3DQUERYTYPE_EVENT, &copied_[i]))) {
             release_targets();
             error_ = "failed to create the capture targets (R32F render target)";
             return false;
@@ -317,16 +319,32 @@ bool D3D9Capture::capture(command_queue*, resource depth, uint32_t capture_width
     return true;
 }
 
-// GetRenderTargetData blocks until the copy is done, so it only runs once the event query says
-// the GPU has finished the capture's draw; the copy itself is then small (under 1 MB) and quick.
+// Two steps, neither of which waits: once done_ says the GPU has finished the capture's draw,
+// GetRenderTargetData queues the copy to system memory with copied_ behind it; once copied_ has
+// finished too (this or a later present), LockRect reads it. A copy that never finishes costs its
+// frame, not the game.
 void D3D9Capture::publish(command_queue*, RingWriter& ring) {
     while (!pending_.empty()) {
-        const Pending& p = pending_.front();
-        const HRESULT q = done_[p.slot]->GetData(nullptr, 0, 0);
-        if (q == S_FALSE) break;  // still running
+        Pending& p = pending_.front();
+        if (!p.copied) {
+            const HRESULT q = done_[p.slot]->GetData(nullptr, 0, 0);
+            if (q == S_FALSE) break;  // still running
+            if (q != S_OK || FAILED(dev_->GetRenderTargetData(rt_[p.slot].Get(), sys_[p.slot].Get())) ||
+                FAILED(copied_[p.slot]->Issue(D3DISSUE_END))) {
+                pending_.pop_front();  // lost with the device
+                continue;
+            }
+            p.copied = true;
+        }
+        const HRESULT q = copied_[p.slot]->GetData(nullptr, 0, 0);
+        if (q == S_FALSE) {
+            if (++p.copy_waits < kMaxCopyWaits) break;
+            ++skipped_;  // gave up on this one
+            pending_.pop_front();
+            continue;
+        }
         D3DLOCKED_RECT lr{};
-        if (q == S_OK && SUCCEEDED(dev_->GetRenderTargetData(rt_[p.slot].Get(), sys_[p.slot].Get())) &&
-            SUCCEEDED(sys_[p.slot]->LockRect(&lr, nullptr, D3DLOCK_READONLY))) {
+        if (q == S_OK && SUCCEEDED(sys_[p.slot]->LockRect(&lr, nullptr, D3DLOCK_READONLY | D3DLOCK_DONOTWAIT))) {
             if (ring.is_open()) {
                 Slot* slot = ring.begin_frame();
                 slot->frame = p.header;

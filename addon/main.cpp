@@ -30,6 +30,7 @@
 #include "depth_tracker.h"
 #include "profile.h"
 #include "ring.h"
+#include "watchdog.h"
 
 using namespace reshade::api;
 using namespace lidar;
@@ -223,6 +224,7 @@ void attach_modules(device* dev) {
 }
 
 void on_init_device(device* dev) {
+    const watchdog::Step step("init_device");
     const std::lock_guard lock(g_mutex);
     if (!is_supported(dev)) {
         static bool logged = false;
@@ -246,6 +248,7 @@ void on_init_device(device* dev) {
     }
     if (capture == nullptr) return;
     g_device = dev;
+    watchdog::start();
     g_init_error.clear();
     g_capture = std::move(capture);
     g_source = cam::create_cbuffer_source(dev);
@@ -255,8 +258,10 @@ void on_init_device(device* dev) {
 }
 
 void on_destroy_device(device* dev) {
+    const watchdog::Step step("destroy_device");
     const std::lock_guard lock(g_mutex);
     if (dev != g_device) return;
+    watchdog::stop();
     cam::configure(dev, nullptr, nullptr);
     g_source.reset();
     g_capture.reset();
@@ -267,19 +272,25 @@ void on_destroy_device(device* dev) {
 
 void on_present(command_queue* queue, swapchain* sc, const rect*, const rect*, uint32_t, const rect*) {
     device* const dev = sc->get_device();
+    watchdog::heartbeat();
+    const watchdog::Step step("present: waiting for the addon lock");
     const std::lock_guard lock(g_mutex);
     if (dev != g_device || !g_init_error.empty()) return;
 
     LARGE_INTEGER t0, t1, freq;
     QueryPerformanceCounter(&t0);
 
+    watchdog::exchange_step("present: camera end_frame");
     const cam::FrameLatches latches = cam::end_frame(dev);
+    watchdog::exchange_step("present: depth end_frame");
     const resource_desc bb = dev->get_resource_desc(sc->get_current_back_buffer());
     std::vector<depth::Candidate> candidates = depth::end_frame(dev, bb.texture.width, bb.texture.height);
     if (candidates.empty()) return;  // e.g. a second present without any rendering in between
     g_candidates = std::move(candidates);
 
+    watchdog::exchange_step("present: publish");
     g_capture->publish(queue, g_ring);
+    watchdog::exchange_step("present: capture");
 
     const depth::Candidate* pick = nullptr;
     for (const auto& c : g_candidates)
@@ -411,6 +422,7 @@ bool draw_camera_section() {
 }
 
 void draw_overlay(effect_runtime*) {
+    const watchdog::Step step("overlay");
     const std::lock_guard lock(g_mutex);
     if (g_device == nullptr) {
         ImGui::TextColored(ImVec4(1, 0.6f, 0.2f, 1), "No supported device: %s",
