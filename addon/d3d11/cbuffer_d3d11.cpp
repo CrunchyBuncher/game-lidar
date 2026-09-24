@@ -49,9 +49,6 @@ struct __declspec(uuid("2d8b4f13-95a7-4c6e-b0d2-7e3f1a6c5b98")) Bindings {
 
 bool is_d3d11(device* dev) { return dev->get_api() == device_api::d3d11; }
 
-void on_init_device(device* dev) {
-    if (is_d3d11(dev)) dev->create_private_data<DeviceData>();
-}
 void on_destroy_device(device* dev) {
     if (is_d3d11(dev)) dev->destroy_private_data<DeviceData>();
 }
@@ -201,6 +198,10 @@ private:
 
 }  // namespace
 
+void init_device(device* dev) {
+    if (is_d3d11(dev) && dev->get_private_data<DeviceData>() == nullptr) dev->create_private_data<DeviceData>();
+}
+
 std::unique_ptr<CbufferSource> create(device* dev) {
     if (!is_d3d11(dev) || dev->get_private_data<DeviceData>() == nullptr) return nullptr;
     return std::make_unique<Source>(dev);
@@ -208,7 +209,7 @@ std::unique_ptr<CbufferSource> create(device* dev) {
 
 void register_events() {
     using reshade::addon_event;
-    reshade::register_event<addon_event::init_device>(on_init_device);
+    reshade::register_event<addon_event::init_device>(init_device);
     reshade::register_event<addon_event::destroy_device>(on_destroy_device);
     reshade::register_event<addon_event::init_command_list>(on_init_command_list);
     reshade::register_event<addon_event::destroy_command_list>(on_destroy_command_list);
@@ -226,7 +227,7 @@ void register_events() {
 
 void unregister_events() {
     using reshade::addon_event;
-    reshade::unregister_event<addon_event::init_device>(on_init_device);
+    reshade::unregister_event<addon_event::init_device>(init_device);
     reshade::unregister_event<addon_event::destroy_device>(on_destroy_device);
     reshade::unregister_event<addon_event::init_command_list>(on_init_command_list);
     reshade::unregister_event<addon_event::destroy_command_list>(on_destroy_command_list);

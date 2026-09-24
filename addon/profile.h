@@ -18,7 +18,7 @@ enum class CameraLayout {
 };
 
 struct CameraProfile {
-    cam::CbufferKey key;  // stage, slot, size (0 = any)
+    cam::CbufferKey key;  // stage, slot, space, size (0 = any)
     CameraLayout layout = CameraLayout::ViewAndProj;
     uint32_t view_offset = 0;  // bytes: the matrix the layout names first
     uint32_t proj_offset = 64;

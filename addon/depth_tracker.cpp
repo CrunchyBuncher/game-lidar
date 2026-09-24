@@ -56,7 +56,6 @@ bool fits_frame(float w, float h, float frame_w, float frame_h) {
     return std::abs(frame_w / frame_h - w / h) <= 0.1f && wr >= 0.5f && wr <= 1.85f && hr >= 0.5f && hr <= 1.85f;
 }
 
-void on_init_device(device* dev) { dev->create_private_data<DeviceData>(); }
 void on_destroy_device(device* dev) { dev->destroy_private_data<DeviceData>(); }
 
 void on_init_command_list(command_list* cmd) { cmd->create_private_data<CmdState>(false); }
@@ -65,8 +64,10 @@ void on_destroy_command_list(command_list* cmd) { cmd->destroy_private_data<CmdS
 void on_init_command_queue(command_queue* q) {
     q->create_private_data<CmdState>(true);
     if ((q->get_type() & command_queue_type::graphics) == 0) return;
+    DeviceData* dd = q->get_device()->get_private_data<DeviceData>();
+    if (dd == nullptr) return;  // a device the addon doesn't handle
     const std::unique_lock lock(g_mutex);
-    q->get_device()->get_private_data<DeviceData>()->queues.push_back(q);
+    dd->queues.push_back(q);
 }
 void on_destroy_command_queue(command_queue* q) {
     q->destroy_private_data<CmdState>();
@@ -78,8 +79,10 @@ void on_destroy_command_queue(command_queue* q) {
 
 void on_init_resource(device* dev, const resource_desc& desc, const subresource_data*, resource_usage, resource res) {
     if (desc.type != resource_type::texture_2d || (desc.usage & resource_usage::depth_stencil) == 0) return;
+    DeviceData* dd = dev->get_private_data<DeviceData>();
+    if (dd == nullptr) return;
     const std::unique_lock lock(g_mutex);
-    dev->get_private_data<DeviceData>()->depth_stencils[res.handle] = desc;
+    dd->depth_stencils[res.handle] = desc;
 }
 void on_destroy_resource(device* dev, resource res) {
     DeviceData* dd = dev->get_private_data<DeviceData>();
@@ -139,6 +142,10 @@ void on_execute_command_list(command_queue* q, command_list* cmd) {
 
 }  // namespace
 
+void init_device(device* dev) {
+    if (dev->get_private_data<DeviceData>() == nullptr) dev->create_private_data<DeviceData>();
+}
+
 std::vector<Candidate> end_frame(device* dev, uint32_t frame_w, uint32_t frame_h) {
     std::vector<Candidate> out;
     DeviceData* dd = dev->get_private_data<DeviceData>();
@@ -175,7 +182,7 @@ std::vector<Candidate> end_frame(device* dev, uint32_t frame_w, uint32_t frame_h
 
 void register_events() {
     using reshade::addon_event;
-    reshade::register_event<addon_event::init_device>(on_init_device);
+    reshade::register_event<addon_event::init_device>(init_device);
     reshade::register_event<addon_event::destroy_device>(on_destroy_device);
     reshade::register_event<addon_event::init_command_list>(on_init_command_list);
     reshade::register_event<addon_event::destroy_command_list>(on_destroy_command_list);
@@ -194,7 +201,7 @@ void register_events() {
 
 void unregister_events() {
     using reshade::addon_event;
-    reshade::unregister_event<addon_event::init_device>(on_init_device);
+    reshade::unregister_event<addon_event::init_device>(init_device);
     reshade::unregister_event<addon_event::destroy_device>(on_destroy_device);
     reshade::unregister_event<addon_event::init_command_list>(on_init_command_list);
     reshade::unregister_event<addon_event::destroy_command_list>(on_destroy_command_list);

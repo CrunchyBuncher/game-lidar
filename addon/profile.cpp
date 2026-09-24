@@ -185,8 +185,8 @@ constexpr shader_stage kStages[] = {shader_stage::vertex, shader_stage::pixel,  
                                     shader_stage::hull,   shader_stage::domain, shader_stage::compute};
 
 bool read_camera(const Table& t, CameraProfile& c, std::string& error) {
-    static const char* const kKeys[] = {"stage",       "slot",  "size",   "layout", "view_offset",
-                                        "proj_offset", "major", "handed", "latch"};
+    static const char* const kKeys[] = {"stage",  "slot",        "space",       "size",  "layout",
+                                        "view_offset", "proj_offset", "major", "handed", "latch"};
     for (const auto& [key, v] : t)
         if (std::none_of(std::begin(kKeys), std::end(kKeys), [&](const char* k) { return key == k; }))
             return error = "line " + std::to_string(v.line) + ": unknown key '" + key + "' in [camera]", false;
@@ -194,7 +194,8 @@ bool read_camera(const Table& t, CameraProfile& c, std::string& error) {
     Reader r{t, "camera", error};
     int stage = 0, layout = 0, major = 0, handed = 0, latch = 0;
     if (!r.choice("stage", {"vertex", "pixel", "geometry", "hull", "domain", "compute"}, stage, true) ||
-        !r.uint("slot", c.key.slot, true, 255) || !r.uint("size", c.key.size, false, 1u << 20) ||
+        !r.uint("slot", c.key.slot, true, 255) || !r.uint("space", c.key.space, false, 0xFFFFFFEFu) ||
+        !r.uint("size", c.key.size, false, 1u << 20) ||
         !r.choice("layout", {"view+proj", "viewproj+proj", "invview+proj", "invviewproj+proj"}, layout, true) ||
         !r.uint("view_offset", c.view_offset, true, 1u << 20) || !r.uint("proj_offset", c.proj_offset, true, 1u << 20) ||
         !r.choice("major", {"row", "column"}, major, false) || !r.choice("handed", {"left", "right"}, handed, false) ||

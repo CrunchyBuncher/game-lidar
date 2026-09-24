@@ -180,8 +180,56 @@ bool apply_camera(const cam::FrameLatches& latches, uint64_t depth_stencil, Fram
     return true;
 }
 
+const char* api_name(device_api api) {
+    switch (api) {
+        case device_api::d3d9: return "Direct3D 9";
+        case device_api::d3d10: return "Direct3D 10";
+        case device_api::d3d11: return "Direct3D 11";
+        case device_api::d3d12: return "Direct3D 12";
+        case device_api::opengl: return "OpenGL";
+        case device_api::vulkan: return "Vulkan";
+    }
+    return "this graphics API";
+}
+
+void register_active_handlers();  // below, next to the handlers it registers
+
+// Until a supported device shows up, the addon's only handler is init_device. Registering an
+// event can change how ReShade hooks the game (on D3D9, map events wrap every buffer Lock), so on
+// an API we don't support the addon must not register anything else: the game has to run exactly
+// as it does without the addon. On the first supported device, everything registers. That device
+// was created before the modules' handlers existed, so it's set up by hand.
+void attach_modules(device* dev) {
+    static bool registered = false;
+    if (!registered) {
+        depth::register_events();
+        cam::register_events();
+        cam::register_source_events();
+        register_capture_events();
+        register_active_handlers();
+        registered = true;
+    }
+    depth::init_device(dev);
+    cam::init_device(dev);
+    cam::init_source_device(dev);
+    init_capture_device(dev);
+}
+
 void on_init_device(device* dev) {
     const std::lock_guard lock(g_mutex);
+    if (!is_supported(dev)) {
+        static bool logged = false;
+        if (!logged) {
+            const std::string msg = std::string("Inactive: the game created a ") + api_name(dev->get_api()) +
+                                    " device, which isn't supported (D3D11 and D3D12 are). Nothing else is hooked.";
+            reshade::log::message(reshade::log::level::warning, msg.c_str());
+            logged = true;
+        }
+        return;
+    }
+    // Later supported devices get this from the modules' own init_device handlers too, but those
+    // run after this one.
+    attach_modules(dev);
     if (g_device != nullptr) return;
     std::string error;
     std::unique_ptr<DepthCapture> capture = create_depth_capture(dev, error);
@@ -299,7 +347,8 @@ bool draw_camera_section() {
     }
 
     const CameraProfile& c = g_profile.camera;
-    ImGui::TextDisabled("%s b%u%s, %s at %u / %u, %s-major, %s-handed, %s latch", stage_name(c.key.stage), c.key.slot,
+    ImGui::TextDisabled("%s b%u%s%s, %s at %u / %u, %s-major, %s-handed, %s latch", stage_name(c.key.stage), c.key.slot,
+                        c.key.space ? (" space" + std::to_string(c.key.space)).c_str() : "",
                         c.key.size ? (" (" + std::to_string(c.key.size) + " bytes)").c_str() : "",
                         layout_name(c.layout), c.view_offset, c.proj_offset, c.column_major ? "column" : "row",
                         c.right_handed ? "right" : "left", c.latch_last ? "last" : "first");
@@ -414,20 +463,20 @@ void draw_overlay(effect_runtime*) {
     if (changed) g_settings.save();
 }
 
+void register_active_handlers() {
+    reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
+    reshade::register_event<reshade::addon_event::present>(on_present);
+    reshade::register_overlay("LiDAR", draw_overlay);
+}
+
 }  // namespace
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
     switch (reason) {
         case DLL_PROCESS_ATTACH:
             if (!reshade::register_addon(module)) return FALSE;
-            // The trackers' and sources' init_device must run first: they create per-device data.
-            depth::register_events();
-            cam::register_events();
-            cam::register_source_events();
+            // Everything else registers in attach_modules(), for supported devices only.
             reshade::register_event<reshade::addon_event::init_device>(on_init_device);
-            reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
-            reshade::register_event<reshade::addon_event::present>(on_present);
-            reshade::register_overlay("LiDAR", draw_overlay);
             break;
         case DLL_PROCESS_DETACH:
             reshade::unregister_addon(module);

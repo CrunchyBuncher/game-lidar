@@ -104,11 +104,36 @@ Test first on the **fake game with ReShade injected**, then on the real game.
 - [ ] Follow-player camera, trail, clear/reset. Handle resolution changes.
 
 ## M5 — More APIs
-- [ ] D3D9 via `push_constants`.
-- [ ] D3D12/Vulkan: a `DepthCapture` on the ReShade API (copies, barriers, fenced readback)
-      and a `CbufferSource` that tracks persistently mapped upload buffers, resolves root CBVs
-      and descriptors at scene-depth draws (`ready = false`), and reads the memory in
-      `resolve()` at submit. Profiles need a binding key beyond stage + slot.
+- [x] **D3D12** (2026-09-24), ahead of M3.
+  - `fake_game --api d3d12`: same scene, camera and depth modes, render only. Camera and
+    per-object constants in one persistently mapped upload buffer, a region per frame,
+    3 frames in flight. Root CBVs (b1 at parameter 0, b0 at 1; root signature 1.1), or
+    `--cbv-tables`: one table [b1, b0 appended] copied every frame from a CPU-only heap
+    (root signature 1.0). Depth ends each frame in PIXEL_SHADER_RESOURCE. `--d3d12-debug`
+    turns on the debug layer and exits 3 on any error.
+  - `D3D12CbufferSource`: upload buffers + Map pointers, root signature layouts, CBV
+    descriptor shadows (creates and copies), per-command-list root CBVs / tables. Records at
+    the draw, reads in `resolve()` at submit. Profiles gained `space`.
+  - `D3D12Capture`: ReShade API only (immediate command list, no events), depth state tracked
+    from the game's barriers and restored, fenced readback ring.
+  - **Result:** `lidar_verify ring --frames 60` passes in all 3 depth modes for both binding
+    modes with the same accuracy as D3D11 (standard max 0.3 mm, reversed ≤ 0.1 mm).
+    `lidar_verify addon` against the un-injected D3D11 reference is bit-identical (depth,
+    proj and view 0 diff) in all 6 combinations. The debug layer reports no errors while
+    capturing. Forcing the addon to assume DEPTH_WRITE makes it report state mismatches,
+    so the state tracking is needed and is working.
+  - Known limits: only graphics bindings are tracked (no compute or bundles). Custom heaps
+    with CPU access aren't tracked, and neither are enhanced-barrier layouts beyond what
+    ReShade maps to states. D24S8/D32S8 depth copies are untested on D3D12. Descriptor
+    shadows grow to the highest index written. Measure the cost of the descriptor events on
+    a real D3D12 game.
+- [x] Unsupported APIs are harmless (2026-09-24): until a D3D11/D3D12 device appears, the addon
+      registers only `init_device` (registering events changes how ReShade hooks D3D9), logs
+      "Inactive" and does nothing else. `d3dcompiler_47.dll` is delay-loaded. Checked once with
+      a throwaway D3D9 test (renders identically with and without the addon, "Inactive" logged).
+      Found via A Hat in Time, whose "DX12" mode is D3D9On12.
+- D3D9: not supported, by decision (2026-09-24).
+- [ ] Vulkan: same shape as D3D12 (host-visible memory, descriptor sets, pipeline layouts).
 
 ## M6 — Scale & extras (as needed)
 - [ ] Chunked pool with eviction/streaming for huge levels. Resume saved scans.

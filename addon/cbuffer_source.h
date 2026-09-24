@@ -15,13 +15,15 @@
 
 namespace lidar::cam {
 
-// Identifies the camera cbuffer at a draw. D3D11: shader stage + register slot, with the buffer
-// size to tell apart buffers that share a slot (handles change every run, sizes don't).
-// Other APIs will add their own binding identity (root parameter, descriptor set/binding).
+// Identifies the camera cbuffer at a draw: shader stage + register (bN) + register space, which
+// stay the same across runs (handles don't). D3D12 finds the root parameter holding that register
+// from the root signature. `size` tells apart buffers that share a register: D3D11 compares it to
+// the buffer size, D3D12 (rounded up to 256 bytes) to the CBV size. Root CBVs have no size to check.
 struct CbufferKey {
     reshade::api::shader_stage stage = reshade::api::shader_stage::vertex;
-    uint32_t slot = 0;
-    uint32_t size = 0;  // 0 = any size
+    uint32_t slot = 0;   // register
+    uint32_t space = 0;  // register space (D3D12)
+    uint32_t size = 0;   // 0 = any size
 };
 
 // A read of [offset, offset + size) of the buffer bound at a draw, offsets relative to the bound range.
@@ -30,6 +32,15 @@ struct CbufferRead {
     uint64_t offset = 0;          // absolute byte offset in the buffer
     std::vector<uint8_t> bytes;   // the data, once ready
     bool ready = false;
+
+    // What resolve() needs when the source couldn't read at the draw. Only that source uses these.
+    struct Deferred {
+        uint32_t size = 0;             // window size
+        uint32_t key_size = 0;         // CbufferKey::size, when the binding's size is only known later
+        uint64_t descriptor_heap = 0;  // D3D12 descriptor table: the CBV's heap + index, looked up at
+        uint32_t descriptor = 0;       // submit (descriptors may be written after the draw). `buffer` is
+                                       // then 0 and `offset` relative to the view until resolved.
+    } deferred;
 };
 
 class CbufferSource {
@@ -55,5 +66,6 @@ std::unique_ptr<CbufferSource> create_cbuffer_source(reshade::api::device* dev);
 // Registers the event handlers of every backend. Backends only act on devices of their own API.
 void register_source_events();
 void unregister_source_events();
+void init_source_device(reshade::api::device* dev);  // for a device created before registration
 
 }  // namespace lidar::cam

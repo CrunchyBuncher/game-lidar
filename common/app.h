@@ -14,10 +14,11 @@ using Microsoft::WRL::ComPtr;
 
 class App {
 public:
-    bool create(const wchar_t* title, int width, int height);
+    // d3d11 = false: window only, for callers that create their own device (the D3D12 fake game).
+    bool create(const wchar_t* title, int width, int height, bool d3d11 = true);
     // Processes pending window messages. Returns false once the window closed.
     bool pump();
-    void present(bool vsync);
+    void present(bool vsync);  // D3D11 only
     void set_title(const std::wstring& title);
 
     bool key_down(int vk) const { return keys_[vk & 0xFF]; }
@@ -26,7 +27,7 @@ public:
 
     HWND hwnd = nullptr;
     int width = 0, height = 0;
-    bool resized = false;  // set by pump() when the back buffer was resized
+    bool resized = false;  // set by pump() when the window (and the D3D11 back buffer) was resized
     float mouse_dx = 0, mouse_dy = 0, wheel = 0;  // accumulated during the last pump
 
     ComPtr<ID3D11Device> dev;

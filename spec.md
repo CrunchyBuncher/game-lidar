@@ -19,7 +19,7 @@ trails from NPCs and other moving objects are acceptable.
 | Camera pose source | **Constant-buffer sniffing inside the same addon** | No second mod needed. Matrices come from the exact frame being rendered, so sync is perfect. |
 | Per-game work | A one-time **discovery** step that finds where the camera matrices live, saved as a game profile | Guided by an in-overlay tool, not manual reverse engineering |
 | First graphics API | **D3D11** | Constant buffers are updated via `Map`/`UpdateSubresource`, and ReShade reports both as events. That's the easiest to sniff. |
-| Later APIs | D3D9 (easy via `push_constants`), then D3D12/Vulkan (harder, see §3.3) | |
+| Later APIs | D3D12 (done, see §3.3), Vulkan. Not D3D9. | On unsupported APIs the addon stays inactive |
 | Unprojection | On the GPU in the viewer | The addon only ships a small depth image and two matrices |
 | Transport | Shared-memory ring buffer (addon → viewer) | Zero-copy, non-blocking, same machine |
 | Viewer | Native C++, D3D11 (compute + indirect draw), no third-party deps | Same API and toolchain as the addon and fake game, and it handles tens of millions of points. Dear ImGui can be added later for UI. |
@@ -69,7 +69,6 @@ trails from NPCs and other moving objects are acceptable.
 - `update_buffer_region` (`UpdateSubresource`): copy the incoming data into the shadow.
 - `bind_descriptor_tables` / `push_descriptors`: track which cbuffer is bound to which
   slot in which shader stage.
-- (D3D9 later: `push_constants` gives the constant registers directly.)
 
 **Choosing the right moment in the frame:**
 A frame usually contains several "cameras": shadow cascades, reflections, UI. The one we
@@ -101,14 +100,27 @@ the matrices for this frame. The first valid latch per frame wins. The last one 
 4. The overlay lists ranked candidates with live values. The user picks one, does the
    "360° turn" test in the viewer, then clicks **Save to profile**.
 
-### 3.3 D3D12 / Vulkan (later)
+### 3.3 D3D12 (and Vulkan, later)
 Constant buffers in these APIs usually live in persistently mapped upload memory that
-the game writes to without map/unmap calls, so there's no event to hook. The plan:
-- Track upload-heap / host-visible buffers at creation, and map them from the addon.
-- Resolve root constant-buffer views and descriptor bindings at scene-depth draws to
-  a buffer + offset, then read that memory directly at that moment. The game may
-  overwrite it later, but at draw time the content is valid for the current frame.
-- Root/push constants arrive via `push_constants` and are easy.
+the game writes to without map/unmap calls, so there's no event to hook. D3D12 (`addon/d3d12/`):
+- **Memory:** track upload-heap buffers at creation and the game's Map pointer for each
+  (Map/Unmap nest). A buffer that isn't mapped when we need it is mapped by the addon itself,
+  with its own map events ignored.
+- **Bindings:** root signatures are converted at `init_pipeline_layout` into "which root
+  parameter holds register bN in space S, visible to which stages". Per command list: the
+  graphics root signature, root CBVs (`push_descriptors`, GPU VA already resolved to buffer +
+  offset) and descriptor tables (`bind_descriptor_tables`). CBV descriptors are shadowed per
+  descriptor heap from `update_descriptor_tables` and `copy_descriptor_tables`, so profiles
+  still key on stage + register (+ `space`).
+- **When to read:** at the draw, record where the bytes live (root CBV: buffer + offset;
+  table: descriptor heap + index). Read them in `resolve()` when the command list is
+  submitted: the game must have written its constants (and descriptors) by then, and with
+  per-frame regions it can't overwrite them until that frame has finished on the GPU.
+- **Depth:** copy, compute downsample and fenced readback through the ReShade API on the
+  queue's immediate command list, which fires no addon events. D3D12 has no queryable
+  resource state, so the depth buffer's state is tracked from the game's barriers (per command
+  list, applied at submit) and restored after the copy.
+- Root/push constants arrive via `push_constants` and are easy (not implemented yet).
 
 ### 3.4 Shared-memory protocol
 `Local\game_lidar_frames`: a versioned header plus N slots. Each slot holds: frame#,
@@ -143,7 +155,8 @@ max_range_m   = 500
 [camera]
 stage   = "vertex"              # shader stage the cbuffer is bound to
 slot    = 0                     # cbuffer register (b0)
-size    = 1024                  # buffer size, to disambiguate
+space   = 0                     # register space (D3D12), default 0
+size    = 1024                  # buffer (D3D11) / CBV (D3D12) size, to disambiguate
 layout  = "view+proj"           # view+proj | viewproj+proj | invview+proj | invviewproj+proj
 view_offset = 0                 # bytes
 proj_offset = 64

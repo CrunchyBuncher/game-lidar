@@ -39,7 +39,6 @@ void merge(CbufferSource* source, bool last, FrameLatches& dst, FrameLatches& sr
     src.clear();
 }
 
-void on_init_device(device* dev) { dev->create_private_data<DeviceData>(); }
 void on_destroy_device(device* dev) { dev->destroy_private_data<DeviceData>(); }
 
 void on_init_command_list(command_list* cmd) { cmd->create_private_data<CmdState>(false); }
@@ -48,8 +47,10 @@ void on_destroy_command_list(command_list* cmd) { cmd->destroy_private_data<CmdS
 void on_init_command_queue(command_queue* q) {
     q->create_private_data<CmdState>(true);
     if ((q->get_type() & command_queue_type::graphics) == 0) return;
+    DeviceData* dd = q->get_device()->get_private_data<DeviceData>();
+    if (dd == nullptr) return;  // a device the addon doesn't handle
     const std::unique_lock lock(g_mutex);
-    q->get_device()->get_private_data<DeviceData>()->queues.push_back(q);
+    dd->queues.push_back(q);
 }
 void on_destroy_command_queue(command_queue* q) {
     q->destroy_private_data<CmdState>();
@@ -97,6 +98,7 @@ void on_execute_command_list(command_queue* q, command_list* cmd) {
     if (cmd == q->get_immediate_command_list()) return;  // just the immediate context flushing
     const std::unique_lock lock(g_mutex);
     const DeviceData* dd = q->get_device()->get_private_data<DeviceData>();
+    if (dd == nullptr) return;
     auto& dst = *q->get_private_data<CmdState>();
     auto& src = *cmd->get_private_data<CmdState>();
     dst.current_ds = src.current_ds;
@@ -104,6 +106,10 @@ void on_execute_command_list(command_queue* q, command_list* cmd) {
 }
 
 }  // namespace
+
+void init_device(device* dev) {
+    if (dev->get_private_data<DeviceData>() == nullptr) dev->create_private_data<DeviceData>();
+}
 
 void configure(device* dev, CbufferSource* source, const LatchRequest* req) {
     DeviceData* dd = dev->get_private_data<DeviceData>();
@@ -125,7 +131,7 @@ FrameLatches end_frame(device* dev) {
 
 void register_events() {
     using reshade::addon_event;
-    reshade::register_event<addon_event::init_device>(on_init_device);
+    reshade::register_event<addon_event::init_device>(init_device);
     reshade::register_event<addon_event::destroy_device>(on_destroy_device);
     reshade::register_event<addon_event::init_command_list>(on_init_command_list);
     reshade::register_event<addon_event::destroy_command_list>(on_destroy_command_list);
@@ -141,7 +147,7 @@ void register_events() {
 
 void unregister_events() {
     using reshade::addon_event;
-    reshade::unregister_event<addon_event::init_device>(on_init_device);
+    reshade::unregister_event<addon_event::init_device>(init_device);
     reshade::unregister_event<addon_event::destroy_device>(on_destroy_device);
     reshade::unregister_event<addon_event::init_command_list>(on_init_command_list);
     reshade::unregister_event<addon_event::destroy_command_list>(on_destroy_command_list);

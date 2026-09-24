@@ -22,6 +22,9 @@ using FrameLatches = std::unordered_map<uint64_t, CbufferRead>;
 
 void register_events();
 void unregister_events();
+// Sets up `dev` (idempotent). The init_device handler does it for devices created after
+// register_events(); call it for a device created before.
+void init_device(reshade::api::device* dev);
 
 // Starts latching `req` on `dev` through `source`. Pass nullptr for either to stop.
 // `source` must outlive the configuration.
