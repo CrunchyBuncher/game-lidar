@@ -40,6 +40,7 @@ struct CameraProfile {
     bool right_handed = false;  // informational: unprojection doesn't depend on it
     Latch latch = Latch::First;
     float units_per_meter = 1;  // the game's world units in a meter: published poses are in meters
+    bool z_up = false;          // the game's world is z-up (IW, Unreal, Source): turned y-up for the viewer
     // Camera-relative matrices (UE3's TranslatedViewProjection: the camera sits at the origin): a
     // float3 at translation_offset moves world points into that space first, p + t ("add", UE3's
     // PreViewTranslation) or p - t ("subtract", a camera position). Not for ModelView.
@@ -88,7 +89,9 @@ ProjectionInfo analyze_projection(const float proj[16]);
 // Puts a decoded pose in the protocol's frame: left-handed (a right-handed game's world gets z
 // negated, or the viewer would show it mirrored) and in meters (world and view units divided by
 // units_per_meter). Unprojecting with the result gives the same points, converted likewise.
-void normalize_pose(float view[16], float proj[16], bool right_handed, float units_per_meter);
+// The world is also turned y-up (`z_up`), and unmirrored if it's mirrored against view space (a
+// right-handed world under a left-handed view: IW) by negating its z.
+void normalize_pose(float view[16], float proj[16], bool right_handed, float units_per_meter, bool z_up = false);
 
 // ModelView: the constant projection at proj_offset, from a window read at proj_offset.
 bool decode_projection(const CameraProfile& profile, const uint8_t* window, size_t window_size, float proj[16],

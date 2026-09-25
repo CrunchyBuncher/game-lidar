@@ -490,6 +490,7 @@ int main(int argc, char** argv) {
     double last = 0, title_timer = 0, reconnect_timer = 0;
     double last_posed = -1;  // when the last posed frame came in
     uint64_t ingested = 0;
+    uint64_t seen_clear = 0;  // the producer's last clear request handled
     int fps_frames = 0;
     double fps = 0;
 
@@ -537,9 +538,16 @@ int main(int argc, char** argv) {
                 reconnect_timer = 0.5;
             }
         }
+        // The producer asked for a clear (its pose's frame changed). A restarted producer starts at 0:
+        // that keeps the points.
+        if (const uint64_t cs = ring.clear_seq(); cs != seen_clear) {
+            if (cs != 0) clear_cloud();
+            seen_clear = cs;
+        }
         for (uint32_t i = 0; i < kSlotCount && ring.is_open() && ring.read_next(frame); ++i) {
             const FrameHeader& h = frame.header;
             if (h.flags & kFlagPaused) continue;
+            if (frame.seq <= seen_clear) continue;  // posed before the clear
             // Without a pose (addon before M2) the frame is camera-relative: show it as a live
             // snapshot at the origin instead of accumulating it.
             const bool posed = (h.flags & kFlagPoseValid) != 0;

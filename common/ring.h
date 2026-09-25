@@ -23,6 +23,9 @@ public:
     // For the writing thread to look at what it committed: the last committed seq (0: none yet)
     // and the slot a seq went to (valid until kSlotCount more frames are written).
     uint64_t latest_seq() const { return hdr_ ? hdr_->latest_seq : 0; }
+    // Asks the viewer to drop its points and the frames written so far (or being written). Any
+    // thread; nothing happens if no viewer is reading.
+    void request_clear();
     const Slot* slot(uint64_t seq) const { return &slots_[seq % kSlotCount]; }
 
 private:
@@ -51,6 +54,8 @@ public:
     // Frames the writer lapped are skipped and counted in dropped().
     bool read_next(Frame& out);
     uint64_t dropped() const { return dropped_; }
+    // The producer's latest clear request (RingHeader::clear_seq), 0 if none or not open.
+    uint64_t clear_seq() const;
 
 private:
     void* map_ = nullptr;

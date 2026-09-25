@@ -51,6 +51,7 @@ bool RingWriter::open(const wchar_t* name) {
         store_release(slots_[i].seq_end, 0);
     }
     store_release(hdr_->latest_seq, 0);
+    store_release(hdr_->clear_seq, 0);
     store_release(hdr_->session_id, make_session_id());
     std::atomic_ref<uint32_t>(hdr_->magic).store(kMagic, std::memory_order_release);
     pending_seq_ = 0;
@@ -78,6 +79,12 @@ void RingWriter::commit() {
     Slot* s = &slots_[pending_seq_ % kSlotCount];
     store_release(s->seq_end, pending_seq_);
     store_release(hdr_->latest_seq, pending_seq_);
+}
+
+void RingWriter::request_clear() {
+    if (!hdr_) return;
+    // + 1: a frame being written now may have been posed the old way.
+    store_release(hdr_->clear_seq, load_acquire(hdr_->latest_seq) + 1);
 }
 
 // ---------------------------------------------------------------- reader
@@ -115,6 +122,8 @@ void RingReader::close() {
     hdr_ = nullptr;
     slots_ = nullptr;
 }
+
+uint64_t RingReader::clear_seq() const { return hdr_ ? load_acquire(hdr_->clear_seq) : 0; }
 
 bool RingReader::read_next(Frame& out) {
     if (!hdr_) return false;

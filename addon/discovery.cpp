@@ -26,7 +26,8 @@ using Clock = std::chrono::steady_clock;
 
 constexpr size_t kMaxHypotheses = 1024;
 constexpr size_t kMaxTranslations = 256;  // of those, translation vectors
-constexpr size_t kTranslationsTried = 4;  // per camera-relative view-projection, most changing first
+constexpr size_t kTranslationsTried = 4;  // per camera-relative candidate, most changing first
+constexpr size_t kRelativeTried = 4;      // camera-relative candidates given translations, best first
 constexpr size_t kHistory = 48;          // frames of values per hypothesis (depth arrives a few frames late)
 constexpr size_t kMaxCandidates = 96;
 constexpr size_t kPublished = 16;        // candidates in the status snapshot
@@ -105,6 +106,16 @@ struct Candidate {
     uint32_t reproj_tests = 0, reproj_passes = 0;
     std::deque<float> errors;  // recent test errors
     uint32_t temporal_checks = 0, temporal_agree = 0;
+    // The camera's right axis in the world, |component| summed over decoded frames: an FPS camera
+    // doesn't roll, so it stays level and the up axis' component stays near 0 as the camera turns.
+    double right_abs[3] = {};
+    uint32_t right_frames = 0;
+
+    // Z-up, if turning showed it: z's component clearly the smallest (both others vary with yaw).
+    bool z_up() const {
+        if (right_frames < 30) return false;
+        return right_abs[2] < 0.5 * right_abs[0] && right_abs[2] < 0.5 * right_abs[1];
+    }
     // ModelView: the solver over every frame's draws, and the views it found (nullopt: no pose).
     std::shared_ptr<mv::Solver> solver;
     std::deque<std::pair<uint64_t, std::optional<mat::Mat>>> views;
@@ -162,11 +173,13 @@ bool view_changed(const mat::Mat& a, const mat::Mat& b) {
     return false;
 }
 
-// A float3 that could be a world position (a translation candidate): finite, not tiny, not huge.
+// A float3 that could be a world position (a translation candidate): finite, not tiny, not huge, and
+// no denormals (bits of an int or a packed value, not a coordinate).
 bool looks_like_position(const float f[3]) {
     double largest = 0;
     for (int i = 0; i < 3; ++i) {
         if (!std::isfinite(f[i]) || std::abs(f[i]) > 1e7f) return false;
+        if (f[i] != 0 && std::abs(f[i]) < 1e-30f) return false;
         largest = std::max(largest, double(std::abs(f[i])));
     }
     return largest >= 1;
@@ -438,7 +451,7 @@ struct Discovery::State {
     Status stats;
     std::unordered_map<Loc, Hypothesis, LocHash> hyps;
     size_t translations = 0;  // hyps of kind Translation
-    // Buffers holding a camera-relative view-projection: their float3s are tracked as translations.
+    // Buffers holding a camera-relative candidate's matrices: their float3s are tracked as translations.
     std::unordered_set<BufId, BufIdHash> translated_bufs;
     std::map<std::string, Candidate> candidates;  // keyed by the profile text
     std::deque<std::shared_ptr<DepthFrame>> depths;
@@ -637,18 +650,20 @@ struct Discovery::State {
 
     // ---- 2. Candidates --------------------------------------------------------------------
 
-    // A view-projection whose camera sits at the origin: world points are moved into camera-relative
-    // space before it (UE3's TranslatedViewProjection), so a translation must come with it.
-    static bool camera_at_origin(const Hypothesis& h) {
-        if (h.history.empty()) return false;
+    // A candidate whose camera sits at the origin: world points are moved into camera-relative space
+    // before its matrices (UE3's TranslatedViewProjection, IW's view origin), so it only has the
+    // rotation and needs a translation.
+    bool camera_at_origin(const Candidate& c) {
+        const auto h = hyps.find(c.a);
+        if (h == hyps.end() || h->second.history.empty()) return false;
         mat::Mat v, p;
-        if (!decompose_view_proj(mat::load(h.history.back().first, h.loc.column_major), v, p)) return false;
+        if (decode(c, h->second.history.back().frame, v, p) != 0) return false;
         return std::abs(v.m[3][0]) < 1e-3 && std::abs(v.m[3][1]) < 1e-3 && std::abs(v.m[3][2]) < 1e-3;
     }
 
+    // `supersede`: when full, takes the place of the worst candidate without a translation.
     void add_candidate(CameraLayout layout, const Hypothesis& a, const Hypothesis* b, Latch latch,
-                       const Hypothesis* t = nullptr, bool subtract = false) {
-        if (candidates.size() >= kMaxCandidates) return;
+                       const Hypothesis* t = nullptr, bool subtract = false, bool supersede = false) {
         CameraProfile p;
         p.key = {a.loc.buf.stage, a.loc.buf.slot, a.loc.buf.space, a.loc.buf.size};
         p.layout = layout;
@@ -662,7 +677,55 @@ struct Discovery::State {
         c.a = a.loc;
         if (b) c.b = b->loc, c.pair = true;
         if (t) c.t = t->loc;
-        candidates.try_emplace(format_profile(p, {}), std::move(c));
+        std::string key = format_profile(p, {});
+        if (candidates.contains(key)) return;
+        if (candidates.size() >= kMaxCandidates) {
+            if (!supersede) return;
+            auto worst = candidates.end();
+            for (auto it = candidates.begin(); it != candidates.end(); ++it)
+                if (!it->second.profile.has_translation && (worst == candidates.end() || better(worst->second, it->second)))
+                    worst = it;
+            if (worst == candidates.end()) return;
+            candidates.erase(worst);
+        }
+        candidates.emplace(std::move(key), std::move(c));
+    }
+
+    // The best camera-relative candidates (one per layout and window, whichever stage) get a variant
+    // per likely translation: the float3s of their buffer that change most, outside any matrix, either
+    // sign. Their buffers' float3s are tracked from now on. Scores come from the reprojection tests,
+    // which rotation alone passes often enough to rank the right matrices first.
+    void add_translated(const std::unordered_map<BufId, std::vector<const Hypothesis*>, BufIdHash>& positions) {
+        std::vector<Candidate> relative;
+        for (const Candidate* c : ranked()) {
+            if (relative.size() >= kRelativeTried) break;
+            if (c->profile.has_translation || c->profile.model_view() || !camera_at_origin(*c)) continue;
+            translated_bufs.insert(c->a.buf);
+            const bool seen = std::any_of(relative.begin(), relative.end(), [&](const Candidate& r) {
+                return r.profile.layout == c->profile.layout && r.a.offset == c->a.offset && r.b.offset == c->b.offset &&
+                       r.a.column_major == c->a.column_major && r.profile.latch == c->profile.latch &&
+                       r.a.buf.slot == c->a.buf.slot && r.a.buf.size == c->a.buf.size;
+            });
+            if (!seen) relative.push_back(*c);
+        }
+        for (const Candidate& c : relative) {
+            const auto pos = positions.find(c.a.buf);
+            if (pos == positions.end()) continue;
+            const Hypothesis& a = hyps.at(c.a);
+            const Hypothesis* b = c.pair ? &hyps.at(c.b) : nullptr;
+            size_t tried = 0;
+            for (const Hypothesis* t : pos->second) {
+                const bool in_matrix = std::any_of(hyps.begin(), hyps.end(), [&](const auto& kv) {
+                    const Loc& m = kv.first;
+                    return m.kind != MatrixKind::Translation && m.buf == t->loc.buf && t->loc.offset + 12 > m.offset &&
+                           t->loc.offset < m.offset + 64;
+                });
+                if (in_matrix) continue;
+                if (tried++ >= kTranslationsTried) break;
+                for (bool subtract : {true, false})
+                    add_candidate(c.profile.layout, a, b, c.profile.latch, t, subtract, true);
+            }
+        }
     }
 
     void rebuild_candidates() {
@@ -706,24 +769,7 @@ struct Discovery::State {
             const auto& proj = grp.kinds[int(MatrixKind::Proj)];
             const auto& vp = grp.kinds[int(MatrixKind::ViewProj)];
             const auto& ivp = grp.kinds[int(MatrixKind::InvViewProj)];
-            for (const Hypothesis* h : vp) {
-                add(CameraLayout::ViewProj, *h, nullptr);
-                // Camera-relative (UE3): the camera sits at the origin, its position is a float3 nearby.
-                if (!camera_at_origin(*h)) continue;
-                translated_bufs.insert(h->loc.buf);
-                const auto pos = positions.find(h->loc.buf);
-                if (pos == positions.end()) continue;
-                size_t tried = 0;
-                for (const Hypothesis* t : pos->second) {
-                    if (t->loc.offset + 12 > h->loc.offset && t->loc.offset < h->loc.offset + 64) continue;
-                    if (tried++ >= kTranslationsTried) break;
-                    for (bool subtract : {false, true}) {
-                        add_candidate(CameraLayout::ViewProj, *h, nullptr, Latch::First, t, subtract);
-                        if (per_draw(*h))
-                            add_candidate(CameraLayout::ViewProj, *h, nullptr, Latch::Common, t, subtract);
-                    }
-                }
-            }
+            for (const Hypothesis* h : vp) add(CameraLayout::ViewProj, *h, nullptr);
             for (const Hypothesis* h : ivp) add(CameraLayout::InvViewProj, *h, nullptr);
             for (const Hypothesis* p : proj) {
                 auto apart = [&](const Hypothesis* h) {
@@ -747,6 +793,7 @@ struct Discovery::State {
                     }
             }
         }
+        add_translated(positions);
     }
 
     // The candidate's matrices at `frame`, decoded exactly as a profile would. Returns 0 if they
@@ -825,6 +872,10 @@ struct Discovery::State {
                     if (r0 == 1 || r1 == 1) continue;
                     ++c.temporal_checks;
                     if (r0 == 0 && r1 == 0 && view_changed(v0, v1) == moving) ++c.temporal_agree;
+                    if (r1 == 0) {
+                        for (int i = 0; i < 3; ++i) c.right_abs[i] += std::abs(v1.m[i][0]);
+                        ++c.right_frames;
+                    }
                 }
             }
         }
@@ -891,6 +942,7 @@ struct Discovery::State {
         if (i.have_values) {
             i.info = analyze_projection(i.proj);
             i.profile.right_handed = i.info.right_handed;
+            i.profile.z_up = c.z_up();
         }
         return i;
     }

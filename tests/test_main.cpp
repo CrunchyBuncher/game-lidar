@@ -73,10 +73,21 @@ static void test_ring() {
     EXPECT(got == int(kSlotCount) && first == 20 - kSlotCount + 1);
     EXPECT(r.dropped() - dropped_before == 9 - kSlotCount);
 
-    // Producer restart: reader resyncs to the new session.
+    // Clear requests: past everything written so far, plus the frame that may be in flight.
+    EXPECT(r.clear_seq() == 0);
+    const uint64_t written = w.latest_seq();
+    w.request_clear();
+    EXPECT(r.clear_seq() == written + 1);
+    RingWriter closed;
+    closed.request_clear();  // not open: a no-op
+
+    // Producer restart: reader resyncs to the new session, and the clear request is gone.
     EXPECT(w.open(name));
+    EXPECT(r.clear_seq() == 0);
     write_frame(w, 1);
     EXPECT(r.read_next(f) && f.header.frame_index == 1);
+    RingReader unopened;
+    EXPECT(unopened.clear_seq() == 0);
 }
 
 static XMMATRIX make_proj(int mode, float fov, float aspect) {
@@ -428,6 +439,50 @@ static void test_normalize_pose() {
     std::memcpy(lp, lp0, sizeof(lp));
     normalize_pose(lv, lp, false, 1);
     EXPECT(std::memcmp(lv, lv0, sizeof(lv)) == 0 && std::memcmp(lp, lp0, sizeof(lp)) == 0);
+
+    // IW (Black Ops III): a right-handed z-up world (x forward, y left) under a left-handed view, in
+    // inches. The view's rotation is a mirror. Normalized with z_up: a rotation, y-up, points in meters
+    // at (x, z, y).
+    {
+        const XMMATRIX to_d3d(0, 0, 1, 0, -1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1);  // forward, left, up -> z, -x, y
+        const XMMATRIX iw_view = XMMatrixTranslation(-193.6f, 1281.7f, -140.1f) * XMMatrixRotationZ(-0.7f) *
+                                 XMMatrixRotationY(0.2f) * to_d3d;
+        const XMMATRIX iw_proj = XMMatrixPerspectiveFovLH(1.0f, 16.0f / 9.0f, 1.0f, 100000.0f);
+        float iv[16], ip[16];
+        XMStoreFloat4x4(reinterpret_cast<XMFLOAT4X4*>(iv), iw_view);
+        XMStoreFloat4x4(reinterpret_cast<XMFLOAT4X4*>(ip), iw_proj);
+        EXPECT(XMVectorGetX(XMMatrixDeterminant(iw_view)) < 0);
+        EXPECT(!analyze_projection(ip).right_handed);
+        const float k = 1 / 39.37f;
+        normalize_pose(iv, ip, false, 39.37f, true);
+        const XMMATRIX v3 = XMLoadFloat4x4(reinterpret_cast<const XMFLOAT4X4*>(iv));
+        const XMMATRIX p3 = XMLoadFloat4x4(reinterpret_cast<const XMFLOAT4X4*>(ip));
+        EXPECT(std::abs(XMVectorGetX(XMMatrixDeterminant(v3)) - 1) < 1e-4f);
+        for (const XMVECTOR world : {XMVectorSet(-100, -1200, 150, 1), XMVectorSet(-250, -1300, 120, 1)}) {
+            const XMVECTOR clip = XMVector4Transform(world, iw_view * iw_proj);
+            if (!(XMVectorGetW(clip) > 0)) continue;  // behind the camera
+            const XMVECTOR ndc = XMVectorScale(clip, 1 / XMVectorGetW(clip));
+            XMVECTOR back = XMVector4Transform(ndc, XMMatrixInverse(nullptr, p3));
+            back = XMVectorScale(back, 1 / XMVectorGetW(back));
+            back = XMVector4Transform(back, XMMatrixInverse(nullptr, v3));
+            const XMVECTOR expect =
+                XMVectorSet(XMVectorGetX(world) * k, XMVectorGetZ(world) * k, XMVectorGetY(world) * k, 1);
+            const float err = XMVectorGetX(XMVector3Length(back - expect));
+            if (!(err < 5e-3f)) std::printf("  normalize_pose (IW): error %g m\n", err);
+            EXPECT(err < 5e-3f);
+        }
+    }
+
+    // up in profiles: y by default, z parsed and written back.
+    {
+        const std::string b = "[camera]\nstage=\"vertex\"\nslot=0\nlayout=\"viewproj\"\nview_offset=0\n";
+        Profile pu, back;
+        std::string e;
+        EXPECT(parse_profile(b, pu, e) && !pu.camera.z_up);
+        EXPECT(parse_profile(b + "up=\"z\"\n", pu, e) && pu.camera.z_up);
+        EXPECT(parse_profile(format_profile(pu.camera, ""), back, e) && back.camera.z_up);
+        EXPECT(parse_fails((b + "up=\"x\"\n").c_str(), "up"));
+    }
 
     // units_per_meter in profiles: parsed, validated, written back.
     const std::string base = "[camera]\nstage=\"vertex\"\nslot=0\nlayout=\"modelview\"\nview_offset=0\nproj_offset=128\n";

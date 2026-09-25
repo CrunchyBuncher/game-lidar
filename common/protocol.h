@@ -66,7 +66,12 @@ struct alignas(64) RingHeader {
     uint32_t slot_size;
     uint64_t session_id;  // changes whenever a producer (re)initializes
     uint64_t latest_seq;  // last fully written seq; slot = seq % slot_count
+    // The producer asks the viewer to drop its points (e.g. the pose's frame changed): the viewer
+    // clears when this changes to a nonzero value, and skips frames up to this seq. 0: no request.
+    // In what was padding, so older viewers and producers just ignore it.
+    uint64_t clear_seq;
 };
+static_assert(sizeof(RingHeader) == 64, "RingHeader's layout is part of protocol v1");
 
 constexpr size_t kMappingSize = sizeof(RingHeader) + size_t(kSlotCount) * sizeof(Slot);
 

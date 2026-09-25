@@ -189,13 +189,13 @@ constexpr shader_stage kStages[] = {shader_stage::vertex, shader_stage::pixel,  
 bool read_camera(const Table& t, CameraProfile& c, std::string& error) {
     static const char* const kKeys[] = {"stage",  "slot",        "space",       "size",  "layout",
                                         "view_offset", "proj_offset", "major", "handed", "latch",
-                                        "units_per_meter", "translation_offset", "translation"};
+                                        "units_per_meter", "translation_offset", "translation", "up"};
     for (const auto& [key, v] : t)
         if (std::none_of(std::begin(kKeys), std::end(kKeys), [&](const char* k) { return key == k; }))
             return error = "line " + std::to_string(v.line) + ": unknown key '" + key + "' in [camera]", false;
 
     Reader r{t, "camera", error};
-    int stage = 0, layout = 0, major = 0, handed = 0, latch = 0;
+    int stage = 0, layout = 0, major = 0, handed = 0, latch = 0, up = 0;
     if (!r.choice("stage", {"vertex", "pixel", "geometry", "hull", "domain", "compute"}, stage, true) ||
         !r.uint("slot", c.key.slot, true, 255) || !r.uint("space", c.key.space, false, 0xFFFFFFEFu) ||
         !r.uint("size", c.key.size, false, 1u << 20) ||
@@ -213,12 +213,13 @@ bool read_camera(const Table& t, CameraProfile& c, std::string& error) {
         return false;
     }
     if (!r.choice("major", {"row", "column"}, major, false) || !r.choice("handed", {"left", "right"}, handed, false) ||
-        !r.choice("latch", {"first", "last", "common"}, latch, false))
+        !r.choice("latch", {"first", "last", "common"}, latch, false) || !r.choice("up", {"y", "z"}, up, false))
         return false;
     c.key.stage = kStages[stage];
     c.column_major = major == 1;
     c.right_handed = handed == 1;
     c.latch = Latch(latch);
+    c.z_up = up == 1;
     if (const Value* v = r.find("units_per_meter", false)) {
         const double u = v->type == Value::Float ? v->f : v->type == Value::Int ? double(v->i) : 0;
         if (!(u > 0 && u < 1e6)) return error = r.where(*v) + "units_per_meter must be a positive number", false;
@@ -329,6 +330,7 @@ std::string format_profile(const CameraProfile& c, std::string_view comment) {
     line("major", quoted(c.column_major ? "column" : "row"));
     line("handed", quoted(c.right_handed ? "right" : "left"));
     line("latch", quoted(latch_name(c.latch)));
+    if (c.z_up) line("up", quoted("z"));
     if (c.has_translation) {
         line("translation_offset", std::to_string(c.translation_offset));
         line("translation", quoted(c.translation_subtract ? "subtract" : "add"));
@@ -477,16 +479,30 @@ ProjectionInfo analyze_projection(const float p[16]) {
     return info;
 }
 
-void normalize_pose(float view[16], float proj[16], bool right_handed, float units_per_meter) {
-    // Handedness, with F = diag(1, 1, -1, 1): view' = F * view * F, proj' = F * proj. Points come out
-    // as p * F (z negated) in the world and in view space alike, so the depth still unprojects.
+void normalize_pose(float view[16], float proj[16], bool right_handed, float units_per_meter, bool z_up) {
+    // View-space handedness, with F = diag(1, 1, -1, 1): view' = view * F, proj' = F * proj. The same
+    // clip space; view space comes out left-handed, the world is left as it is.
     if (right_handed) {
         for (int i = 0; i < 4; ++i) {
-            view[2 * 4 + i] = -view[2 * 4 + i];  // row 2
-            view[i * 4 + 2] = -view[i * 4 + 2];  // column 2 (view[10] flips back)
+            view[i * 4 + 2] = -view[i * 4 + 2];  // column 2
             proj[2 * 4 + i] = -proj[2 * 4 + i];
         }
     }
+    // The world, with a basis change B (p' = p * B, so view' = B^T * view: its rows mixed). z-up to
+    // y-up: (x, y, z) -> (x, z, -y), a rotation. Then, if the world is mirrored against view space
+    // (det < 0, e.g. any right-handed world by now), z negated: up stays up. Points come out as p * B.
+    auto row = [&](int i) { return view + i * 4; };
+    if (z_up) {
+        float y[4];
+        std::memcpy(y, row(1), sizeof(y));
+        std::memcpy(row(1), row(2), sizeof(y));
+        for (int i = 0; i < 4; ++i) row(2)[i] = -y[i];
+    }
+    const double det = double(view[0]) * (double(view[5]) * view[10] - double(view[6]) * view[9]) -
+                       double(view[1]) * (double(view[4]) * view[10] - double(view[6]) * view[8]) +
+                       double(view[2]) * (double(view[4]) * view[9] - double(view[5]) * view[8]);
+    if (det < 0)
+        for (int i = 0; i < 4; ++i) row(2)[i] = -row(2)[i];
     // Units, with S = diag(k, k, k, 1), k = 1 / units_per_meter: view' = S^-1 * view * S scales the
     // translation only; proj' = S^-1 * proj * k (the same projection: clip space is homogeneous)
     // scales its last row only, so w stays z (analyze_projection's near/far come out in meters).

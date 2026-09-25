@@ -258,22 +258,24 @@ void log_discovery(const disc::Status& s) {
         log_info("  #" + std::to_string(i + 1) + " " + candidate_line(s.candidates[i]));
 }
 
-// Sets units_per_meter in a profile file, keeping the rest of it (comments too). Profiles have one
+// Sets `key = value` in a profile file, keeping the rest of it (comments too). Profiles have one
 // section, [camera], so the line goes at the end.
-void write_units_per_meter(const std::filesystem::path& path, float units_per_meter) {
+void write_profile_key(const std::filesystem::path& path, std::string_view key, const std::string& value) {
     std::ifstream in(path, std::ios::binary);
     if (!in) return;
     std::string text, line;
     while (std::getline(in, line)) {
         const size_t start = line.find_first_not_of(" \t");
-        if (start == std::string::npos || line.compare(start, 15, "units_per_meter") != 0) text += line + "\n";
+        const bool match = start != std::string::npos && line.compare(start, key.size(), key) == 0 &&
+                           (line.size() == start + key.size() || line[start + key.size()] == ' ' ||
+                            line[start + key.size()] == '\t' || line[start + key.size()] == '=');
+        if (!match) text += line + "\n";
     }
     in.close();
     while (text.size() >= 2 && text.ends_with("\n\n")) text.pop_back();
-    char buf[64];
-    std::snprintf(buf, sizeof(buf), "units_per_meter = %.9g\n", double(units_per_meter));
-    std::ofstream(path, std::ios::binary) << text << buf;
-    log_info(std::string("Profile: ") + buf);
+    const std::string set = std::string(key) + " = " + value + "\n";
+    std::ofstream(path, std::ios::binary) << text << set;
+    log_info("Profile: " + set);
 }
 
 // Writes the candidate as lidar_profile.toml next to the exe (keeping the old one as .bak), makes
@@ -417,7 +419,7 @@ bool apply_camera(const cam::FrameLatches& latches, const cam::FrameDraws& draws
     }
     g_camera.state = CameraStatus::Latched;
     g_camera.info = analyze_projection(proj);  // in the game's units and handedness
-    normalize_pose(view, proj, g_camera.info.right_handed, camera->units_per_meter);
+    normalize_pose(view, proj, g_camera.info.right_handed, camera->units_per_meter, camera->z_up);
     std::memcpy(g_camera.view, view, sizeof(view));
     std::memcpy(g_camera.proj, proj, sizeof(proj));
     std::memcpy(h.view, view, sizeof(h.view));
@@ -683,6 +685,7 @@ bool draw_camera_section() {
         if (ImGui::Button("End preview")) {
             g_preview.reset();
             configure_camera();
+            g_ring.request_clear();
         }
     }
     if (!g_preview && !g_profile_error.empty()) {
@@ -716,13 +719,39 @@ bool draw_camera_section() {
     if (ImGui::InputFloat("Game units per meter", &upm, 0, 0, "%.6g", ImGuiInputTextFlags_EnterReturnsTrue) &&
         upm > 0 && std::isfinite(upm)) {
         (g_preview ? *g_preview : g_profile.camera).units_per_meter = upm;
-        if (!g_preview) write_units_per_meter(g_profile_path, upm);
+        if (!g_preview) {
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%.9g", double(upm));
+            write_profile_key(g_profile_path, "units_per_meter", buf);
+        }
+        g_ring.request_clear();  // the viewer's points are in the old units
     }
     ImGui::SameLine();
     ImGui::TextDisabled("(?)");
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("How many of the game's world units make one meter. The viewer assumes meters (voxel\n"
-                          "size, range, height colors). Press C in the viewer after changing it.");
+                          "size, range, height colors). Changing it clears the viewer's points.");
+
+    // Up axis: live too, like the scale.
+    bool z_up = c.z_up;
+    if (ImGui::Checkbox("World is Z-up", &z_up)) {
+        (g_preview ? *g_preview : g_profile.camera).z_up = z_up;
+        if (!g_preview) write_profile_key(g_profile_path, "up", z_up ? "\"z\"" : "\"y\"");
+        g_ring.request_clear();
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("The game's world has z up (IW, Unreal, Source), not y: the capture shows on its side\n"
+                          "without this. Discovery suggests it once the camera has turned around. Changing it\n"
+                          "clears the viewer's points.");
+
+    if (ImGui::Button("Clear viewer points")) g_ring.request_clear();
+    ImGui::SameLine();
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Like C in the viewer, from here. Also done when the scale, the up axis or the previewed\n"
+                          "camera changes. Does nothing if the viewer isn't running.");
 
     switch (g_camera.state) {
         case CameraStatus::NoProfile: break;
@@ -865,10 +894,15 @@ void draw_discovery_section() {
             ImGui::Text("%u/%u", c.temporal_agree, c.temporal_checks);
             ImGui::TableNextColumn();
             if (ImGui::SmallButton("Use")) {
-                const float upm = active_camera() ? active_camera()->units_per_meter : 1;
+                // The scale and up axis in use carry over (discovery can only suggest z-up).
+                const CameraProfile* now = active_camera();
+                const float upm = now ? now->units_per_meter : 1;
+                const bool z_up = c.profile.z_up || (now && now->z_up);
                 g_preview = c.profile;
                 g_preview->units_per_meter = upm;
+                g_preview->z_up = z_up;
                 configure_camera();
+                g_ring.request_clear();
             }
             ImGui::SameLine();
             if (ImGui::SmallButton("Save")) save_candidate(c);
