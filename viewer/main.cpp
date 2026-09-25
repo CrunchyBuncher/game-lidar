@@ -3,7 +3,7 @@
 // point pool, and renders it with a free-fly camera. Points that a newer frame
 // sees straight through (things that moved away) are carved out.
 //
-// Usage: lidar_viewer [--voxel 0.05] [--capacity-m 16] [--table-bits 25]
+// Usage: lidar_viewer [--voxel 0.05] [--capacity-m 50] [--table-bits auto]
 //                     [--near-cut 0.3] [--max-range 500] [--height-range -1 20]
 //                     [--no-carve] [--carve-margin 0.15] [--carve-rel 0.02]
 //                     [--size 1600x900] [--out file.ply] [--save-after s] [--exit-after s]
@@ -70,8 +70,8 @@ float height_from_key(uint32_t key) {
 
 struct Options {
     float voxel = 0.05f;
-    uint32_t capacity = 16u << 20;
-    uint32_t table_bits = 25;
+    uint32_t capacity = 50u << 20;
+    uint32_t table_bits = 0;  // 0: sized for the capacity
     float near_cut = 0.3f;
     float max_range = 500.0f;
     float height_min = -1.0f, height_max = 20.0f;
@@ -344,7 +344,7 @@ int main(int argc, char** argv) {
     }
 
     PointCloud cloud;
-    if (!cloud.create(dev, opt.capacity, opt.table_bits)) {
+    if (!cloud.create(dev, opt.capacity, opt.table_bits != 0 ? opt.table_bits : table_bits_for(opt.capacity))) {
         std::fprintf(stderr, "can't allocate a %u-point pool: try a smaller --capacity-m\n", opt.capacity);
         return 1;
     }

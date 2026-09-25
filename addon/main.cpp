@@ -898,6 +898,17 @@ void draw_discovery_section() {
     }
 }
 
+// A multisampled depth-stencil drawing more than the captured one: the scene is likely there, and
+// neither capture nor discovery can use it.
+bool msaa_hides_scene() {
+    uint32_t captured = 0;
+    for (const auto& c : g_candidates)
+        if (c.resource.handle == g_selected) captured = c.stats.drawcalls;
+    for (const auto& c : g_candidates)
+        if (c.desc.texture.samples > 1 && c.stats.drawcalls > captured) return true;
+    return false;
+}
+
 void draw_overlay(effect_runtime*) {
     const watchdog::Step step("overlay");
     const std::lock_guard lock(g_mutex);
@@ -915,6 +926,10 @@ void draw_overlay(effect_runtime*) {
     ImGui::SameLine();
     ImGui::TextDisabled("(%.1f fps, addon CPU %.0f us/frame)", ImGui::GetIO().Framerate, g_cpu_us);
     if (!g_capture->error().empty()) ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1), "%s", g_capture->error().c_str());
+    if (msaa_hides_scene())
+        ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1),
+                           "The game renders with MSAA, which can't be captured: turn anti-aliasing (MSAA) off in the\n"
+                           "game's video settings. Until then depth and discovery only see a secondary buffer.");
     ImGui::Text("Published %llu frames at %ux%u, skipped %llu (GPU readback busy)",
                 static_cast<unsigned long long>(g_capture->published()), g_capture->width(), g_capture->height(),
                 static_cast<unsigned long long>(g_capture->skipped()));

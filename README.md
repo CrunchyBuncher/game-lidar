@@ -55,7 +55,7 @@ world·view·proj in b1/c13 (the level is drawn in three parts after the NPC in 
 **lidar_viewer**: right-drag to look, WASD/QE to move, Shift for speed, the wheel changes base speed.
 `F` follow player, `H` height/color mode, `T` trail, `X` toggle carving, `+/-` point size,
 `C` clear, `P` save `.ply` to `scans/`, `Space` pause ingest.
-Options: `--voxel 0.05`, `--capacity-m 16`, `--near-cut 0.3`, `--max-range 500`,
+Options: `--voxel 0.05`, `--capacity-m 50` (millions of points; ~1.5 GB of GPU memory at 50), `--near-cut 0.3`, `--max-range 500`,
 `--height-range -1 20`, `--no-carve`, `--carve-margin 0.15`, `--carve-rel 0.02`.
 
 **Carving:** when the camera sees *through* a spot where an old point sits (because the thing
@@ -128,7 +128,11 @@ build\bin\Release\lidar_verify.exe addon --frames 60 --depth-tol 6e-8
 ```
 
 ## Use it in a game
-Works with D3D9, D3D11 and D3D12 games. Stick to single-player games: anti-cheat may block ReShade
+Works with D3D9, D3D11 and D3D12 games. **Turn anti-aliasing (MSAA) off in the game's video
+settings:** multisampled depth can't be captured. With MSAA on, the addon falls back to some other
+depth buffer (often a post-process pass with a couple of draws), so capture shows nothing useful and
+discovery can't find the camera. The LiDAR tab warns when this happens. Post-process AA (FXAA,
+TAA, SMAA) is fine. Stick to single-player games: anti-cheat may block ReShade
 or ban you for it. Check which API the game actually uses: `ReShade.log` names the device it
 hooked (`D3D11CreateDevice`, `D3D12CreateDevice`, `IDirect3D9::CreateDevice`, ...). Older games
 can be D3D9 even on a D3D12 system (e.g. Unreal Engine 3 titles, which may run through Windows'
@@ -138,7 +142,7 @@ and the game runs as it would without it (there's no LiDAR tab in that case).
 
 **D3D9 notes:** D3D9 depth buffers can't be read, so the addon has ReShade create the game's
 screen-sized depth buffers as INTZ textures (the trick ReShade's own depth access uses). This
-needs MSAA off in the game, and depth is 24-bit. There are no constant buffers either: games put
+needs MSAA off in the game (see above), and depth is 24-bit. There are no constant buffers either: games put
 their matrices in shader constant registers, so a D3D9 profile uses `slot = 0` and byte offsets
 of register × 16 (c4 = 64). `size` and `space` are ignored. Games that use the fixed-function
 pipeline (`SetTransform`, mostly pre-2004) have no shader constants to sniff.
