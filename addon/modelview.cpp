@@ -112,6 +112,7 @@ Result Solver::solve(const std::vector<Draw>& draws) {
         r.posed = true;
         r.view = view;
         r.segment = segment_;
+        r.anchor_shared = anchor_shared_;
         mat::Mat view_inv;
         mat::inverse(view, view_inv);
         for (size_t i = 0; i < hyps.size(); ++i) {
@@ -204,19 +205,45 @@ bool Solver::consensus(const std::vector<Hypothesis>& hyps, double tol_t, mat::M
     return inliers >= s_.min_inliers && votes >= s_.min_support * total;
 }
 
-// Forgets every placement. The heaviest draw anchors the new world frame: its model-view, without
-// its scale, is the view. Everything else in the frame is placed provisionally around it. A
-// mirrored object (negative determinant: the view itself is a rotation) would mirror the whole
-// world, so it anchors only if nothing else can.
+// Forgets every placement and picks the new world frame's anchor. Everything else in the frame is
+// placed provisionally around it.
+//
+// Best: a model-view that several objects share, bit for bit. Games draw most level geometry with
+// an identity world matrix, so that matrix is the view itself: our world is then the game's (its
+// up stays up), and every segment lands in the same frame. Of those groups (three or more
+// objects), the heaviest wins; the identity (screen-space quads: the HUD) is never one.
+// Else: the heaviest draw, without its scale. That frame is the object's, so it's tilted if the
+// object is. A mirrored object (negative determinant: the view itself is a rotation) would mirror
+// the whole world, so it anchors only if nothing else can.
 void Solver::start_segment(const std::vector<const Draw*>& draws, Result& r) {
     objects_.clear();
     ++segment_;
     lost_ = 0;
-    const Draw* anchor = draws.front();
-    for (const Draw* d : draws) {
-        const bool mirrored = det3(d->m) < 0, anchor_mirrored = det3(anchor->m) < 0;
-        if (mirrored != anchor_mirrored ? anchor_mirrored : d->weight > anchor->weight) anchor = d;
+    std::vector<const Draw*> sorted(draws);
+    std::sort(sorted.begin(), sorted.end(),
+              [](const Draw* a, const Draw* b) { return std::memcmp(&a->m, &b->m, sizeof(a->m)) < 0; });
+    const mat::Mat eye = mat::identity();
+    const Draw* anchor = nullptr;
+    double anchor_weight = 0;
+    uint32_t anchor_shared = 0;
+    for (size_t i = 0; i < sorted.size();) {
+        size_t j = i + 1;
+        double weight = sorted[i]->weight;
+        for (; j < sorted.size() && std::memcmp(&sorted[i]->m, &sorted[j]->m, sizeof(mat::Mat)) == 0; ++j)
+            weight += sorted[j]->weight;
+        const mat::Mat& m = sorted[i]->m;
+        if (j - i >= 3 && weight > anchor_weight && det3(m) > 0 && std::memcmp(&m, &eye, sizeof(m)) != 0)
+            anchor = sorted[i], anchor_weight = weight, anchor_shared = uint32_t(j - i);
+        i = j;
     }
+    if (anchor == nullptr) {
+        anchor = draws.front();
+        for (const Draw* d : draws) {
+            const bool mirrored = det3(d->m) < 0, anchor_mirrored = det3(anchor->m) < 0;
+            if (mirrored != anchor_mirrored ? anchor_mirrored : d->weight > anchor->weight) anchor = d;
+        }
+    }
+    anchor_shared_ = anchor_shared;
     const mat::Mat view = rigid_part(anchor->m);
     mat::Mat view_inv;
     mat::inverse(view, view_inv);
@@ -228,6 +255,7 @@ void Solver::start_segment(const std::vector<const Draw*>& draws, Result& r) {
     r.posed = true;
     r.view = view;
     r.segment = segment_;
+    r.anchor_shared = anchor_shared_;
     r.new_segment = true;
     r.placed = uint32_t(draws.size());
 }
@@ -263,6 +291,7 @@ void Solver::evict() {
 void Solver::reset() {
     objects_.clear();
     lost_ = 0;
+    anchor_shared_ = 0;
 }
 
 State Solver::state(uint64_t key) const {

@@ -1,6 +1,7 @@
 #include "depth_tracker.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <mutex>
 #include <shared_mutex>
@@ -13,8 +14,17 @@ namespace {
 
 struct DsFrameStats {
     DrawStats total;
+    DrawStats segment;  // since the last depth clear
+    uint32_t clears = 0;  // depth clears so far: the current pass' number
+    bool cleared = false;
     bool reversed_clear = false;
 };
+
+void add(DrawStats& d, const DrawStats& s) {
+    d.vertices += s.vertices;
+    d.drawcalls += s.drawcalls;
+    d.drawcalls_indirect += s.drawcalls_indirect;
+}
 
 // Per command list / queue. The immediate D3D11 context is both, so it gets queue state.
 struct __declspec(uuid("5b2f7a0e-3c1d-4e8a-9f61-0d7c2b4a8e15")) CmdState {
@@ -27,9 +37,13 @@ struct __declspec(uuid("5b2f7a0e-3c1d-4e8a-9f61-0d7c2b4a8e15")) CmdState {
         current_ds = src.current_ds;
         for (const auto& [h, s] : src.stats) {
             DsFrameStats& d = stats[h];
-            d.total.vertices += s.total.vertices;
-            d.total.drawcalls += s.total.drawcalls;
-            d.total.drawcalls_indirect += s.total.drawcalls_indirect;
+            add(d.total, s.total);
+            if (s.cleared)
+                d.segment = s.segment;
+            else
+                add(d.segment, s.segment);
+            d.clears += s.clears;
+            d.cleared |= s.cleared;
             d.reversed_clear |= s.reversed_clear;
         }
     }
@@ -42,6 +56,7 @@ struct __declspec(uuid("a3e4d6c1-8b27-4f0e-b5a9-6e1c3d2f7b40")) DeviceData {
 
 // Guards queue state (draws on the immediate context vs. present) and the resource map.
 std::shared_mutex g_mutex;
+std::atomic<ClearHook> g_clear_hook{nullptr};
 
 // Shared lock only for queue state: other command lists are recorded by a single thread.
 std::shared_lock<std::shared_mutex> lock_if_queue(const CmdState& s) {
@@ -100,9 +115,11 @@ bool on_draw(command_list* cmd, uint32_t vertices, uint32_t instances, uint32_t,
     auto& s = *cmd->get_private_data<CmdState>();
     if (s.current_ds == 0) return false;
     const auto lock = lock_if_queue(s);
-    DrawStats& st = s.stats[s.current_ds.handle].total;
-    st.vertices += vertices * instances;
-    st.drawcalls += 1;
+    DsFrameStats& st = s.stats[s.current_ds.handle];
+    for (DrawStats* d : {&st.total, &st.segment}) {
+        d->vertices += vertices * instances;
+        d->drawcalls += 1;
+    }
     return false;
 }
 bool on_draw_indexed(command_list* cmd, uint32_t indices, uint32_t instances, uint32_t, int32_t, uint32_t) {
@@ -113,19 +130,33 @@ bool on_draw_indirect(command_list* cmd, indirect_command type, resource, uint64
     auto& s = *cmd->get_private_data<CmdState>();
     if (s.current_ds == 0) return false;
     const auto lock = lock_if_queue(s);
-    DrawStats& st = s.stats[s.current_ds.handle].total;
-    st.drawcalls += count;
-    st.drawcalls_indirect += count;
+    DsFrameStats& st = s.stats[s.current_ds.handle];
+    for (DrawStats* d : {&st.total, &st.segment}) {
+        d->drawcalls += count;
+        d->drawcalls_indirect += count;
+    }
     return false;
 }
 
 bool on_clear_depth_stencil(command_list* cmd, resource_view dsv, const float* depth, const uint8_t*, uint32_t,
                             const rect*) {
-    if (dsv == 0 || depth == nullptr || *depth == 1.0f) return false;
+    if (dsv == 0 || depth == nullptr) return false;
     auto& s = *cmd->get_private_data<CmdState>();
     const resource ds = cmd->get_device()->get_resource_from_view(dsv);
-    const auto lock = lock_if_queue(s);
-    s.stats[ds.handle].reversed_clear = true;
+    DrawStats segment;
+    uint32_t pass = 0;
+    {
+        const auto lock = lock_if_queue(s);
+        DsFrameStats& st = s.stats[ds.handle];
+        if (*depth != 1.0f) st.reversed_clear = true;
+        segment = st.segment;
+        pass = st.clears++;
+        st.segment = {};
+        st.cleared = true;
+    }
+    // Outside the lock: the hook captures, which takes the addon's own lock.
+    if (const ClearHook hook = g_clear_hook.load(); hook != nullptr && segment.drawcalls > 0)
+        hook(cmd, ds, segment, pass);
     return false;
 }
 
@@ -145,6 +176,8 @@ void on_execute_command_list(command_queue* q, command_list* cmd) {
 void init_device(device* dev) {
     if (dev->get_private_data<DeviceData>() == nullptr) dev->create_private_data<DeviceData>();
 }
+
+void set_clear_hook(ClearHook hook) { g_clear_hook = hook; }
 
 std::vector<Candidate> end_frame(device* dev, uint32_t frame_w, uint32_t frame_h) {
     std::vector<Candidate> out;
@@ -166,6 +199,8 @@ std::vector<Candidate> end_frame(device* dev, uint32_t frame_w, uint32_t frame_h
         c.resource = {h};
         c.desc = it->second;
         c.stats = s.total;
+        c.last_segment = s.segment;
+        c.last_pass = s.clears;
         c.reversed_clear = s.reversed_clear;
         c.fits_frame = c.desc.texture.samples <= 1 &&
                        fits_frame(float(c.desc.texture.width), float(c.desc.texture.height), float(frame_w),

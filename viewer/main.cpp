@@ -8,8 +8,9 @@
 //                     [--no-carve] [--carve-margin 0.15] [--carve-rel 0.02]
 //                     [--size 1600x900] [--out file.ply] [--save-after s] [--exit-after s]
 // Keys:  right-drag look, WASD move, Q/E down/up, Shift fast, wheel speed,
-//        F follow player, H color mode, T trail, X carving, +/- point size,
-//        C clear, P save .ply, Space pause ingest, F1 settings panel, Esc quit.
+//        F follow player, V attach to the player's camera, H color mode, T trail,
+//        X carving, +/- point size, arrows tilt the view, L level it, C clear,
+//        P save .ply, Space pause ingest, F1 settings panel, Esc quit.
 // The settings panel changes voxel size, capacity, range, carving and colors while it runs.
 #include <DirectXMath.h>
 
@@ -120,6 +121,7 @@ struct DrawCB {
     float point_size;
     uint32_t color_mode;
     float height_min, height_max, pad[2];
+    float height_axis[4];  // a point's height as shown: dot((pos, 1), height_axis), for the tilt
 };
 struct PointData {
     float pos[3];
@@ -442,9 +444,12 @@ int main(int argc, char** argv) {
     float cam_yaw = 0.0f, cam_pitch = -0.5f, cam_speed = 10.0f;
     float point_size = 2.0f;
     uint32_t color_mode = 0;
-    bool follow = false, show_trail = true, paused = false, saved = false, carve = opt.carve;
+    bool follow = false, attach = false, show_trail = true, paused = false, saved = false, carve = opt.carve;
     // Settings panel (F1). Voxel size and capacity only apply with the button: both rebuild the pool.
     bool show_ui = true, auto_height = true;
+    // Display-only tilt (degrees about world X and Z) around a pivot, for leveling a tilted scan.
+    float tilt_x = 0, tilt_z = 0;
+    XMFLOAT3 tilt_pivot{0, 0, 0};
     float ui_voxel = opt.voxel, ui_capacity_m = float(opt.capacity) / float(1 << 20);
     std::string pool_message;
 
@@ -483,6 +488,7 @@ int main(int argc, char** argv) {
     QueryPerformanceFrequency(&qpf);
     QueryPerformanceCounter(&t0);
     double last = 0, title_timer = 0, reconnect_timer = 0;
+    double last_posed = -1;  // when the last posed frame came in
     uint64_t ingested = 0;
     int fps_frames = 0;
     double fps = 0;
@@ -500,7 +506,14 @@ int main(int argc, char** argv) {
 
         // Input.
         if (app.key_pressed(VK_F1)) show_ui = !show_ui;
-        if (app.key_pressed('F')) follow = !follow;
+        if (app.key_pressed('F')) {
+            follow = !follow;
+            if (follow) attach = false;
+        }
+        if (app.key_pressed('V')) {
+            attach = !attach;
+            if (attach) follow = false;
+        }
         if (app.key_pressed('H')) color_mode ^= 1;
         if (app.key_pressed('T')) show_trail = !show_trail;
         if (app.key_pressed('X')) carve = !carve;
@@ -530,6 +543,10 @@ int main(int argc, char** argv) {
             // Without a pose (addon before M2) the frame is camera-relative: show it as a live
             // snapshot at the origin instead of accumulating it.
             const bool posed = (h.flags & kFlagPoseValid) != 0;
+            // An unposed frame among posed ones is a camera that failed for a moment: skip it rather
+            // than start over.
+            if (posed) last_posed = t;
+            else if (last_posed >= 0 && t - last_posed < 2.0) continue;
             const XMMATRIX view =
                 posed ? XMLoadFloat4x4(reinterpret_cast<const XMFLOAT4X4*>(h.view)) : XMMatrixIdentity();
             const XMMATRIX proj = XMLoadFloat4x4(reinterpret_cast<const XMFLOAT4X4*>(h.proj));
@@ -685,14 +702,71 @@ int main(int argc, char** argv) {
             ImGui::Checkbox("Follow the player (F)", &follow);
             ImGui::SameLine();
             ImGui::Checkbox("Trail (T)", &show_trail);
+            ImGui::SameLine();
+            if (ImGui::Checkbox("Attach to camera (V)", &attach) && attach) follow = false;
+            if (follow) attach = false;
             ImGui::TextDisabled("Right-drag look, WASD move, Q/E down/up, Shift fast, wheel speed");
+            ImGui::TextDisabled("Arrows tilt the view, L levels it (display only)");
             ImGui::End();
         }
 
+        // Tilt: the arrows tilt about world X and Z, Shift faster, L levels. Display only (.ply files
+        // keep the capture's frame). It pivots about where the player was when it left level, so the
+        // scene doesn't swing away.
+        {
+            const bool was_level = tilt_x == 0 && tilt_z == 0;
+            const float rate = (app.key_down(VK_SHIFT) ? 40.0f : 10.0f) * dt;
+            if (app.key_down(VK_UP)) tilt_x += rate;
+            if (app.key_down(VK_DOWN)) tilt_x -= rate;
+            if (app.key_down(VK_LEFT)) tilt_z += rate;
+            if (app.key_down(VK_RIGHT)) tilt_z -= rate;
+            // No limit: a capture can come in on its side or upside down. Just keep the angles in range.
+            tilt_x = std::remainder(tilt_x, 360.0f);
+            tilt_z = std::remainder(tilt_z, 360.0f);
+            if (app.key_pressed('L')) tilt_x = tilt_z = 0;
+            if (was_level && (tilt_x != 0 || tilt_z != 0))
+                tilt_pivot = have_player ? XMFLOAT3{player_inv_view._41, player_inv_view._42, player_inv_view._43}
+                                         : XMFLOAT3{cam_pos[0], cam_pos[1], cam_pos[2]};
+        }
+        const XMMATRIX tilt =
+            XMMatrixTranslation(-tilt_pivot.x, -tilt_pivot.y, -tilt_pivot.z) *
+            XMMatrixRotationX(XMConvertToRadians(tilt_x)) * XMMatrixRotationZ(XMConvertToRadians(tilt_z)) *
+            XMMatrixTranslation(tilt_pivot.x, tilt_pivot.y, tilt_pivot.z);
+
         // Viewer camera.
-        if (follow && have_player) {
-            const XMFLOAT3 p{player_inv_view._41, player_inv_view._42, player_inv_view._43};
-            const float fx = player_inv_view._31, fz = player_inv_view._33;
+        float fov_y = XMConvertToRadians(60.0f);
+        bool attached = false;
+        XMVECTOR attach_fwd{}, attach_up{};
+        if (attach && have_player) {
+            // Look through the player's camera (as displayed, so tilted) with its full orientation,
+            // roll included, and its field of view. Forward and up come from unprojecting the screen
+            // center and top edge, which holds whichever handedness the game uses. Detaching leaves
+            // the free-fly camera where the player's was.
+            const XMMATRIX inv_proj = XMLoadFloat4x4(&player_inv_proj);
+            const XMMATRIX shown = XMLoadFloat4x4(&player_inv_view) * tilt;
+            XMVECTOR vc = XMVector3TransformCoord(XMVectorSet(0, 0, 0.5f, 1), inv_proj);  // view space
+            XMVECTOR vt = XMVector3TransformCoord(XMVectorSet(0, 1, 0.5f, 1), inv_proj);
+            vt = XMVectorScale(vt, XMVectorGetZ(vc) / XMVectorGetZ(vt));  // the top edge at the center's depth
+            const XMVECTOR apex = XMVector3TransformCoord(XMVectorZero(), shown);
+            attach_fwd = XMVector3Normalize(XMVector3TransformCoord(vc, shown) - apex);
+            attach_up = XMVector3Normalize(XMVector3TransformCoord(vt, shown) - XMVector3TransformCoord(vc, shown));
+            attached = !XMVector3IsNaN(attach_fwd) && !XMVector3IsNaN(attach_up) &&
+                       XMVectorGetX(XMVector3LengthSq(XMVector3Cross(attach_fwd, attach_up))) > 1e-6f;
+            if (attached) {
+                XMFLOAT3 f, p;
+                XMStoreFloat3(&f, attach_fwd);
+                XMStoreFloat3(&p, apex);
+                cam_pos[0] = p.x, cam_pos[1] = p.y, cam_pos[2] = p.z;
+                cam_yaw = std::atan2(f.x, f.z);
+                cam_pitch = std::clamp(std::asin(std::clamp(f.y, -1.0f, 1.0f)), -1.55f, 1.55f);
+                const float half = std::atan2(XMVectorGetY(vt), std::fabs(XMVectorGetZ(vc)));
+                if (std::isfinite(half) && half > 0.05f && half < 1.4f) fov_y = 2.0f * half;
+            }
+        } else if (follow && have_player) {
+            XMFLOAT4X4 shown;  // the player's camera as displayed (tilted)
+            XMStoreFloat4x4(&shown, XMLoadFloat4x4(&player_inv_view) * tilt);
+            const XMFLOAT3 p{shown._41, shown._42, shown._43};
+            const float fx = shown._31, fz = shown._33;
             const float len = std::max(std::sqrt(fx * fx + fz * fz), 1e-4f);
             cam_pos[0] = p.x - fx / len * 8.0f;
             cam_pos[1] = p.y + 4.0f;
@@ -720,14 +794,21 @@ int main(int argc, char** argv) {
         }
         const float cp = std::cos(cam_pitch);
         const XMMATRIX view =
-            XMMatrixLookToLH(XMVectorSet(cam_pos[0], cam_pos[1], cam_pos[2], 1),
-                             XMVectorSet(std::sin(cam_yaw) * cp, std::sin(cam_pitch), std::cos(cam_yaw) * cp, 0),
-                             XMVectorSet(0, 1, 0, 0));
-        const XMMATRIX proj = XMMatrixPerspectiveFovLH(XMConvertToRadians(60.0f),
+            attached ? XMMatrixLookToLH(XMVectorSet(cam_pos[0], cam_pos[1], cam_pos[2], 1), attach_fwd, attach_up)
+                     : XMMatrixLookToLH(XMVectorSet(cam_pos[0], cam_pos[1], cam_pos[2], 1),
+                                        XMVectorSet(std::sin(cam_yaw) * cp, std::sin(cam_pitch), std::cos(cam_yaw) * cp, 0),
+                                        XMVectorSet(0, 1, 0, 0));
+        const XMMATRIX proj = XMMatrixPerspectiveFovLH(fov_y,
                                                        float(app.width) / float(app.height), 10000.0f, 0.05f);
 
         DrawCB dcb{};
-        XMStoreFloat4x4(&dcb.view_proj, view * proj);
+        XMStoreFloat4x4(&dcb.view_proj, tilt * view * proj);
+        {
+            XMFLOAT4X4 tm;  // the tilted y: the matrix's second column
+            XMStoreFloat4x4(&tm, tilt);
+            dcb.height_axis[0] = tm._12, dcb.height_axis[1] = tm._22, dcb.height_axis[2] = tm._32;
+            dcb.height_axis[3] = tm._42;
+        }
         dcb.px_to_ndc[0] = 2.0f / float(app.width);
         dcb.px_to_ndc[1] = 2.0f / float(app.height);
         dcb.point_size = point_size;
@@ -739,7 +820,7 @@ int main(int argc, char** argv) {
 
         // Lines: player frustum + trail.
         std::vector<LineVertex> lines;
-        if (have_player) {
+        if (have_player && !attach) {  // attached, it would just frame the screen
             const XMMATRIX inv_proj = XMLoadFloat4x4(&player_inv_proj);
             const XMMATRIX inv_view = XMLoadFloat4x4(&player_inv_view);
             const XMVECTOR apex = XMVector3TransformCoord(XMVectorZero(), inv_view);

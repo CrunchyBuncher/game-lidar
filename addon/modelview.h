@@ -45,6 +45,8 @@ struct Result {
     bool posed = false;
     mat::Mat view = mat::identity();  // our world -> view, rigid
     uint32_t segment = 0;             // 1, 2, ...: frames of one segment share a world frame
+    uint32_t anchor_shared = 0;       // objects sharing the segment's anchor matrix (0: a single
+                                      // object anchors it, so the frame may be tilted)
     bool new_segment = false;         // this frame started it (view = the anchor's)
     // This frame.
     uint32_t draws = 0, ambiguous = 0;  // draws, and keys dropped for several different matrices
@@ -91,6 +93,7 @@ private:
     uint64_t frame_ = 0;
     uint32_t segment_ = 0;
     uint32_t lost_ = 0;  // frames since the last pose
+    uint32_t anchor_shared_ = 0;
 };
 
 }  // namespace lidar::mv

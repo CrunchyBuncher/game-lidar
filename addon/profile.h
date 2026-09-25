@@ -40,10 +40,16 @@ struct CameraProfile {
     bool right_handed = false;  // informational: unprojection doesn't depend on it
     Latch latch = Latch::First;
     float units_per_meter = 1;  // the game's world units in a meter: published poses are in meters
+    // Camera-relative matrices (UE3's TranslatedViewProjection: the camera sits at the origin): a
+    // float3 at translation_offset moves world points into that space first, p + t ("add", UE3's
+    // PreViewTranslation) or p - t ("subtract", a camera position). Not for ModelView.
+    bool has_translation = false;
+    uint32_t translation_offset = 0;
+    bool translation_subtract = false;
 
     bool single_matrix() const { return layout == CameraLayout::ViewProj || layout == CameraLayout::InvViewProj; }
     bool model_view() const { return layout == CameraLayout::ModelView; }
-    // The contiguous byte window covering both matrices, relative to the bound range.
+    // The contiguous byte window covering the matrices (and translation), relative to the bound range.
     uint32_t window_offset() const;
     uint32_t window_size() const;
 };

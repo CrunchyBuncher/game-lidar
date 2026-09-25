@@ -196,6 +196,7 @@ void D3D9Capture::release() {
 
 void D3D9Capture::release_targets() {
     pending_.clear();
+    staged_ = -1;
     for (int i = 0; i < kReadback; ++i) {
         rt_[i].Reset();
         sys_[i].Reset();
@@ -231,9 +232,45 @@ bool D3D9Capture::ensure_targets(uint32_t src_w, uint32_t src_h, uint32_t captur
     return true;
 }
 
-bool D3D9Capture::capture(command_queue*, resource depth, uint32_t capture_width, const FrameHeader& header) {
-    auto* res = reinterpret_cast<IDirect3DResource9*>(depth.handle);
+bool D3D9Capture::snapshot(resource depth, uint32_t capture_width) {
+    if (pending_.size() >= kReadback) return false;  // next_slot_ is still being read back
     D3DSURFACE_DESC src{};
+    if (!downsample(depth, capture_width, src)) return false;
+    staged_ = next_slot_;
+    staged_w_ = src.Width;
+    staged_h_ = src.Height;
+    return true;
+}
+
+bool D3D9Capture::capture(command_queue*, resource depth, uint32_t capture_width, const FrameHeader& header) {
+    D3DSURFACE_DESC src{};
+    if (staged_ >= 0 && staged_ == next_slot_) {
+        src.Width = staged_w_;
+        src.Height = staged_h_;
+    } else {
+        staged_ = -1;
+        if (pending_.size() >= kReadback) {
+            ++skipped_;
+            return true;
+        }
+        if (!downsample(depth, capture_width, src)) return false;
+    }
+    staged_ = -1;
+    const int s = next_slot_;
+    next_slot_ = (next_slot_ + 1) % kReadback;
+
+    Pending p{s, header};
+    p.header.width = cap_w_;
+    p.header.height = cap_h_;
+    p.header.src_width = src.Width;
+    p.header.src_height = src.Height;
+    p.header.depth_format = uint32_t(DepthFormat::Float32Ndc);
+    pending_.push_back(p);
+    return true;
+}
+
+bool D3D9Capture::downsample(resource depth, uint32_t capture_width, D3DSURFACE_DESC& src) {
+    auto* res = reinterpret_cast<IDirect3DResource9*>(depth.handle);
     if (res->GetType() == D3DRTYPE_TEXTURE)
         static_cast<IDirect3DTexture9*>(res)->GetLevelDesc(0, &src);
     else if (res->GetType() == D3DRTYPE_SURFACE)
@@ -249,10 +286,6 @@ bool D3D9Capture::capture(command_queue*, resource depth, uint32_t capture_width
     }
     if (!ensure_targets(src.Width, src.Height, capture_width)) return false;
     error_.clear();
-    if (pending_.size() >= kReadback) {
-        ++skipped_;
-        return true;
-    }
 
     const int s = next_slot_;
     {
@@ -307,15 +340,6 @@ bool D3D9Capture::capture(command_queue*, resource depth, uint32_t capture_width
         }
     }
     done_[s]->Issue(D3DISSUE_END);
-    next_slot_ = (next_slot_ + 1) % kReadback;
-
-    Pending p{s, header};
-    p.header.width = cap_w_;
-    p.header.height = cap_h_;
-    p.header.src_width = src.Width;
-    p.header.src_height = src.Height;
-    p.header.depth_format = uint32_t(DepthFormat::Float32Ndc);
-    pending_.push_back(p);
     return true;
 }
 

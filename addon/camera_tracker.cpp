@@ -69,8 +69,9 @@ struct __declspec(uuid("8e3a51c7-2b94-4f6d-9c08-d4a7e61f3b25")) CmdState {
     explicit CmdState(bool queue) : is_queue(queue) {}
     const bool is_queue;
     resource current_ds{0};
+    std::unordered_map<uint64_t, uint32_t> passes;  // per depth-stencil: depth clears so far
     FrameLatches latches;
-    std::unordered_map<uint64_t, Tally> tallies;  // Latch::Common
+    std::unordered_map<PassKey, Tally, PassKeyHash> tallies;  // Latch::Common
     FrameSamples samples;                         // discovery
     FrameDraws draws;                             // model-view camera, or discovery
     CbufferRead scratch;  // reused for reads, so steady state doesn't allocate
@@ -98,13 +99,21 @@ struct __declspec(uuid("f04c9d26-7a1e-4b83-8e5f-39c2d7a6b0e1")) DeviceData {
 // list's state (recorded by a single thread) and read the configuration.
 std::shared_mutex g_mutex;
 
-void merge_latches(CbufferSource* source, Latch latch, FrameLatches& dst, FrameLatches& src) {
-    for (auto& [ds, read] : src) {
+uint32_t pass_of(const std::unordered_map<uint64_t, uint32_t>& passes, uint64_t ds) {
+    const auto it = passes.find(ds);
+    return it != passes.end() ? it->second : 0;
+}
+
+// `src`'s passes follow `dst_passes`' (a command list executed after what the queue has so far).
+void merge_latches(CbufferSource* source, Latch latch, const std::unordered_map<uint64_t, uint32_t>& dst_passes,
+                   FrameLatches& dst, FrameLatches& src) {
+    for (auto& [key, read] : src) {
         if (!read.ready && (source == nullptr || !source->resolve(read))) continue;
+        const PassKey k{key.ds, key.pass + pass_of(dst_passes, key.ds)};
         if (latch == Latch::Last)
-            dst[ds] = std::move(read);
+            dst[k] = std::move(read);
         else
-            dst.try_emplace(ds, std::move(read));
+            dst.try_emplace(k, std::move(read));
     }
     src.clear();
 }
@@ -147,9 +156,11 @@ void complete_geometry(const DeviceData& dd, CmdState& s) {
 
 void merge(const DeviceData& dd, CmdState& dst, CmdState& src) {
     complete_geometry(dd, src);
-    merge_latches(dd.source, dd.req.latch, dst.latches, src.latches);
-    for (auto& [ds, t] : src.tallies) dst.tallies[ds].merge(t, dd.source);
+    merge_latches(dd.source, dd.req.latch, dst.passes, dst.latches, src.latches);
+    for (auto& [key, t] : src.tallies) dst.tallies[{key.ds, key.pass + pass_of(dst.passes, key.ds)}].merge(t, dd.source);
     src.tallies.clear();
+    for (const auto& [ds, n] : src.passes) dst.passes[ds] += n;
+    src.passes.clear();
     merge_samples(dd.discovery, dst.samples, src.samples);
     merge_draws(dst.draws, src.draws);
 }
@@ -181,14 +192,14 @@ void on_bind_depth_stencil(command_list* cmd, uint32_t, const resource_view*, re
 }
 
 void latch_profile(command_list* cmd, CmdState& s, const DeviceData& dd) {
-    const uint64_t ds = s.current_ds.handle;
-    if (dd.req.latch == Latch::First && s.latches.contains(ds)) return;  // first one wins
+    const PassKey key{s.current_ds.handle, pass_of(s.passes, s.current_ds.handle)};
+    if (dd.req.latch == Latch::First && s.latches.contains(key)) return;  // first one wins
     if (!dd.source->read_at_draw(cmd, dd.req.key, dd.req.offset, dd.req.size, s.scratch)) return;
     if (dd.req.latch != Latch::Common) {
-        std::swap(s.latches[ds], s.scratch);
+        std::swap(s.latches[key], s.scratch);
         return;
     }
-    Tally& t = s.tallies[ds];
+    Tally& t = s.tallies[key];
     if (s.scratch.ready) {
         t.count(s.scratch);
     } else {
@@ -266,9 +277,21 @@ bool on_draw_indirect(command_list* cmd, indirect_command type, resource, uint64
     return false;
 }
 
+// A depth clear starts the depth-stencil's next pass.
+bool on_clear_depth_stencil(command_list* cmd, resource_view dsv, const float* depth, const uint8_t*, uint32_t,
+                            const rect*) {
+    if (dsv == 0 || depth == nullptr) return false;
+    auto& s = *cmd->get_private_data<CmdState>();
+    const resource ds = cmd->get_device()->get_resource_from_view(dsv);
+    const std::shared_lock lock(g_mutex);  // like a draw: only this command list's state
+    ++s.passes[ds.handle];
+    return false;
+}
+
 void on_reset_command_list(command_list* cmd) {
     auto& s = *cmd->get_private_data<CmdState>();
     s.current_ds = {0};
+    s.passes.clear();
     s.pending_geometry = s.pending_copy = nullptr;
     s.latches.clear();
     s.tallies.clear();
@@ -290,6 +313,7 @@ void clear_queues(DeviceData& dd) {
     for (command_queue* q : dd.queues) {
         auto& s = *q->get_private_data<CmdState>();
         s.pending_geometry = s.pending_copy = nullptr;
+        s.passes.clear();
         s.latches.clear();
         s.tallies.clear();
         s.samples.clear();
@@ -366,9 +390,9 @@ FrameLatches end_frame(device* dev, FrameSamples* samples, FrameDraws* draws) {
     CmdState all(true);
     for (command_queue* q : dd->queues) merge(*dd, all, *q->get_private_data<CmdState>());
     out = std::move(all.latches);
-    for (auto& [ds, t] : all.tallies) {
+    for (auto& [key, t] : all.tallies) {
         t.resolve(dd->source);
-        if (const CbufferRead* r = t.winner()) out[ds] = *r;
+        if (const CbufferRead* r = t.winner()) out[key] = *r;
     }
     dd->last_draws.clear();
     for (const auto& [ds, s] : all.samples) dd->last_draws[ds] = s.draws;
@@ -399,6 +423,7 @@ void register_events() {
     reshade::register_event<addon_event::draw>(on_draw);
     reshade::register_event<addon_event::draw_indexed>(on_draw_indexed);
     reshade::register_event<addon_event::draw_or_dispatch_indirect>(on_draw_indirect);
+    reshade::register_event<addon_event::clear_depth_stencil_view>(on_clear_depth_stencil);
     reshade::register_event<addon_event::reset_command_list>(on_reset_command_list);
     reshade::register_event<addon_event::execute_command_list>(on_execute_command_list);
 }
@@ -415,6 +440,7 @@ void unregister_events() {
     reshade::unregister_event<addon_event::draw>(on_draw);
     reshade::unregister_event<addon_event::draw_indexed>(on_draw_indexed);
     reshade::unregister_event<addon_event::draw_or_dispatch_indirect>(on_draw_indirect);
+    reshade::unregister_event<addon_event::clear_depth_stencil_view>(on_clear_depth_stencil);
     reshade::unregister_event<addon_event::reset_command_list>(on_reset_command_list);
     reshade::unregister_event<addon_event::execute_command_list>(on_execute_command_list);
 }

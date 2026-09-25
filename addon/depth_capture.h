@@ -25,6 +25,12 @@ public:
     virtual bool capture(reshade::api::command_queue* queue, reshade::api::resource depth, uint32_t capture_width,
                          const FrameHeader& header) = 0;
 
+    // Before a clear (depth::ClearHook), where the API allows it (D3D9): samples `depth` down now,
+    // replacing this frame's earlier snapshot. The next capture() publishes the snapshot instead of
+    // sampling again, unless drop_snapshot() comes first. Returns false if nothing was taken.
+    virtual bool snapshot(reshade::api::resource /*depth*/, uint32_t /*capture_width*/) { return false; }
+    virtual void drop_snapshot() {}
+
     // Publishes every readback the GPU has finished. Never waits.
     virtual void publish(reshade::api::command_queue* queue, RingWriter& ring) = 0;
 

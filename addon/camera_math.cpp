@@ -152,6 +152,7 @@ const char* kind_name(MatrixKind k) {
         case MatrixKind::Proj: return "proj";
         case MatrixKind::ViewProj: return "viewproj";
         case MatrixKind::InvViewProj: return "invviewproj";
+        case MatrixKind::Translation: return "translation";
     }
     return "?";
 }

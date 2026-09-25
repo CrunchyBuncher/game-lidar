@@ -189,6 +189,7 @@ cbuffer Draw : register(b0) {
     float height_min;
     float height_max;
     float2 pad_;
+    float4 height_axis;  // height as shown (tilted): dot(float4(pos, 1), height_axis)
 };
 
 struct PointData { float3 pos; uint color; };
@@ -221,7 +222,7 @@ VSOut vs_points(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     o.pos = mul(float4(p.pos, 1), view_proj);
     o.pos.xy += corners[vid] * px_to_ndc * point_size * 0.5 * o.pos.w;
     if (color_mode == 0) {
-        o.col = turbo((p.pos.y - height_min) / (height_max - height_min));
+        o.col = turbo((dot(float4(p.pos, 1), height_axis) - height_min) / (height_max - height_min));
     } else {
         o.col = float3(p.color & 0xFF, (p.color >> 8) & 0xFF, (p.color >> 16) & 0xFF) / 255.0;
     }

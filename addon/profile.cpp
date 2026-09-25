@@ -189,7 +189,7 @@ constexpr shader_stage kStages[] = {shader_stage::vertex, shader_stage::pixel,  
 bool read_camera(const Table& t, CameraProfile& c, std::string& error) {
     static const char* const kKeys[] = {"stage",  "slot",        "space",       "size",  "layout",
                                         "view_offset", "proj_offset", "major", "handed", "latch",
-                                        "units_per_meter"};
+                                        "units_per_meter", "translation_offset", "translation"};
     for (const auto& [key, v] : t)
         if (std::none_of(std::begin(kKeys), std::end(kKeys), [&](const char* k) { return key == k; }))
             return error = "line " + std::to_string(v.line) + ": unknown key '" + key + "' in [camera]", false;
@@ -224,7 +224,20 @@ bool read_camera(const Table& t, CameraProfile& c, std::string& error) {
         if (!(u > 0 && u < 1e6)) return error = r.where(*v) + "units_per_meter must be a positive number", false;
         c.units_per_meter = float(u);
     }
-    if (c.view_offset % 4 != 0 || c.proj_offset % 4 != 0) return error = "offsets must be multiples of 4 bytes", false;
+    if (const Value* v = r.find("translation_offset", false)) {
+        if (c.model_view())
+            return error = r.where(*v) + "translation_offset doesn't apply to layout " + layout_name(c.layout), false;
+        int sign = 0;
+        if (!r.uint("translation_offset", c.translation_offset, true, 1u << 20) ||
+            !r.choice("translation", {"add", "subtract"}, sign, true))
+            return false;
+        c.has_translation = true;
+        c.translation_subtract = sign == 1;
+    } else if (const Value* sign = r.find("translation", false)) {
+        return error = r.where(*sign) + "translation needs translation_offset", false;
+    }
+    if (c.view_offset % 4 != 0 || c.proj_offset % 4 != 0 || c.translation_offset % 4 != 0)
+        return error = "offsets must be multiples of 4 bytes", false;
     if (!c.single_matrix()) {
         const uint32_t lo = std::min(c.view_offset, c.proj_offset), hi = std::max(c.view_offset, c.proj_offset);
         if (hi - lo < 64) return error = "view_offset and proj_offset overlap", false;
@@ -261,10 +274,14 @@ bool fail(std::string* why, const char* msg) {
 }  // namespace
 
 uint32_t CameraProfile::window_offset() const {
-    return single_matrix() ? view_offset : std::min(view_offset, proj_offset);
+    uint32_t lo = single_matrix() ? view_offset : std::min(view_offset, proj_offset);
+    if (has_translation) lo = std::min(lo, translation_offset);
+    return lo;
 }
 uint32_t CameraProfile::window_size() const {
-    return single_matrix() ? 64 : std::max(view_offset, proj_offset) + 64 - window_offset();
+    uint32_t hi = single_matrix() ? view_offset + 64 : std::max(view_offset, proj_offset) + 64;
+    if (has_translation) hi = std::max(hi, translation_offset + 12);
+    return hi - window_offset();
 }
 
 bool parse_profile(std::string_view text, Profile& out, std::string& error) {
@@ -312,6 +329,10 @@ std::string format_profile(const CameraProfile& c, std::string_view comment) {
     line("major", quoted(c.column_major ? "column" : "row"));
     line("handed", quoted(c.right_handed ? "right" : "left"));
     line("latch", quoted(latch_name(c.latch)));
+    if (c.has_translation) {
+        line("translation_offset", std::to_string(c.translation_offset));
+        line("translation", quoted(c.translation_subtract ? "subtract" : "add"));
+    }
     if (c.units_per_meter != 1) {
         char buf[32];
         std::snprintf(buf, sizeof(buf), "%.9g", double(c.units_per_meter));
@@ -362,12 +383,24 @@ bool decode_camera(const CameraProfile& c, const uint8_t* window, size_t window_
     const Mat first = load(a, c.column_major);
     if (!finite(first)) return fail(why, "non-finite values");
 
+    // Camera-relative matrices: world -> that space first (row vectors: p * T = p ± t).
+    Mat to_relative = mat::identity();
+    if (c.has_translation) {
+        float t[3];
+        std::memcpy(t, window + (c.translation_offset - c.window_offset()), sizeof(t));
+        for (int i = 0; i < 3; ++i) {
+            if (!std::isfinite(t[i])) return fail(why, "non-finite translation");
+            to_relative.m[3][i] = c.translation_subtract ? -double(t[i]) : double(t[i]);
+        }
+    }
+
     Mat v, inv;
     if (c.single_matrix()) {
         Mat vp = first, p;
         if (c.layout == CameraLayout::InvViewProj && !inverse(first, vp))
             return fail(why, "inverse view-projection is singular");
         if (!decompose_view_proj(vp, v, p)) return fail(why, "not a perspective view-projection");
+        if (c.has_translation) v = mul(to_relative, v);
         store(v, view);
         store(p, proj);
         return true;
@@ -400,6 +433,7 @@ bool decode_camera(const CameraProfile& c, const uint8_t* window, size_t window_
         case CameraLayout::InvViewProj:
         case CameraLayout::ModelView: break;  // handled above
     }
+    if (c.has_translation) v = mul(to_relative, v);
     store(v, view);
     if (!analyze_projection(proj).valid) return fail(why, "proj is not a perspective projection");
     if (!plausible_view(view)) return fail(why, "view is not a rigid transform");
@@ -425,8 +459,14 @@ ProjectionInfo analyze_projection(const float p[16]) {
     // With d = distance in front of the camera, ndc_z = a + b / d.
     const double a = double(p[10]) * s, b = p[14];
     const double inf = std::numeric_limits<double>::infinity();
-    const double d0 = a == 0 ? inf : -b / a;        // where depth = 0
-    const double d1 = a == 1 ? inf : b / (1 - a);   // where depth = 1
+    double d0 = a == 0 ? inf : -b / a;        // where depth = 0
+    double d1 = a == 1 ? inf : b / (1 - a);   // where depth = 1
+    // Depth tends to `a` far away. Strictly inside (0, 1), the far end is never reached: an infinite
+    // projection that keeps a little headroom (UE3: 1 - 1e-3 at infinity).
+    if (a > 0 && a < 1) {
+        if (!(d0 > 0) && d1 > 0) d0 = inf;
+        if (!(d1 > 0) && d0 > 0) d1 = inf;
+    }
     if (!(d0 > 0) || !(d1 > 0) || d0 == d1) return info;
     info.reversed = d1 < d0;
     info.near_z = float(std::min(d0, d1));

@@ -26,9 +26,21 @@ struct LatchRequest {
     Latch latch = Latch::First;
 };
 
-// Per depth-stencil handle: the window read at its first (or last) draw that had the cbuffer bound,
+// A pass of a depth-stencil: its draws between two depth clears in a frame, numbered by the depth
+// clears before it this frame (depth_tracker numbers them the same way). Games that reuse the scene
+// depth-stencil for other views (UE3) latch the scene's camera only in the scene's pass.
+struct PassKey {
+    uint64_t ds = 0;
+    uint32_t pass = 0;
+    bool operator==(const PassKey&) const = default;
+};
+struct PassKeyHash {
+    size_t operator()(const PassKey& k) const { return std::hash<uint64_t>()(k.ds ^ (uint64_t(k.pass) << 48)); }
+};
+
+// Per depth-stencil pass: the window read at its first (or last) draw that had the cbuffer bound,
 // or for Latch::Common, the value most of its draws had.
-using FrameLatches = std::unordered_map<uint64_t, CbufferRead>;
+using FrameLatches = std::unordered_map<PassKey, CbufferRead, PassKeyHash>;
 
 // A draw call's arguments as ReShade reports them (D3D9 UP draws: count only, the rest 0).
 enum class DrawType : uint8_t { Draw, Indexed, Indirect };

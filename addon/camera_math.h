@@ -25,8 +25,9 @@ bool is_projection(const mat::Mat& m);
 // world * view * proj whose world scales, and a bare projection (view = identity).
 bool decompose_view_proj(const mat::Mat& vp, mat::Mat& view, mat::Mat& proj);
 
-// What a 64-byte window could be. Bit (kind * 2 + column_major).
-enum class MatrixKind : uint32_t { Rigid = 0, Proj = 1, ViewProj = 2, InvViewProj = 3 };
+// What a 64-byte window could be. Bit (kind * 2 + column_major). Translation isn't a matrix and has no
+// bit: discovery's float3 next to a camera-relative view-projection (CameraProfile::has_translation).
+enum class MatrixKind : uint32_t { Rigid = 0, Proj = 1, ViewProj = 2, InvViewProj = 3, Translation = 4 };
 constexpr uint32_t kind_bit(MatrixKind k, bool column_major) { return 1u << (uint32_t(k) * 2 + (column_major ? 1 : 0)); }
 uint32_t classify_matrix(const float f[16]);
 const char* kind_name(MatrixKind k);

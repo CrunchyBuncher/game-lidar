@@ -30,6 +30,8 @@ public:
     bool capture(reshade::api::command_queue* queue, reshade::api::resource depth, uint32_t capture_width,
                  const FrameHeader& header) override;
     void publish(reshade::api::command_queue* queue, RingWriter& ring) override;
+    bool snapshot(reshade::api::resource depth, uint32_t capture_width) override;
+    void drop_snapshot() override { staged_ = -1; }
 
     // INTZ replacement of depth-stencils, and releasing GPU resources before a Reset.
     static void register_events();
@@ -42,6 +44,8 @@ private:
     static constexpr int kReadback = 3;
 
     bool ensure_targets(uint32_t src_w, uint32_t src_h, uint32_t capture_width);
+    // Samples `depth` down into slot next_slot_ (without claiming it). False, with error_, if it can't.
+    bool downsample(reshade::api::resource depth, uint32_t capture_width, D3DSURFACE_DESC& src);
     void release_targets();
     static void on_destroy_command_queue(reshade::api::command_queue* q);
 
@@ -72,6 +76,8 @@ private:
     };
     std::deque<Pending> pending_;
     int next_slot_ = 0;
+    int staged_ = -1;  // next_slot_ holds a snapshot taken before a clear this frame
+    uint32_t staged_w_ = 0, staged_h_ = 0;  // its source size
 };
 
 }  // namespace lidar

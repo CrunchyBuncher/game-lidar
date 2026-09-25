@@ -328,6 +328,65 @@ static void test_profile_decode() {
     EXPECT(!decode_camera(c, swapped, sizeof(swapped), v, p));
 }
 
+// UE3: a camera-relative view-projection (TranslatedViewProjection, the camera at the origin) with
+// the world offset in another register (PreViewTranslation = -camera), and a projection whose
+// depth tends to 1 - 1e-3 instead of reaching 1.
+static void test_translated_camera() {
+    const XMVECTOR eye = XMVectorSet(-375.5f, 1286.3f, 236.1f, 1);
+    const XMVECTOR dir = XMVectorSet(0.16f, -0.93f, -0.32f, 0);
+    const XMMATRIX view = XMMatrixLookToLH(eye, dir, XMVectorSet(0, 0, 1, 0));
+    const XMMATRIX rel_view = XMMatrixLookToLH(XMVectorSet(0, 0, 0, 1), dir, XMVectorSet(0, 0, 1, 0));
+    const float a = 1 - 1e-3f, near_z = 10;
+    const XMMATRIX proj(1, 0, 0, 0, 0, 16.0f / 9.0f, 0, 0, 0, 0, a, 1, 0, 0, -near_z * a, 0);
+
+    float pf[16];
+    XMStoreFloat4x4(reinterpret_cast<XMFLOAT4X4*>(pf), proj);
+    const ProjectionInfo info = analyze_projection(pf);
+    EXPECT(info.valid && !info.reversed && std::isinf(info.far_z));
+    EXPECT(std::abs(info.near_z - near_z) < 1e-3f);
+    EXPECT(classify_matrix([&] {
+               static float f[16];
+               XMStoreFloat4x4(reinterpret_cast<XMFLOAT4X4*>(f), rel_view * proj);
+               return f;
+           }()) == kind_bit(MatrixKind::ViewProj, false));
+
+    for (bool subtract : {false, true}) {
+        CameraProfile c;
+        c.layout = CameraLayout::ViewProj;
+        c.view_offset = 0;
+        c.has_translation = true;
+        c.translation_offset = 80;  // c5
+        c.translation_subtract = subtract;
+        EXPECT(c.window_offset() == 0 && c.window_size() == 92);
+        uint8_t buf[96] = {};
+        put(buf, 0, rel_view * proj, false);
+        const float t[3] = {XMVectorGetX(eye), XMVectorGetY(eye), XMVectorGetZ(eye)};
+        for (int i = 0; i < 3; ++i) reinterpret_cast<float*>(buf + 80)[i] = subtract ? t[i] : -t[i];
+        float v[16], p[16];
+        std::string why;
+        const bool ok = decode_camera(c, buf, c.window_size(), v, p, &why);
+        if (!ok) std::printf("  translated camera: %s\n", why.c_str());
+        EXPECT(ok);
+        const float dv = max_diff(v, view);
+        if (!(dv < 1e-3f)) std::printf("  translated camera (%s): view diff %g\n", subtract ? "-" : "+", dv);
+        EXPECT(dv < 1e-3f);
+    }
+
+    const std::string base = "[camera]\nstage=\"vertex\"\nslot=0\nlayout=\"viewproj\"\nview_offset=0\n";
+    Profile pr;
+    std::string err;
+    EXPECT(parse_profile(base + "translation_offset=80\ntranslation=\"add\"\n", pr, err));
+    EXPECT(pr.camera.has_translation && pr.camera.translation_offset == 80 && !pr.camera.translation_subtract);
+    Profile back;
+    EXPECT(parse_profile(format_profile(pr.camera, ""), back, err) && back.camera.has_translation &&
+           back.camera.translation_offset == 80 && !back.camera.translation_subtract);
+    EXPECT(parse_fails((base + "translation_offset=80\n").c_str(), "translation"));
+    EXPECT(parse_fails((base + "translation=\"add\"\n").c_str(), "needs translation_offset"));
+    EXPECT(parse_fails("[camera]\nstage=\"vertex\"\nslot=0\nlayout=\"modelview\"\nview_offset=0\nproj_offset=128\n"
+                       "translation_offset=256\ntranslation=\"add\"\n",
+                       "doesn't apply"));
+}
+
 // A right-handed game in decimeters: normalized, the pose unprojects its depth to the world point
 // in meters with z negated (so the viewer's left-handed display isn't mirrored).
 static void test_normalize_pose() {
@@ -848,6 +907,21 @@ static void test_modelview() {
                        m.m[0][1] * (m.m[1][0] * m.m[2][2] - m.m[1][2] * m.m[2][0]) +
                        m.m[0][2] * (m.m[1][0] * m.m[2][1] - m.m[1][1] * m.m[2][0]);
     EXPECT(rm.posed && rm.new_segment && det > 0);
+
+    // Level geometry drawn with an identity world matrix (three keys, the same model-view: the view)
+    // anchors the world, not the heavier tilted rock, and not the HUD quads sharing the identity:
+    // the solved view is the game's own, so up stays up after every reset.
+    const mat::Mat view = mvt::inv(mat::mul(mat::mul(mvt::pitch(0.2), mvt::yaw(0.7)), mvt::translate(40, 12, -30)));
+    const mat::Mat rock = mat::mul(mat::mul(mvt::pitch(0.5), mvt::translate(45, 10, -20)), view);
+    const mat::Mat eye = mat::identity();
+    for (int reset = 0; reset < 2; ++reset) {
+        mv::Solver shared;
+        const mv::Result rs = shared.solve({{30, view, 100}, {31, view, 80}, {32, view, 60}, {33, rock, 5000},
+                                            {34, eye, 4}, {35, eye, 4}, {36, eye, 4}, {37, eye, 4}});
+        EXPECT(rs.posed && rs.new_segment && rs.anchor_shared == 3);
+        EXPECT(std::memcmp(&rs.view, &view, sizeof(view)) == 0 || mat::rotation_between_deg(rs.view, view) < 1e-9);
+        EXPECT(mat::translation_between(rs.view, view) < 1e-9);
+    }
 }
 
 int main() {
@@ -855,6 +929,7 @@ int main() {
     test_unproject();
     test_profile_parse();
     test_profile_decode();
+    test_translated_camera();
     test_normalize_pose();
     test_classify();
     test_decompose();

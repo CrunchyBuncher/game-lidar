@@ -19,6 +19,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -30,6 +31,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "camera_tracker.h"
@@ -106,6 +108,7 @@ struct CameraStatus {
     float view[16] = {}, proj[16] = {};
     ProjectionInfo info;
     uint64_t with_pose = 0, without_pose = 0;
+    uint64_t recent = 0;  // the last 64 captured frames, bit set: no pose (newest in bit 0)
 };
 
 // Touched from the game's render thread (present) and the overlay, which ReShade draws on the
@@ -133,6 +136,15 @@ double g_mv_us = 0;                 // smoothed solve time
 std::vector<depth::Candidate> g_candidates;  // last frame's depth-stencils, best first
 uint64_t g_selected = 0;                     // handle captured last frame
 uint64_t g_override = 0;                     // manual pick from the overlay, 0 = auto
+// A snapshot of the captured depth-stencil taken before a clear this frame (games that reuse it for a
+// later pass), and the pass it holds.
+struct DepthSnapshot {
+    uint64_t ds = 0;
+    depth::DrawStats pass;
+    uint32_t pass_index = 0;  // cam::PassKey::pass
+};
+DepthSnapshot g_snapshot;
+std::optional<DepthSnapshot> g_snapshot_used;  // last capture's, for the overlay (nullopt: at present)
 double g_cpu_us = 0;                         // smoothed CPU cost of our present work
 
 disc::Discovery g_discovery;
@@ -231,14 +243,14 @@ std::string candidate_line(const disc::CandidateInfo& c) {
 }
 
 void log_discovery(const disc::Status& s) {
-    char buf[320];
+    char buf[360];
     std::snprintf(buf, sizeof(buf),
                   "Discovery %.0f s: %llu frames analyzed (%llu dropped, %.2f ms each), %u draws/%u sampled/%u buffers "
-                  "last frame; hypotheses: %zu rigid, %zu proj, %zu viewproj, %zu invviewproj; depth %llu frames "
+                  "last frame; hypotheses: %zu rigid, %zu proj, %zu viewproj, %zu invviewproj, %zu translation; depth %llu frames "
                   "(%llu still, %llu moving), %llu reprojection rounds",
                   s.seconds, (unsigned long long)s.frames_analyzed, (unsigned long long)s.frames_dropped, s.analyze_ms,
                   s.last_draws, s.last_samples, s.last_buffers, s.hypotheses[0], s.hypotheses[1], s.hypotheses[2],
-                  s.hypotheses[3],
+                  s.hypotheses[3], s.hypotheses[4],
                   (unsigned long long)s.depth_frames, (unsigned long long)s.still_frames,
                   (unsigned long long)s.moving_frames, (unsigned long long)s.reproj_rounds);
     log_info(buf);
@@ -362,6 +374,11 @@ bool solve_model_view(const CameraProfile& camera, const cam::CbufferRead& proj_
     QueryPerformanceCounter(&t0);
     cam::solver_draws(d->second, camera.column_major, g_mv_input);
     g_mv = g_solver.solve(g_mv_input);
+    if (g_mv.new_segment)
+        log_info("Camera: model-view segment " + std::to_string(g_mv.segment) +
+                 (g_mv.anchor_shared != 0 ? ", in the game's world frame (" + std::to_string(g_mv.anchor_shared) +
+                                                " objects share the anchor matrix)"
+                                          : ", in one object's frame (nothing shares a matrix: may be tilted)"));
     QueryPerformanceCounter(&t1);
     QueryPerformanceFrequency(&freq);
     g_mv_us = g_mv_us * 0.9 + double(t1.QuadPart - t0.QuadPart) * 1e6 / double(freq.QuadPart) * 0.1;
@@ -375,14 +392,16 @@ bool solve_model_view(const CameraProfile& camera, const cam::CbufferRead& proj_
 }
 
 // Fills the header's pose from this frame's latch (or model-view solve) for the captured depth-stencil.
-bool apply_camera(const cam::FrameLatches& latches, const cam::FrameDraws& draws, uint64_t depth_stencil,
+// The camera latched in `pass`: the one the captured depth comes from.
+bool apply_camera(const cam::FrameLatches& latches, const cam::FrameDraws& draws, cam::PassKey pass,
                   FrameHeader& h) {
+    const uint64_t depth_stencil = pass.ds;
     const CameraProfile* camera = active_camera();
     if (camera == nullptr) {
         g_camera.state = CameraStatus::NoProfile;
         return false;
     }
-    const auto it = latches.find(depth_stencil);
+    const auto it = latches.find(pass);
     if (it == latches.end()) {
         g_camera.state = CameraStatus::NoLatch;
         return false;
@@ -441,6 +460,7 @@ const char* api_name(device_api api) {
 }
 
 void register_active_handlers();  // below, next to the handlers it registers
+void on_depth_clear(command_list* cmd, resource ds, const depth::DrawStats& pass, uint32_t pass_index);
 
 // Until a supported device shows up, the addon's only handler is init_device. Registering an
 // event can change how ReShade hooks the game (on D3D9, map events wrap every buffer Lock), so on
@@ -497,6 +517,7 @@ void on_init_device(device* dev) {
     watchdog::start();
     g_init_error.clear();
     g_capture = std::move(capture);
+    depth::set_clear_hook(on_depth_clear);
     g_source = cam::create_cbuffer_source(dev);
     g_settings.load();
     if (!g_ring.open()) g_init_error = "failed to create the shared-memory ring";
@@ -504,10 +525,24 @@ void on_init_device(device* dev) {
     if (g_settings.discovery_autostart) start_discovery();
 }
 
+// Before a depth clear: if it's the captured depth-stencil and this pass is its busiest so far this
+// frame, snapshot it (the frame's final contents may be a later pass that isn't the scene).
+void on_depth_clear(command_list* cmd, resource ds, const depth::DrawStats& pass, uint32_t pass_index) {
+    const std::lock_guard lock(g_mutex);
+    if (cmd->get_device() != g_device || g_capture == nullptr || !g_init_error.empty() || !g_settings.enabled ||
+        ds.handle != g_selected)
+        return;
+    if (g_snapshot.ds == ds.handle && !pass.better_than(g_snapshot.pass)) return;
+    const watchdog::Step step("depth clear: snapshot");
+    if (g_capture->snapshot(ds, uint32_t(g_settings.capture_width))) g_snapshot = {ds.handle, pass, pass_index};
+}
+
 void on_destroy_device(device* dev) {
     const watchdog::Step step("destroy_device");
     const std::lock_guard lock(g_mutex);
     if (dev != g_device) return;
+    depth::set_clear_hook(nullptr);
+    g_snapshot = {};
     stop_discovery();
     watchdog::stop();
     cam::configure(dev, nullptr, nullptr);
@@ -537,7 +572,11 @@ void on_present(command_queue* queue, swapchain* sc, const rect*, const rect*, u
     watchdog::exchange_step("present: depth end_frame");
     const resource_desc bb = dev->get_resource_desc(sc->get_current_back_buffer());
     std::vector<depth::Candidate> candidates = depth::end_frame(dev, bb.texture.width, bb.texture.height);
-    if (candidates.empty()) return;  // e.g. a second present without any rendering in between
+    const DepthSnapshot snapshot = std::exchange(g_snapshot, {});
+    if (candidates.empty()) {  // e.g. a second present without any rendering in between
+        g_capture->drop_snapshot();
+        return;
+    }
     g_candidates = std::move(candidates);
 
     watchdog::exchange_step("present: publish");
@@ -549,13 +588,19 @@ void on_present(command_queue* queue, swapchain* sc, const rect*, const rect*, u
         if (c.resource.handle == g_override) pick = &c;
     if (pick == nullptr && g_candidates.front().fits_frame) pick = &g_candidates.front();
     g_selected = pick ? pick->resource.handle : 0;
+    // The snapshot, unless the pass still in the depth-stencil drew more.
+    const bool use_snapshot = pick != nullptr && g_settings.enabled && snapshot.ds == pick->resource.handle &&
+                              !pick->last_segment.better_than(snapshot.pass);
+    if (!use_snapshot) g_capture->drop_snapshot();
 
     if (g_settings.enabled && pick != nullptr) {
         FrameHeader h{};
         h.frame_index = g_frame;
         h.timestamp_qpc = uint64_t(t0.QuadPart);
-        const bool posed = apply_camera(latches, draws, pick->resource.handle, h);
+        const cam::PassKey pass{pick->resource.handle, use_snapshot ? snapshot.pass_index : pick->last_pass};
+        const bool posed = apply_camera(latches, draws, pass, h);
         log_camera_changes();
+        g_camera.recent = (g_camera.recent << 1) | (posed ? 0 : 1);
         if (posed) {
             ++g_camera.with_pose;
         } else {
@@ -564,7 +609,14 @@ void on_present(command_queue* queue, swapchain* sc, const rect*, const rect*, u
             std::memcpy(h.view, identity, sizeof(h.view));
             make_proj(g_settings, float(pick->desc.texture.width) / float(pick->desc.texture.height), h.proj);
         }
-        g_capture->capture(queue, pick->resource, uint32_t(g_settings.capture_width), h);
+        // With a camera, a frame it couldn't pose is dropped: the viewer would take it as camera-relative
+        // and start over. Without one, unposed frames are all there is (a live view).
+        if (posed || active_camera() == nullptr) {
+            g_capture->capture(queue, pick->resource, uint32_t(g_settings.capture_width), h);
+            g_snapshot_used = use_snapshot ? std::optional(snapshot) : std::nullopt;
+        } else {
+            g_capture->drop_snapshot();
+        }
     }
     if (g_discovering) {
         watchdog::exchange_step("present: discovery");
@@ -632,17 +684,21 @@ bool draw_camera_section() {
             g_preview.reset();
             configure_camera();
         }
-    } else if (!g_profile_error.empty()) {
+    }
+    if (!g_preview && !g_profile_error.empty()) {
         ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1), "%s", g_profile_error.c_str());
         return changed;
     }
-
-    const CameraProfile& c = *active_camera();
+    // None after ending a preview with no profile to go back to.
+    const CameraProfile* active = active_camera();
+    if (active == nullptr) return changed;
+    const CameraProfile& c = *active;
     // D3D9: one register file per stage, no buffers: offsets are registers (16 bytes each).
     auto at = [&](uint32_t offset) {
         return d3d9 ? "c" + std::to_string(offset / 16) + (offset % 16 ? " (unaligned)" : "") : std::to_string(offset);
     };
-    const std::string where = c.single_matrix() ? at(c.view_offset) : at(c.view_offset) + " / " + at(c.proj_offset);
+    std::string where = c.single_matrix() ? at(c.view_offset) : at(c.view_offset) + " / " + at(c.proj_offset);
+    if (c.has_translation) where += (c.translation_subtract ? " - " : " + ") + at(c.translation_offset);
     if (d3d9)
         ImGui::TextDisabled("%s constants, %s at %s, %s-major, %s-handed, %s latch", stage_name(c.key.stage),
                             layout_name(c.layout), where.c_str(), c.column_major ? "column" : "row",
@@ -677,21 +733,34 @@ bool draw_camera_section() {
                                     : "No latch: no draw into the captured depth buffer had that cbuffer bound.");
             break;
         case CameraStatus::Rejected:
-            ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1), "Latched, but rejected: %s", g_camera.why.c_str());
+        case CameraStatus::Latched: {
+            // Over the last 64 frames, so a camera that's rejected now and then reads as one steady line.
+            const int missed = std::popcount(g_camera.recent);
+            const char* posed = c.model_view() ? "Pose solved" : "Pose latched";
+            if (missed == 0)
+                ImGui::TextColored(ImVec4(0.3f, 1, 0.4f, 1), "%s", posed);
+            else if (missed < 64)
+                ImGui::TextColored(ImVec4(1, 0.8f, 0.2f, 1), "%s in %d of the last 64 frames (the others: %s)", posed,
+                                   64 - missed, g_camera.why.c_str());
+            else
+                ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1), "Latched, but rejected: %s", g_camera.why.c_str());
             break;
-        case CameraStatus::Latched:
-            ImGui::TextColored(ImVec4(0.3f, 1, 0.4f, 1), c.model_view() ? "Pose solved" : "Pose latched");
-            break;
+        }
     }
-    if (c.model_view())
+    if (c.model_view()) {
         ImGui::Text("Model-view: segment %u, %u draws, %u known objects, %u agree; %u static, %u provisional, "
                     "%u dynamic; %.0f us",
                     g_mv.segment, g_mv.draws, g_mv.known, g_mv.inliers, g_mv.statics, g_mv.provisional, g_mv.dynamic,
                     g_mv_us);
+        if (g_mv.segment != 0 && g_mv.anchor_shared != 0)
+            ImGui::TextDisabled("World frame: the game's (%u objects share its matrix)", g_mv.anchor_shared);
+        else if (g_mv.segment != 0)
+            ImGui::TextColored(ImVec4(1, 0.8f, 0.2f, 1), "World frame: one object's (may be tilted)");
+    }
     ImGui::Text("Frames with pose %llu, without %llu", static_cast<unsigned long long>(g_camera.with_pose),
                 static_cast<unsigned long long>(g_camera.without_pose));
 
-    if (g_camera.state == CameraStatus::Latched) {
+    if (g_camera.with_pose > 0) {  // the last pose, kept through rejected frames
         const ProjectionInfo& p = g_camera.info;
         char far_text[32] = "infinite";
         if (!std::isinf(p.far_z)) std::snprintf(far_text, sizeof(far_text), "%.6g", p.far_z);
@@ -741,8 +810,8 @@ void draw_discovery_section() {
                 "buffers",
                 s.seconds, (unsigned long long)s.frames_analyzed, (unsigned long long)s.frames_dropped, s.analyze_ms,
                 s.last_draws, s.last_samples, s.last_buffers);
-    ImGui::Text("Matrices found: %zu rigid, %zu projection, %zu view-projection, %zu inverse", s.hypotheses[0],
-                s.hypotheses[1], s.hypotheses[2], s.hypotheses[3]);
+    ImGui::Text("Matrices found: %zu rigid, %zu projection, %zu view-projection, %zu inverse; %zu translations",
+                s.hypotheses[0], s.hypotheses[1], s.hypotheses[2], s.hypotheses[3], s.hypotheses[4]);
     ImGui::Text("Depth: %llu frames (%llu still, %llu moving), %llu reprojection rounds",
                 (unsigned long long)s.depth_frames, (unsigned long long)s.still_frames,
                 (unsigned long long)s.moving_frames, (unsigned long long)s.reproj_rounds);
@@ -901,6 +970,10 @@ void draw_overlay(effect_runtime*) {
             }
             ImGui::EndTable();
         }
+        if (g_snapshot_used)
+            ImGui::TextDisabled("Captured before a clear: that pass drew %u draws (the depth buffer is reused later "
+                                "in the frame).",
+                                g_snapshot_used->pass.drawcalls);
     }
     if (changed) g_settings.save();
 }

@@ -49,7 +49,7 @@ struct Status {
     uint64_t depth_frames = 0, still_frames = 0, moving_frames = 0, reproj_rounds = 0;
     uint32_t last_samples = 0, last_draws = 0, last_buffers = 0;
     double analyze_ms = 0;  // worker time per analyzed frame (smoothed)
-    size_t hypotheses[4] = {};  // per MatrixKind
+    size_t hypotheses[5] = {};  // per MatrixKind
     std::vector<CandidateInfo> candidates;  // best first
 };
 

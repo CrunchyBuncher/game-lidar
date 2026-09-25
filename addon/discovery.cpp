@@ -25,6 +25,8 @@ namespace {
 using Clock = std::chrono::steady_clock;
 
 constexpr size_t kMaxHypotheses = 1024;
+constexpr size_t kMaxTranslations = 256;  // of those, translation vectors
+constexpr size_t kTranslationsTried = 4;  // per camera-relative view-projection, most changing first
 constexpr size_t kHistory = 48;          // frames of values per hypothesis (depth arrives a few frames late)
 constexpr size_t kMaxCandidates = 96;
 constexpr size_t kPublished = 16;        // candidates in the status snapshot
@@ -99,6 +101,7 @@ struct Candidate {
     CameraProfile profile;
     Loc a, b;  // the first-named matrix, and the projection for pair layouts
     bool pair = false;
+    Loc t;  // the translation, if profile.has_translation
     uint32_t reproj_tests = 0, reproj_passes = 0;
     std::deque<float> errors;  // recent test errors
     uint32_t temporal_checks = 0, temporal_agree = 0;
@@ -157,6 +160,16 @@ bool view_changed(const mat::Mat& a, const mat::Mat& b) {
     for (int j = 0; j < 3; ++j)
         if (std::abs(a.m[3][j] - b.m[3][j]) > 1e-5 * (1 + std::abs(a.m[3][j]))) return true;
     return false;
+}
+
+// A float3 that could be a world position (a translation candidate): finite, not tiny, not huge.
+bool looks_like_position(const float f[3]) {
+    double largest = 0;
+    for (int i = 0; i < 3; ++i) {
+        if (!std::isfinite(f[i]) || std::abs(f[i]) > 1e7f) return false;
+        largest = std::max(largest, double(std::abs(f[i])));
+    }
+    return largest >= 1;
 }
 
 // Every distinct raw value of a window over one frame's sampled draws (report only): shows what a
@@ -400,6 +413,14 @@ std::string describe(const CameraProfile& c, bool registers) {
             n += std::snprintf(buf + n, sizeof(buf) - n, " @ %u / %u", c.view_offset, c.proj_offset);
         if (c.key.size) std::snprintf(buf + n, sizeof(buf) - n, " (%u bytes)", c.key.size);
     }
+    if (c.has_translation) {
+        const size_t n = std::strlen(buf);
+        const char* sign = c.translation_subtract ? "-" : "+";
+        if (registers)
+            std::snprintf(buf + n, sizeof(buf) - n, " %s c%u", sign, c.translation_offset / 16);
+        else
+            std::snprintf(buf + n, sizeof(buf) - n, " %s @ %u", sign, c.translation_offset);
+    }
     return buf;
 }
 
@@ -416,6 +437,9 @@ struct Discovery::State {
     Clock::time_point start = Clock::now(), last_reproj{};
     Status stats;
     std::unordered_map<Loc, Hypothesis, LocHash> hyps;
+    size_t translations = 0;  // hyps of kind Translation
+    // Buffers holding a camera-relative view-projection: their float3s are tracked as translations.
+    std::unordered_set<BufId, BufIdHash> translated_bufs;
     std::map<std::string, Candidate> candidates;  // keyed by the profile text
     std::deque<std::shared_ptr<DepthFrame>> depths;
     uint64_t last_frame = 0;  // latest analyzed sample frame
@@ -484,17 +508,26 @@ struct Discovery::State {
                             const Loc loc{id, off, (k & 1) != 0, MatrixKind(k >> 1)};
                             values[loc].push_back(reinterpret_cast<const float*>(bytes.data() + off));
                         }
+                if (translated_bufs.contains(id))
+                    for (uint32_t off = 0; off + 64 <= bytes.size(); off += 16) {
+                        const auto* f = reinterpret_cast<const float*>(bytes.data() + off);
+                        if (looks_like_position(f)) values[Loc{id, off, false, MatrixKind::Translation}].push_back(f);
+                    }
             }
         }
         stats.last_buffers = buffers;
 
         for (auto& [loc, v] : values) {
+            const bool translation = loc.kind == MatrixKind::Translation;
             auto it = hyps.find(loc);
             if (it == hyps.end()) {
-                if (hyps.size() >= kMaxHypotheses) continue;
+                if (hyps.size() >= kMaxHypotheses || (translation && translations >= kMaxTranslations)) continue;
                 it = hyps.emplace(loc, Hypothesis{loc}).first;
+                translations += translation;
             }
             Hypothesis& h = it->second;
+            // A translation is the float3 alone: whatever follows it may differ per draw.
+            const size_t n = translation ? 12 : 64;
             Record r;
             r.frame = sf.frame;
             std::memcpy(r.first, v.front(), sizeof(r.first));
@@ -503,15 +536,15 @@ struct Discovery::State {
             const float* best = v.front();
             uint32_t best_count = 0;
             for (const float* p : v) {
-                auto& [n, first] = counts[hash_bytes(p, 64)];
-                if (n++ == 0) first = p;
-                if (n > best_count) best_count = n, best = first;
+                auto& [count, first] = counts[hash_bytes(p, n)];
+                if (count++ == 0) first = p;
+                if (count > best_count) best_count = count, best = first;
             }
             std::memcpy(r.common, best, sizeof(r.common));
             r.distinct = uint16_t(std::min<size_t>(counts.size(), 0xFFFF));
             ++h.frames_valid;
             h.per_draw += r.distinct > 1;
-            if (!h.history.empty() && std::memcmp(h.history.back().common, r.common, sizeof(r.common)) != 0) ++h.changes;
+            if (!h.history.empty() && std::memcmp(h.history.back().common, r.common, n) != 0) ++h.changes;
             h.history.push_back(r);
             if (h.history.size() > kHistory) h.history.pop_front();
         }
@@ -553,7 +586,8 @@ struct Discovery::State {
                 if (w.buf == id && w.offset == off) return w;
             return s.windows.emplace_back(Snapshot::Window{id, off, {}});
         };
-        for (const auto& [loc, h] : hyps) slot(loc.buf, loc.offset);
+        for (const auto& [loc, h] : hyps)
+            if (loc.kind != MatrixKind::Translation) slot(loc.buf, loc.offset);
         for (const cam::DrawSample& d : sf.samples.samples)
             for (const cam::BoundBuffer& b : d.buffers)
                 for (uint32_t off = 0; off < 256; off += 64) slot({b.key.stage, b.key.slot, b.key.space, b.key.size}, off);
@@ -588,17 +622,32 @@ struct Discovery::State {
     void prune() {
         std::erase_if(hyps, [](const auto& kv) {
             const Hypothesis& h = kv.second;
-            return h.frames_seen >= 60 && h.validity() < 0.5;
+            // A translation that differs per draw isn't the camera's: make room for others.
+            const bool per_draw = h.loc.kind == MatrixKind::Translation && h.per_draw * 5 > h.frames_valid;
+            return h.frames_seen >= 60 && (h.validity() < 0.5 || per_draw);
         });
+        translations = 0;
+        for (const auto& [loc, h] : hyps) translations += loc.kind == MatrixKind::Translation;
         std::erase_if(candidates, [&](const auto& kv) {
             const Candidate& c = kv.second;
-            return !hyps.contains(c.a) || (c.pair && !hyps.contains(c.b));
+            return !hyps.contains(c.a) || (c.pair && !hyps.contains(c.b)) ||
+                   (c.profile.has_translation && !hyps.contains(c.t));
         });
     }
 
     // ---- 2. Candidates --------------------------------------------------------------------
 
-    void add_candidate(CameraLayout layout, const Hypothesis& a, const Hypothesis* b, Latch latch) {
+    // A view-projection whose camera sits at the origin: world points are moved into camera-relative
+    // space before it (UE3's TranslatedViewProjection), so a translation must come with it.
+    static bool camera_at_origin(const Hypothesis& h) {
+        if (h.history.empty()) return false;
+        mat::Mat v, p;
+        if (!decompose_view_proj(mat::load(h.history.back().first, h.loc.column_major), v, p)) return false;
+        return std::abs(v.m[3][0]) < 1e-3 && std::abs(v.m[3][1]) < 1e-3 && std::abs(v.m[3][2]) < 1e-3;
+    }
+
+    void add_candidate(CameraLayout layout, const Hypothesis& a, const Hypothesis* b, Latch latch,
+                       const Hypothesis* t = nullptr, bool subtract = false) {
         if (candidates.size() >= kMaxCandidates) return;
         CameraProfile p;
         p.key = {a.loc.buf.stage, a.loc.buf.slot, a.loc.buf.space, a.loc.buf.size};
@@ -607,10 +656,12 @@ struct Discovery::State {
         if (b) p.proj_offset = b->loc.offset;
         p.column_major = a.loc.column_major;
         p.latch = latch;
+        if (t) p.has_translation = true, p.translation_offset = t->loc.offset, p.translation_subtract = subtract;
         Candidate c;
         c.profile = p;
         c.a = a.loc;
         if (b) c.b = b->loc, c.pair = true;
+        if (t) c.t = t->loc;
         candidates.try_emplace(format_profile(p, {}), std::move(c));
     }
 
@@ -621,11 +672,22 @@ struct Discovery::State {
             std::vector<const Hypothesis*> kinds[4];
         };
         std::unordered_map<Loc, Group, LocHash> groups;  // keyed by the buffer + major (offset 0, Rigid)
+        std::unordered_map<BufId, std::vector<const Hypothesis*>, BufIdHash> positions;  // translations
         for (const auto& [loc, h] : hyps) {
             if (h.frames_seen < 20 || h.validity() < 0.9) continue;
+            if (loc.kind == MatrixKind::Translation) {
+                // The camera's: one value per frame, changing as it moves.
+                if (h.changes > 0 && h.per_draw * 5 <= h.frames_valid) positions[loc.buf].push_back(&h);
+                continue;
+            }
             Loc g{loc.buf, 0, loc.column_major, MatrixKind::Rigid};
             groups[g].kinds[int(loc.kind)].push_back(&h);
         }
+        for (auto& [buf, v] : positions)
+            std::sort(v.begin(), v.end(), [](const Hypothesis* x, const Hypothesis* y) {
+                if (x->changes != y->changes) return x->changes > y->changes;
+                return x->loc.offset < y->loc.offset;
+            });
         // Moving hypotheses first, so the candidate cap keeps the interesting ones.
         auto order = [](std::vector<const Hypothesis*>& v) {
             std::sort(v.begin(), v.end(), [](const Hypothesis* x, const Hypothesis* y) {
@@ -644,7 +706,24 @@ struct Discovery::State {
             const auto& proj = grp.kinds[int(MatrixKind::Proj)];
             const auto& vp = grp.kinds[int(MatrixKind::ViewProj)];
             const auto& ivp = grp.kinds[int(MatrixKind::InvViewProj)];
-            for (const Hypothesis* h : vp) add(CameraLayout::ViewProj, *h, nullptr);
+            for (const Hypothesis* h : vp) {
+                add(CameraLayout::ViewProj, *h, nullptr);
+                // Camera-relative (UE3): the camera sits at the origin, its position is a float3 nearby.
+                if (!camera_at_origin(*h)) continue;
+                translated_bufs.insert(h->loc.buf);
+                const auto pos = positions.find(h->loc.buf);
+                if (pos == positions.end()) continue;
+                size_t tried = 0;
+                for (const Hypothesis* t : pos->second) {
+                    if (t->loc.offset + 12 > h->loc.offset && t->loc.offset < h->loc.offset + 64) continue;
+                    if (tried++ >= kTranslationsTried) break;
+                    for (bool subtract : {false, true}) {
+                        add_candidate(CameraLayout::ViewProj, *h, nullptr, Latch::First, t, subtract);
+                        if (per_draw(*h))
+                            add_candidate(CameraLayout::ViewProj, *h, nullptr, Latch::Common, t, subtract);
+                    }
+                }
+            }
             for (const Hypothesis* h : ivp) add(CameraLayout::InvViewProj, *h, nullptr);
             for (const Hypothesis* p : proj) {
                 auto apart = [&](const Hypothesis* h) {
@@ -691,6 +770,12 @@ struct Discovery::State {
         window.assign(p.window_size(), 0);
         std::memcpy(window.data() + (p.view_offset - p.window_offset()), common ? ra->common : ra->first, 64);
         if (rb) std::memcpy(window.data() + (p.proj_offset - p.window_offset()), common ? rb->common : rb->first, 64);
+        if (p.has_translation) {
+            const auto ht = hyps.find(c.t);
+            const Record* rt = ht != hyps.end() ? ht->second.at(frame) : nullptr;
+            if (rt == nullptr) return 1;
+            std::memcpy(window.data() + (p.translation_offset - p.window_offset()), common ? rt->common : rt->first, 12);
+        }
         float v[16], pr[16];
         if (!decode_camera(p, window.data(), window.size(), v, pr)) return 2;
         view = mat::load(v, false);
@@ -873,7 +958,11 @@ struct Discovery::State {
                           h->loc.column_major ? "column" : "row", h->frames_valid, h->frames_seen, h->changes,
                           h->per_draw);
             f << line;
-            if (!h->history.empty()) {
+            if (!h->history.empty() && h->loc.kind == MatrixKind::Translation) {
+                const float* t = h->history.back().common;
+                std::snprintf(line, sizeof(line), "    %12.5g %12.5g %12.5g\n", t[0], t[1], t[2]);
+                f << line;
+            } else if (!h->history.empty()) {
                 const float* m = h->history.back().common;
                 for (int r = 0; r < 4; ++r) {
                     std::snprintf(line, sizeof(line), "    %12.5g %12.5g %12.5g %12.5g\n", m[r * 4], m[r * 4 + 1],
