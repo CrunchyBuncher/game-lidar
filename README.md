@@ -141,3 +141,8 @@ ImGui commit in `CMakeLists.txt` and rebuild.
 
 [docs/development.md](docs/development.md) covers the architecture, debugging the addon in a game,
 and testing.
+
+## License
+game-lidar is licensed under the [GNU General Public License v3.0](LICENSE). You can use, modify
+and share it, but if you distribute a modified version, you have to release its source under the
+same license.

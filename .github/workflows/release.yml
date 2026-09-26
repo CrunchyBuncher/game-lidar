@@ -1,0 +1,58 @@
+# Run by hand (Actions tab > release > Run workflow, or `gh workflow run release.yml`): build the
+# viewer and both addon bitnesses, run the tests, and publish them as a GitHub release tagged
+# build-<run number>.
+name: release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write  # create the tag and release
+
+# A newer run supersedes a build still running.
+concurrency:
+  group: release
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      # Static CRT, so the viewer runs without the VC++ redistributable installed.
+      CMAKE_ARGS: -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+    steps:
+      - uses: actions/checkout@v4
+
+      # No -G: use whichever Visual Studio the runner has.
+      - name: Build x64 (viewer, addon, tests)
+        run: |
+          cmake -S . -B build -A x64 $env:CMAKE_ARGS.Split(' ')
+          cmake --build build --config Release --target lidar_viewer lidar_capture lidar_tests --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Build Win32 (addon)
+        run: |
+          cmake -S . -B build-win32 -A Win32 $env:CMAKE_ARGS.Split(' ')
+          cmake --build build-win32 --config Release --target lidar_capture --parallel
+
+      - name: Package
+        run: |
+          $out = "dist/game-lidar"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Copy-Item build/bin/Release/lidar_viewer.exe, build/bin/Release/lidar_capture.addon64, `
+                    build-win32/bin/Release/lidar_capture.addon32, README.md, LICENSE $out
+          Copy-Item -Recurse profiles $out
+          Compress-Archive -Path "$out/*" -DestinationPath dist/game-lidar-build-${{ github.run_number }}.zip
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "build-${{ github.run_number }}"
+          $sha = "${{ github.sha }}".Substring(0, 7)
+          gh release create $tag --target ${{ github.sha }} --title "Build ${{ github.run_number }} ($sha)" `
+            --generate-notes `
+            dist/game-lidar-$tag.zip `
+            dist/game-lidar/lidar_viewer.exe dist/game-lidar/lidar_capture.addon64 dist/game-lidar/lidar_capture.addon32
