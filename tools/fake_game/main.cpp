@@ -22,10 +22,12 @@
 //                  [--depth standard|reversed|reversed-infinite] [--capture-width 480]
 //                  [--capture-every 1] [--fov 70] [--no-npc] [--no-color]
 //                  [--size 1280x720] [--duration seconds] [--no-publish]
-//                  [--ring NAME] [--freeze T]
+//                  [--ring NAME] [--freeze T] [--tint-until T]
 //        --no-publish: render only, leave the ring to the ReShade addon.
 //        --ring: publish to another mapping (e.g. a reference for `lidar_verify addon`).
 //        --freeze: hold the scripted camera at path time T seconds.
+//        --tint-until: publish magenta color, with the true depth, for the first T seconds (D3D11): a
+//                      stand-in for an effect over the scene, to test the viewer's color updates.
 //        --d3d12-debug: D3D12 debug layer on; its warnings/errors go to stderr (exit code 3 on errors).
 //        --d24: D3D11 with a D24S8 depth buffer instead of D32F, the reference for D3D9's 24-bit depth.
 // Keys:  M toggle manual camera (WASD/QE + right-drag), Space pause capture, Esc quit.
@@ -118,6 +120,8 @@ Options parse(int argc, char** argv) {
             o.ring.assign(n.begin(), n.end());
         } else if (a == "--freeze") {
             o.freeze = float(std::atof(next()));
+        } else if (a == "--tint-until") {
+            o.tint_until = float(std::atof(next()));
         } else {
             std::fprintf(stderr, "unknown argument: %s\n", a.c_str());
         }

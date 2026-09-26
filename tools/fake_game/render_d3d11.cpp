@@ -298,6 +298,8 @@ int run_d3d11(const Options& opt) {
                     std::memcpy(&slot->color[y * w], static_cast<const uint8_t*>(mc.pData) + y * mc.RowPitch,
                                 w * sizeof(uint32_t));
             }
+            const double captured = double(int64_t(pc.header.timestamp_qpc) - t0.QuadPart) / double(qpf.QuadPart);
+            if (opt.color && captured < opt.tint_until) std::fill_n(slot->color, size_t(w) * h, 0xFFFF00FFu);
             ring.commit();
             ctx->Unmap(tg.stage_depth[pc.stage].Get(), 0);
             if (opt.color) ctx->Unmap(tg.stage_color[pc.stage].Get(), 0);

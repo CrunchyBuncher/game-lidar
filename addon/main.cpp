@@ -59,10 +59,12 @@ constexpr char kDiscoveryReport[] = "lidar_discovery.txt";
 constexpr uint32_t kDiscoveryBytes = 8192;  // per bound buffer at a sampled draw
 
 enum class DepthMode : int { Standard = 0, Reversed = 1, ReversedInfinite = 2 };
+constexpr const char* kCropKeys[4] = {"ColorCropLeft", "ColorCropTop", "ColorCropRight", "ColorCropBottom"};
 
 struct Settings {
     bool enabled = true;
     bool color = true;  // also capture the scene's color, where the backend can
+    float color_crop[4] = {};  // percent of the image from the left, top, right, bottom without color
     int capture_width = 480;
     std::string profile = kDefaultProfile;  // relative to the game's folder
     // Fallback projection for frames without a camera pose. Defaults match fake_game.
@@ -83,6 +85,10 @@ struct Settings {
         discovery_samples = std::clamp(discovery_samples, 4, 512);
         reshade::get_config_value(nullptr, kSection, "Enabled", enabled);
         reshade::get_config_value(nullptr, kSection, "Color", color);
+        for (int i = 0; i < 4; ++i) {
+            reshade::get_config_value(nullptr, kSection, kCropKeys[i], color_crop[i]);
+            color_crop[i] = std::clamp(color_crop[i], 0.0f, 45.0f);
+        }
         reshade::get_config_value(nullptr, kSection, "CaptureWidth", capture_width);
         char buf[1024];
         size_t n = sizeof(buf);
@@ -95,6 +101,7 @@ struct Settings {
     void save() const {
         reshade::set_config_value(nullptr, kSection, "Enabled", enabled);
         reshade::set_config_value(nullptr, kSection, "Color", color);
+        for (int i = 0; i < 4; ++i) reshade::set_config_value(nullptr, kSection, kCropKeys[i], color_crop[i]);
         reshade::set_config_value(nullptr, kSection, "CaptureWidth", capture_width);
         reshade::set_config_value(nullptr, kSection, "Profile", profile.c_str());
         reshade::set_config_value(nullptr, kSection, "FovY", fov_y_deg);
@@ -585,6 +592,9 @@ void on_present(command_queue* queue, swapchain* sc, const rect*, const rect*, u
     g_candidates = std::move(candidates);
 
     watchdog::exchange_step("present: publish");
+    float crop[4];
+    for (int i = 0; i < 4; ++i) crop[i] = g_settings.color_crop[i] / 100;
+    g_capture->set_color_crop(crop);
     g_capture->publish(queue, g_ring);
     watchdog::exchange_step("present: capture");
 
@@ -980,6 +990,23 @@ void draw_overlay(effect_runtime*) {
         ImGui::TextDisabled("(the scene's render target, sampled with depth)");
     else
         ImGui::TextColored(ImVec4(1, 0.8f, 0.2f, 1), "none: %s", g_capture->color_note().c_str());
+    if (g_settings.color && ImGui::TreeNode("Color crop (HUD)")) {
+        ImGui::TextDisabled("Percent of the screen from each edge whose color is dropped (depth is kept).\n"
+                            "The outline on screen is the area that keeps its color.");
+        static const char* const kLabels[4] = {"Left", "Top", "Right", "Bottom"};
+        for (int i = 0; i < 4; ++i)
+            changed |= ImGui::SliderFloat(kLabels[i], &g_settings.color_crop[i], 0.0f, 45.0f, "%.0f%%");
+        if (ImGui::Button("Reset crop")) {
+            std::fill_n(g_settings.color_crop, 4, 0.0f);
+            changed = true;
+        }
+        const ImVec2 size = ImGui::GetIO().DisplaySize;
+        const float* c = g_settings.color_crop;
+        ImGui::GetForegroundDrawList()->AddRect(ImVec2(size.x * c[0] / 100, size.y * c[1] / 100),
+                                                ImVec2(size.x * (1 - c[2] / 100), size.y * (1 - c[3] / 100)),
+                                                IM_COL32(255, 200, 40, 255), 0.0f, 0, 3.0f);
+        ImGui::TreePop();
+    }
 
     changed |= draw_camera_section();
     draw_discovery_section();

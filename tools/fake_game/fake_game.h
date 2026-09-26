@@ -88,6 +88,7 @@ struct Options {
     float fov_deg = 70.0f;
     bool npc = true;
     bool color = true;
+    float tint_until = 0;  // published color is magenta until this many seconds in (D3D11)
     int width = 1280, height = 720;
     float duration = 0;  // 0 = run until closed
     bool publish = true;

@@ -83,7 +83,9 @@ per-object world·view·proj matrices. The profile format is described in
 
 ### Settings
 Everything is in the LiDAR tab, and saved under `[LIDAR]` in the game's `ReShade.ini`
-(`Enabled`, `Color`, `CaptureWidth`, `Profile`, `FovY`, `Near`, `Far`, `DepthMode`). For unattended
+(`Enabled`, `Color`, `ColorCropLeft/Top/Right/Bottom`, `CaptureWidth`, `Profile`, `FovY`, `Near`, `Far`,
+`DepthMode`). If the game's HUD shows up in the colors, crop it out under Color crop (HUD): the
+outline on screen is the area that keeps its color, and depth still covers the whole screen. For unattended
 discovery there are `DiscoveryAutoStart=1`, `DiscoveryAutoSave=<seconds>` and `DiscoverySamples`.
 Only edit the ini while the game is closed: ReShade rewrites it from memory.
 
@@ -97,7 +99,7 @@ To uninstall, run the ReShade installer again and uninstall, then delete the add
 | `F` | Follow the player |
 | `H` | Color by height / captured color (the game's scene colors, D3D9 and D3D11) |
 | `T` | Show the player's trail |
-| `X` | Toggle carving |
+| `M` | Toggle carving |
 | `+` / `-` | Point size |
 | `C` | Clear the scan |
 | `P` | Save a `.ply` to `scans/` |
@@ -106,7 +108,9 @@ To uninstall, run the ReShade installer again and uninstall, then delete the add
 
 Command-line options: `--voxel 0.05` (point spacing in meters), `--capacity-m 50` (millions of
 points; about 1.5 GB of GPU memory at 50), `--near-cut 0.3`, `--max-range 500`,
-`--height-range -1 20`, `--no-carve`, `--carve-margin 0.15`, `--carve-rel 0.02`.
+`--height-range -1 20`, `--no-carve`, `--carve-margin 0.15`, `--carve-rel 0.02`,
+`--color-update first|closest|latest` (which sighting's color a point keeps; default closest, so
+an effect that tinted a wall from afar is replaced once you get nearer).
 
 ## Build
 Windows only. Requires Visual Studio 2022 or 2026 with the C++ workload (it bundles CMake). There

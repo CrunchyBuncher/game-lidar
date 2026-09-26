@@ -376,6 +376,7 @@ void D3D11Capture::publish(reshade::api::command_queue* queue, RingWriter& ring)
                 for (uint32_t y = 0; y < h; ++y)
                     std::memcpy(&slot->color[y * w], static_cast<const uint8_t*>(cm.pData) + y * cm.RowPitch,
                                 w * sizeof(uint32_t));
+            if (has_color) crop_color(*slot);
             ring.commit();
             ++published_;
         }

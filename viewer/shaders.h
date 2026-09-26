@@ -8,7 +8,8 @@ inline constexpr unsigned kQuadsPerBatch = 16384;  // 4 vertices each: fits 16-b
 
 // Per-frame compute passes over the point pool:
 //   cs_min_dist - per pixel, the nearest distance observed in its 3x3 neighborhood (for carving)
-//   cs_carve    - free-space carving: delete points the current frame sees through
+//   cs_carve    - free-space carving: delete points the current frame sees through; also
+//                 refreshes the color of points it sees (color_update)
 //   cs_ingest   - depth frame -> world points, deduplicated through a voxel hash
 //   cs_args     - refresh indirect draw/dispatch arguments
 // Unprojection mirrors common/unproject.h.
@@ -28,9 +29,13 @@ cbuffer FrameCB : register(b0) {
     uint has_color;
     float carve_margin_abs;
     float carve_margin_rel;
+    uint carve_on;
+    uint color_update;  // 0 keep the first color, 1 closest sighting's, 2 latest sighting's
 };
 
-struct PointData { float3 pos; uint color; };  // pos.x = NaN marks a deleted point
+// pos.x = NaN marks a deleted point. color: RGB in the low bytes, dist_key() of the sighting it
+// came from in the top one.
+struct PointData { float3 pos; uint color; };
 
 Texture2D<float> depth_tex : register(t0);
 Texture2D<float4> color_tex : register(t1);
@@ -63,10 +68,17 @@ uint voxel_hash(float3 w) {
     return (h == kEmpty || h == kTombstone) ? 1 : h;
 }
 
-uint pack_rgba(float4 c) {
-    uint4 u = (uint4)round(saturate(c) * 255.0);
-    return u.r | (u.g << 8) | (u.b << 16) | (u.a << 24);
+// A sighting distance as a byte: 0 at 0.1 m, then one step per 4.7% farther (255: ~13 km or more).
+uint dist_key(float d) {
+    return (uint)clamp(round(log2(max(d, 0.1) / 0.1) * 15.0), 0.0, 255.0);
 }
+
+uint pack_color(float4 c, float d) {
+    uint3 u = (uint3)round(saturate(c.rgb) * 255.0);
+    return u.r | (u.g << 8) | (u.b << 16) | (dist_key(d) << 24);
+}
+
+static const uint kNoColor = 0xFFFFFFFFu;  // white, "seen from infinitely far": any color replaces it
 
 // View-space position of stored pixel p, sampled at its source pixel center.
 float4 unproject_pixel(uint2 p) {
@@ -117,11 +129,22 @@ void cs_carve(uint3 id : SV_DispatchThreadID) {
     int2 pix = (int2)floor(float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * (float2)dims);
     if (any(pix < 0) || any(pix >= (int2)dims)) return;
 
+    // Color refresh, only where the pixel sees this point's own surface (not something in front of
+    // it or behind it) and has color (alpha 0: cropped out). First: only a point without color yet
+    // takes it. Closest: a sighting at the same distance step or nearer wins, so standing where a
+    // passing effect was seen from also clears it. Latest: every sighting.
+    float4 seen = color_tex.Load(int3(pix, 0));
+    if (has_color && seen.a > 0.5 && abs(observed_distance(pix) - d) < max(2 * voxel_size, 0.02 * d)) {
+        uint c = pack_color(seen, d);
+        if (color_update == 2 || (color_update == 1 ? (c >> 24) <= (pt.color >> 24) : pt.color == kNoColor))
+            points[id.x].color = c;
+    }
+
     // Delete only if every neighboring ray clearly passes beyond the point. This is
     // conservative at silhouettes and at grazing angles. (A ray stopping before near_cut
     // also keeps it: need > d > near_cut.)
     float need = d + max(carve_margin_abs, carve_margin_rel * d);
-    if (min_dist.Load(int3(pix, 0)) < need) return;
+    if (!carve_on || min_dist.Load(int3(pix, 0)) < need) return;
 
     // Free the voxel so it can be filled again, and recycle the point slot.
     uint h = voxel_hash(pt.pos);
@@ -165,7 +188,8 @@ void cs_ingest(uint3 id : SV_DispatchThreadID) {
             if (idx < capacity) {
                 PointData p;
                 p.pos = w;
-                p.color = has_color ? pack_rgba(color_tex.Load(int3(id.xy, 0))) : 0xFFFFFFFFu;
+                float4 c = color_tex.Load(int3(id.xy, 0));
+                p.color = has_color && c.a > 0.5 ? pack_color(c, d) : kNoColor;
                 points[idx] = p;
             }
             return;

@@ -464,11 +464,12 @@ void D3D9Capture::publish(command_queue*, RingWriter& ring) {
                 for (uint32_t y = 0; y < h; ++y)
                     std::memcpy(&slot->depth[y * w], static_cast<const uint8_t*>(lr.pBits) + y * lr.Pitch,
                                 w * sizeof(float));
-                if (color_locked)
+                if (color_locked) {
                     for (uint32_t y = 0; y < h; ++y)
                         std::memcpy(&slot->color[y * w], static_cast<const uint8_t*>(clr.pBits) + y * clr.Pitch,
                                     w * sizeof(uint32_t));
-                else
+                    crop_color(*slot);
+                } else
                     slot->frame.flags &= ~kFlagHasColor;
                 ring.commit();
                 ++published_;

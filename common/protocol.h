@@ -13,7 +13,8 @@
 //     (same for y), computed EXACTLY in integers as ((2u + 1) * src_width) / (2 * width).
 //     Float math rounds differently at exact boundaries depending on how it was compiled. Consumers compute NDC from the SOURCE pixel center, so
 //     downsampling introduces no geometric error.
-//   * color[] is RGBA8 (R in the lowest byte), same layout as depth.
+//   * color[] is RGBA8 (R in the lowest byte), same layout as depth. Alpha 0 marks a pixel
+//     without color (e.g. cropped out as HUD): its depth still counts. Older viewers ignore alpha.
 #pragma once
 #include <cstddef>
 #include <cstdint>

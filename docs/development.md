@@ -22,7 +22,11 @@ a downsampled depth image plus the camera's view and projection matrices.
 - **Color:** the tracker also remembers the render target bound at the last draw into each
   depth-stencil. D3D9 and D3D11 sample it at the same pixels and moment as depth (so before the
   HUD, in games that draw it elsewhere), if it's the depth buffer's size; HDR values are clamped,
-  not tone-mapped. The overlay says why a frame has no color. Voxels keep their first color.
+  not tone-mapped. The overlay says why a frame has no color. The color crop (for HUDs drawn
+  into the same target) is applied at publish: cropped pixels get alpha 0, meaning no color. In the viewer, the carve pass also
+  recolors points the frame sees (their own surface at their pixel): from the closest sighting
+  (distance step in the color's top byte) or the latest. `fake_game --tint-until T` publishes
+  magenta over the true depth for T seconds to test it: with first-seen, those points stay magenta.
 - **Camera path:** `camera_tracker` latches the profile's constant-buffer window at the draws into
   each depth-stencil. The bytes come from a `CbufferSource`. At present, the latch for the captured
   depth-stencil becomes the frame's pose. Without a profile, frames go out camera-relative with a
@@ -111,7 +115,7 @@ With `--no-publish` the addon does the capturing. Without it, the test game publ
 depth and camera, as a reference producer.
 
 **Options:** `--depth standard|reversed|reversed-infinite`, `--capture-width 480`,
-`--no-npc`, `--no-color`, `--fov 70`, `--no-publish` (leave the ring to the addon). Keys: `M` manual camera (WASD/QE + right-drag),
+`--no-npc`, `--no-color`, `--tint-until T`, `--fov 70`, `--no-publish` (leave the ring to the addon). Keys: `M` manual camera (WASD/QE + right-drag),
 `Space` pause capture.
 
 `--api d3d12` renders the same level with D3D12 (render only, so the addon must publish),

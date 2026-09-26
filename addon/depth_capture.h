@@ -5,6 +5,7 @@
 #pragma once
 #include <reshade.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -44,13 +45,27 @@ public:
     const std::string& error() const { return error_; }
     // Why the last capture has no color ("" if it has).
     const std::string& color_note() const { return color_note_; }
+    // Fractions of the image, from each edge (left, top, right, bottom), whose color is dropped
+    // (alpha 0, see protocol.h): games that draw their HUD into the scene's target.
+    void set_color_crop(const float crop[4]) { std::copy_n(crop, 4, crop_); }
     uint32_t width() const { return cap_w_; }
     uint32_t height() const { return cap_h_; }
     uint64_t published() const { return published_; }
     uint64_t skipped() const { return skipped_; }
 
 protected:
+    // Applies the color crop to a published slot with color.
+    void crop_color(Slot& slot) const {
+        const uint32_t w = slot.frame.width, h = slot.frame.height;
+        const uint32_t x0 = uint32_t(crop_[0] * w), y0 = uint32_t(crop_[1] * h);
+        const uint32_t x1 = w - std::min(w, uint32_t(crop_[2] * w)), y1 = h - std::min(h, uint32_t(crop_[3] * h));
+        for (uint32_t y = 0; y < h; ++y)
+            for (uint32_t x = 0; x < w; ++x)
+                if (y < y0 || y >= y1 || x < x0 || x >= x1) slot.color[y * w + x] &= 0x00FFFFFFu;
+    }
+
     std::string error_;
+    float crop_[4] = {};
     std::string color_note_ = "not captured";
     uint32_t cap_w_ = 0, cap_h_ = 0;
     uint64_t published_ = 0, skipped_ = 0;

@@ -115,6 +115,7 @@ int verify_addon(int frames_wanted, float tol, float depth_tol) {
     int with_pose = 0;
     int with_color = 0;
     size_t color_compared = 0, color_off = 0;  // off: a channel more than kColorTol steps away
+    size_t color_none = 0;                     // alpha 0: no color (cropped), not compared
     constexpr int kColorTol = 8;
     while (frames < frames_wanted && GetTickCount64() < deadline) {
         if (!ring.is_open() && !ring.try_open()) {
@@ -142,6 +143,10 @@ int verify_addon(int frames_wanted, float tol, float depth_tol) {
         if ((f.header.flags & kFlagHasColor) && (ref.header.flags & kFlagHasColor)) {
             ++with_color;
             for (size_t i = 0; i < size_t(f.header.width) * f.header.height; ++i) {
+                if ((f.color[i] >> 24) == 0) {
+                    ++color_none;
+                    continue;
+                }
                 bool off = false;
                 for (int c = 0; c < 24; c += 8)
                     off |= std::abs(int((f.color[i] >> c) & 0xFF) - int((ref.color[i] >> c) & 0xFF)) > kColorTol;
@@ -181,8 +186,9 @@ int verify_addon(int frames_wanted, float tol, float depth_tol) {
     std::printf("\n");
     const bool color_bad = color_off * 100 > color_compared;  // more than 1% of pixels
     if (with_color > 0)
-        std::printf("frames with color: %d of %d, %zu of %zu pixels off by more than %d steps%s\n", with_color, frames,
-                    color_off, color_compared, kColorTol, color_bad ? " (over 1%: FAIL)" : "");
+        std::printf("frames with color: %d of %d, %zu of %zu pixels off by more than %d steps%s, %zu without color "
+                    "(cropped)\n", with_color, frames, color_off, color_compared, kColorTol,
+                    color_bad ? " (over 1%: FAIL)" : "", color_none);
     else
         std::printf("frames with color: 0 of %d%s\n", frames,
                     ref.header.flags & kFlagHasColor ? "" : " (the reference has no color either)");

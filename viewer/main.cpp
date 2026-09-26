@@ -6,10 +6,11 @@
 // Usage: lidar_viewer [--voxel 0.05] [--capacity-m 50] [--table-bits auto]
 //                     [--near-cut 0.3] [--max-range 500] [--height-range -1 20]
 //                     [--no-carve] [--carve-margin 0.15] [--carve-rel 0.02]
+//                     [--color-update first|closest|latest]
 //                     [--size 1600x900] [--out file.ply] [--save-after s] [--exit-after s]
 // Keys:  right-drag look, WASD move, Q/E down/up, Shift fast, wheel speed,
 //        F follow player, V attach to the player's camera, H color mode, T trail,
-//        X carving, +/- point size, arrows tilt the view, L level it, C clear,
+//        M carving, +/- point size, arrows tilt the view, L level it, C clear,
 //        P save .ply, Space pause ingest, F1 settings panel, Esc quit.
 // The settings panel changes voxel size, capacity, range, carving and colors while it runs.
 #include <DirectXMath.h>
@@ -81,6 +82,7 @@ struct Options {
     bool carve = true;
     float carve_margin = 0.15f;  // meters
     float carve_rel = 0.02f;     // fraction of distance
+    uint32_t color_update = 1;   // a point's color: 0 first sighting's, 1 closest's, 2 latest's
 };
 
 Options parse(int argc, char** argv) {
@@ -103,6 +105,10 @@ Options parse(int argc, char** argv) {
         else if (a == "--no-carve") o.carve = false;
         else if (a == "--carve-margin") o.carve_margin = float(std::atof(next()));
         else if (a == "--carve-rel") o.carve_rel = float(std::atof(next()));
+        else if (a == "--color-update") {
+            const std::string m = next();
+            o.color_update = m == "first" ? 0 : m == "latest" ? 2 : 1;
+        }
         else std::fprintf(stderr, "unknown argument: %s\n", a.c_str());
     }
     return o;
@@ -114,6 +120,7 @@ struct FrameCB {
     float near_cut, max_range, voxel_size;
     uint32_t table_mask, capacity, has_color;
     float carve_margin_abs, carve_margin_rel;
+    uint32_t carve_on, color_update;
 };
 struct DrawCB {
     XMFLOAT4X4 view_proj;
@@ -658,8 +665,9 @@ int main(int argc, char** argv) {
             if (cs != 0) clear_cloud();
             seen_clear = cs;
         }
-        // Carving is a pass over the whole pool, so it runs for one frame per viewer frame at most:
-        // when the viewer falls behind, a backlog of frames doesn't multiply its cost.
+        // Carving (and the color refresh that shares its pass) is a pass over the whole pool, so it
+        // runs for one frame per viewer frame at most: when the viewer falls behind, a backlog of
+        // frames doesn't multiply its cost.
         bool carved = false;
         gpu_timer.mark(ctx, 0);
         for (uint32_t i = 0; i < kSlotCount && ring.is_open() && ring.read_next(frame); ++i) {
@@ -710,6 +718,8 @@ int main(int argc, char** argv) {
             cb.has_color = has_color;
             cb.carve_margin_abs = opt.carve_margin;
             cb.carve_margin_rel = opt.carve_rel;
+            cb.carve_on = carve;
+            cb.color_update = opt.color_update;
             upload(ctx, frame_cb.Get(), cb);
 
             ID3D11ShaderResourceView* srvs[2] = {depth_srv.Get(), color_srv.Get()};
@@ -717,7 +727,7 @@ int main(int argc, char** argv) {
             ctx->CSSetShaderResources(0, 2, srvs);
             // Carve first, so this frame's own points aren't tested against itself
             // and freed slots can be reused right away.
-            if (carve && !carved) {
+            if ((carve || has_color) && !carved) {  // has_color: the color refresh (even first-seen fills in)
                 carved = true;
                 ctx->CSSetShader(cs_min_dist.Get(), nullptr, 0);
                 ctx->CSSetUnorderedAccessViews(5, 1, min_dist_uav.GetAddressOf(), nullptr);
@@ -812,6 +822,15 @@ int main(int argc, char** argv) {
             ImGui::SameLine();
             ImGui::RadioButton("Captured color", &mode, 1);
             color_mode = uint32_t(mode);
+            int update = int(opt.color_update);
+            ImGui::TextUnformatted("Keep the color");
+            ImGui::SameLine();
+            ImGui::RadioButton("first seen", &update, 0);
+            ImGui::SameLine();
+            ImGui::RadioButton("seen closest", &update, 1);
+            ImGui::SameLine();
+            ImGui::RadioButton("seen last", &update, 2);
+            opt.color_update = uint32_t(update);
             ImGui::Checkbox("Height range from the cloud", &auto_height);
             if (auto_height) {
                 if (have_bounds)
