@@ -40,7 +40,7 @@ runs at 120 fps (vsync).
 
 ### M0.5 — Free-space carving ✅ (2026-09-24)
 - [x] GPU carve pass before each ingest (3×3 conservative test), hash tombstones, and a free
-      list for slot reuse. Toggle with `X` / `--no-carve`.
+      list for slot reuse. Toggle with `M` / `--no-carve`.
 - [x] A/B on a 90 s run with the moving NPC: ghost points (> 2 cm from static scene)
       went from 128,523 to 313. The total drop (6.65M → 6.52M) matches the removed ghosts, so
       no static geometry was lost. Viewer still at 120 fps.

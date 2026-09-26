@@ -3,10 +3,14 @@
 
 namespace lidar::shaders {
 
+// Points are drawn in batches of this many quads, one instance per batch (see vs_points).
+inline constexpr unsigned kQuadsPerBatch = 16384;  // 4 vertices each: fits 16-bit indices
+
 // Per-frame compute passes over the point pool:
-//   cs_carve  - free-space carving: delete points the current frame sees through
-//   cs_ingest - depth frame -> world points, deduplicated through a voxel hash
-//   cs_args   - refresh indirect draw/dispatch arguments
+//   cs_min_dist - per pixel, the nearest distance observed in its 3x3 neighborhood (for carving)
+//   cs_carve    - free-space carving: delete points the current frame sees through
+//   cs_ingest   - depth frame -> world points, deduplicated through a voxel hash
+//   cs_args     - refresh indirect draw/dispatch arguments
 // Unprojection mirrors common/unproject.h.
 inline const char* kCompute = R"(
 cbuffer FrameCB : register(b0) {
@@ -30,17 +34,19 @@ struct PointData { float3 pos; uint color; };  // pos.x = NaN marks a deleted po
 
 Texture2D<float> depth_tex : register(t0);
 Texture2D<float4> color_tex : register(t1);
-// [0] slots ever allocated (may exceed capacity), [4] free-list size, [8] ~lowest and [12] highest
-// point height as height_key()s (0 = no points yet; both only grow, so a clear resets them).
+Texture2D<float> min_dist : register(t2);
+// [0] slots ever allocated (may exceed capacity), [4] free-list size.
 RWByteAddressBuffer counter : register(u0);
 RWStructuredBuffer<uint> table : register(u1);
 RWStructuredBuffer<PointData> points : register(u2);
 RWStructuredBuffer<uint> free_list : register(u3);
-RWBuffer<uint> args : register(u4);  // [0..3] DrawInstancedIndirect, [4..6] DispatchIndirect for carving
+RWBuffer<uint> args : register(u4);  // [0..4] DrawIndexedInstancedIndirect, [5..7] DispatchIndirect for carving
+RWTexture2D<float> min_dist_out : register(u5);
 
 static const uint kEmpty = 0;
 static const uint kTombstone = 0xFFFFFFFFu;
 static const uint kCarveGroup = 256;
+static const uint kQuadsPerBatch = 16384;  // must match the C++ one
 
 uint mix(uint h) {
     h ^= h >> 16; h *= 0x7feb352du;
@@ -55,12 +61,6 @@ uint voxel_hash(float3 w) {
     h = mix(h ^ asuint(k.y));
     h = mix(h ^ asuint(k.z));
     return (h == kEmpty || h == kTombstone) ? 1 : h;
-}
-
-// A float as a uint with the same order, so atomics can track the extremes (never 0 for a real number).
-uint height_key(float y) {
-    uint u = asuint(y);
-    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
 }
 
 uint pack_rgba(float4 c) {
@@ -86,6 +86,21 @@ float observed_distance(uint2 p) {
     return d;
 }
 
+// Carving tests a point against a 3x3 pixel neighborhood; this does the per-pixel work once per
+// frame instead of once per point. Edge pixels have no full neighborhood and get 0 (never carve).
+[numthreads(8, 8, 1)]
+void cs_min_dist(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= dims)) return;
+    float m = 0;
+    if (all(id.xy >= 1) && all(id.xy < dims - 1)) {
+        m = 1e30;
+        [unroll] for (int y = -1; y <= 1; ++y)
+            [unroll] for (int x = -1; x <= 1; ++x)
+                m = min(m, observed_distance(uint2(int2(id.xy) + int2(x, y))));
+    }
+    min_dist_out[id.xy] = m;
+}
+
 [numthreads(kCarveGroup, 1, 1)]
 void cs_carve(uint3 id : SV_DispatchThreadID) {
     uint n = min(counter.Load(0), capacity);
@@ -100,17 +115,13 @@ void cs_carve(uint3 id : SV_DispatchThreadID) {
     if (clip.w <= 0) return;
     float2 ndc = clip.xy / clip.w;
     int2 pix = (int2)floor(float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * (float2)dims);
-    if (any(pix < 1) || any(pix >= (int2)dims - 1)) return;  // need a full 3x3 neighborhood
+    if (any(pix < 0) || any(pix >= (int2)dims)) return;
 
     // Delete only if every neighboring ray clearly passes beyond the point. This is
-    // conservative at silhouettes and at grazing angles.
+    // conservative at silhouettes and at grazing angles. (A ray stopping before near_cut
+    // also keeps it: need > d > near_cut.)
     float need = d + max(carve_margin_abs, carve_margin_rel * d);
-    [unroll] for (int y = -1; y <= 1; ++y) {
-        [unroll] for (int x = -1; x <= 1; ++x) {
-            float o = observed_distance(uint2(pix + int2(x, y)));
-            if (o < near_cut || o < need) return;
-        }
-    }
+    if (min_dist.Load(int3(pix, 0)) < need) return;
 
     // Free the voxel so it can be filled again, and recycle the point slot.
     uint h = voxel_hash(pt.pos);
@@ -156,9 +167,6 @@ void cs_ingest(uint3 id : SV_DispatchThreadID) {
                 p.pos = w;
                 p.color = has_color ? pack_rgba(color_tex.Load(int3(id.xy, 0))) : 0xFFFFFFFFu;
                 points[idx] = p;
-                uint key = height_key(w.y), ignored;
-                counter.InterlockedMax(8, ~key, ignored);
-                counter.InterlockedMax(12, key, ignored);
             }
             return;
         }
@@ -170,13 +178,52 @@ void cs_ingest(uint3 id : SV_DispatchThreadID) {
 [numthreads(1, 1, 1)]
 void cs_args() {
     uint n = min(counter.Load(0), capacity);
-    args[0] = 6;  // vertices per point quad
-    args[1] = n;
+    args[0] = 6 * kQuadsPerBatch;  // indices per batch
+    args[1] = (n + kQuadsPerBatch - 1) / kQuadsPerBatch;
     args[2] = 0;
     args[3] = 0;
-    args[4] = (n + kCarveGroup - 1) / kCarveGroup;
-    args[5] = 1;
+    args[4] = 0;
+    args[5] = (n + kCarveGroup - 1) / kCarveGroup;
     args[6] = 1;
+    args[7] = 1;
+}
+)";
+
+// Height histogram of the live points (height as shown, so tilted), for a color range that
+// ignores a few stray points: [0] ~lowest and [4] highest height_key(), then kHistBins counts
+// over [lo, hi] (heights outside land in the end bins).
+inline constexpr unsigned kHistBins = 1024;
+inline const char* kHeightHist = R"(
+cbuffer HistCB : register(b0) {
+    float4 height_axis;
+    float lo;
+    float hi;
+    uint capacity;
+    uint bins;
+};
+
+struct PointData { float3 pos; uint color; };
+StructuredBuffer<PointData> points : register(t0);
+RWByteAddressBuffer hist : register(u0);
+RWByteAddressBuffer counter : register(u1);  // read only: [0] slots ever allocated
+
+// A float as a uint with the same order, so atomics can track the extremes (never 0 for a real number).
+uint height_key(float y) {
+    uint u = asuint(y);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+[numthreads(256, 1, 1)]
+void cs_height_hist(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= min(counter.Load(0), capacity)) return;
+    float3 p = points[id.x].pos;
+    if (isnan(p.x)) return;  // carved
+    float h = dot(float4(p, 1), height_axis);
+    uint key = height_key(h), ignored;
+    hist.InterlockedMax(0, ~key, ignored);
+    hist.InterlockedMax(4, key, ignored);
+    uint bin = (uint)clamp((h - lo) / max(hi - lo, 1e-6) * bins, 0.0, bins - 1.0);
+    hist.InterlockedAdd(8 + 4 * bin, 1);
 }
 )";
 
@@ -188,12 +235,15 @@ cbuffer Draw : register(b0) {
     uint color_mode;  // 0 height, 1 captured color
     float height_min;
     float height_max;
-    float2 pad_;
+    uint capacity;
+    float pad_;
     float4 height_axis;  // height as shown (tilted): dot(float4(pos, 1), height_axis)
 };
 
 struct PointData { float3 pos; uint color; };
 StructuredBuffer<PointData> points : register(t0);
+ByteAddressBuffer counter : register(t1);  // [0] slots ever allocated
+static const uint kQuadsPerBatch = 16384;  // must match the C++ one
 
 float3 turbo(float x) {
     const float4 kr = float4(0.13572138, 4.61539260, -42.66032258, 132.13108234);
@@ -210,19 +260,23 @@ float3 turbo(float x) {
 
 struct VSOut { float4 pos : SV_Position; float3 col : COLOR; };
 
+// One instance per batch of kQuadsPerBatch points. The index buffer holds each batch's quads as
+// 4 shared vertices (vid = 4 * quad + corner), so the vertex cache runs this ~4 times per point, not 6.
 VSOut vs_points(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
-    const float2 corners[6] = { float2(-1,-1), float2(-1,1), float2(1,1), float2(-1,-1), float2(1,1), float2(1,-1) };
-    PointData p = points[iid];
+    const float2 corners[4] = { float2(-1,-1), float2(-1,1), float2(1,1), float2(1,-1) };
+    uint idx = iid * kQuadsPerBatch + (vid >> 2);
     VSOut o;
     o.col = 0;
-    if (isnan(p.pos.x)) {  // deleted: emit a clipped vertex
-        o.pos = float4(2, 2, 2, 1);
-        return o;
-    }
+    o.pos = float4(2, 2, 2, 1);  // clipped
+    if (idx >= min(counter.Load(0), capacity)) return o;  // past the last point of the last batch
+    PointData p = points[idx];
+    if (isnan(p.pos.x)) return o;  // deleted
     o.pos = mul(float4(p.pos, 1), view_proj);
-    o.pos.xy += corners[vid] * px_to_ndc * point_size * 0.5 * o.pos.w;
+    o.pos.xy += corners[vid & 3] * px_to_ndc * point_size * 0.5 * o.pos.w;
     if (color_mode == 0) {
-        o.col = turbo((dot(float4(p.pos, 1), height_axis) - height_min) / (height_max - height_min));
+        // Skip turbo's near-black bottom end so the lowest points (usually the floor) still show.
+        float t = saturate((dot(float4(p.pos, 1), height_axis) - height_min) / (height_max - height_min));
+        o.col = turbo(0.08 + 0.92 * t);
     } else {
         o.col = float3(p.color & 0xFF, (p.color >> 8) & 0xFF, (p.color >> 16) & 0xFF) / 255.0;
     }

@@ -120,8 +120,15 @@ struct DrawCB {
     float px_to_ndc[2];
     float point_size;
     uint32_t color_mode;
-    float height_min, height_max, pad[2];
+    float height_min, height_max;
+    uint32_t capacity;
+    float pad;
     float height_axis[4];  // a point's height as shown: dot((pos, 1), height_axis), for the tilt
+};
+struct HistCB {
+    float height_axis[4];
+    float lo, hi;
+    uint32_t capacity, bins;
 };
 struct PointData {
     float pos[3];
@@ -152,12 +159,46 @@ void upload(ID3D11DeviceContext* ctx, ID3D11Buffer* b, const T& data) {
     ctx->Unmap(b, 0);
 }
 
+// GPU time between kMarks points in the frame, read back a few frames late without stalling.
+// begin(), then mark(0..kMarks-1) in order, then end(), once a frame.
+struct GpuTimer {
+    static constexpr int kFrames = 6, kMarks = 4;
+    ComPtr<ID3D11Query> disjoint[kFrames], stamps[kFrames][kMarks];
+    int frame = 0;
+    float ms[kMarks - 1] = {};  // smoothed time from each mark to the next
+
+    void create(ID3D11Device* dev) {
+        D3D11_QUERY_DESC d{D3D11_QUERY_TIMESTAMP_DISJOINT};
+        for (auto& q : disjoint) check(dev->CreateQuery(&d, &q), "timer query");
+        d.Query = D3D11_QUERY_TIMESTAMP;
+        for (auto& f : stamps)
+            for (auto& q : f) check(dev->CreateQuery(&d, &q), "timer query");
+    }
+    void begin(ID3D11DeviceContext* ctx) { ctx->Begin(disjoint[frame % kFrames].Get()); }
+    void mark(ID3D11DeviceContext* ctx, int i) { ctx->End(stamps[frame % kFrames][i].Get()); }
+    void end(ID3D11DeviceContext* ctx) {
+        ctx->End(disjoint[frame % kFrames].Get());
+        if (++frame < kFrames) return;
+        const int f = frame % kFrames;  // the oldest, reused next frame: read it now or never
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj;
+        if (ctx->GetData(disjoint[f].Get(), &dj, sizeof(dj), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK || dj.Disjoint)
+            return;
+        UINT64 t[kMarks];
+        for (int i = 0; i < kMarks; ++i)
+            if (ctx->GetData(stamps[f][i].Get(), &t[i], sizeof(t[i]), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) return;
+        for (int i = 0; i + 1 < kMarks; ++i) {
+            const float now = float(double(t[i + 1] - t[i]) * 1000.0 / double(dj.Frequency));
+            ms[i] += (now - ms[i]) * 0.1f;
+        }
+    }
+};
+
 // GPU point pool + voxel hash table.
 struct PointCloud {
     uint32_t capacity = 0, table_size = 0;
     ComPtr<ID3D11Buffer> counter, table, points, free_list, args;
     ComPtr<ID3D11UnorderedAccessView> counter_uav, table_uav, points_uav, free_list_uav, args_uav;
-    ComPtr<ID3D11ShaderResourceView> points_srv;
+    ComPtr<ID3D11ShaderResourceView> points_srv, counter_srv;
 
     // False if the GPU can't allocate it (e.g. a capacity set too high in the UI).
     bool create(ID3D11Device* dev, uint32_t cap, uint32_t table_bits) {
@@ -166,14 +207,19 @@ struct PointCloud {
 
         D3D11_BUFFER_DESC d{};
         d.ByteWidth = 16;
-        d.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+        d.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;  // the draw reads the count
         d.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
         if (FAILED(dev->CreateBuffer(&d, nullptr, &counter))) return false;
         D3D11_UNORDERED_ACCESS_VIEW_DESC u{DXGI_FORMAT_R32_TYPELESS, D3D11_UAV_DIMENSION_BUFFER};
         u.Buffer.NumElements = 4;
         u.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
         if (FAILED(dev->CreateUnorderedAccessView(counter.Get(), &u, &counter_uav))) return false;
+        D3D11_SHADER_RESOURCE_VIEW_DESC sv{DXGI_FORMAT_R32_TYPELESS, D3D11_SRV_DIMENSION_BUFFEREX};
+        sv.BufferEx.NumElements = 4;
+        sv.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
+        if (FAILED(dev->CreateShaderResourceView(counter.Get(), &sv, &counter_srv))) return false;
 
+        d.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
         d.ByteWidth = table_size * 4;
         d.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
         d.StructureByteStride = 4;
@@ -191,7 +237,7 @@ struct PointCloud {
         if (FAILED(dev->CreateUnorderedAccessView(points.Get(), nullptr, &points_uav))) return false;
         if (FAILED(dev->CreateShaderResourceView(points.Get(), nullptr, &points_srv))) return false;
 
-        // [0..3] DrawInstancedIndirect, [4..6] DispatchIndirect (carving).
+        // [0..4] DrawIndexedInstancedIndirect, [5..7] DispatchIndirect (carving).
         d = {};
         d.ByteWidth = 32;
         d.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
@@ -294,15 +340,20 @@ int main(int argc, char** argv) {
     app.message_hook = ui_message;
 
     // Shaders.
+    auto min_dist_blob = compile_shader(shaders::kCompute, "cs_min_dist", "cs_5_0");
     auto carve_blob = compile_shader(shaders::kCompute, "cs_carve", "cs_5_0");
     auto ingest_blob = compile_shader(shaders::kCompute, "cs_ingest", "cs_5_0");
     auto args_blob = compile_shader(shaders::kCompute, "cs_args", "cs_5_0");
     auto vsp_blob = compile_shader(shaders::kDraw, "vs_points", "vs_5_0");
     auto vsl_blob = compile_shader(shaders::kDraw, "vs_lines", "vs_5_0");
     auto ps_blob = compile_shader(shaders::kDraw, "ps_main", "ps_5_0");
-    ComPtr<ID3D11ComputeShader> cs_carve, cs_ingest, cs_args;
+    auto hist_blob = compile_shader(shaders::kHeightHist, "cs_height_hist", "cs_5_0");
+    ComPtr<ID3D11ComputeShader> cs_min_dist, cs_carve, cs_ingest, cs_args, cs_hist;
     ComPtr<ID3D11VertexShader> vs_points, vs_lines;
     ComPtr<ID3D11PixelShader> ps;
+    check(dev->CreateComputeShader(min_dist_blob->GetBufferPointer(), min_dist_blob->GetBufferSize(), nullptr,
+                                   &cs_min_dist),
+          "cs_min_dist");
     check(dev->CreateComputeShader(carve_blob->GetBufferPointer(), carve_blob->GetBufferSize(), nullptr, &cs_carve),
           "cs_carve");
     check(dev->CreateComputeShader(ingest_blob->GetBufferPointer(), ingest_blob->GetBufferSize(), nullptr,
@@ -310,6 +361,8 @@ int main(int argc, char** argv) {
           "cs_ingest");
     check(dev->CreateComputeShader(args_blob->GetBufferPointer(), args_blob->GetBufferSize(), nullptr, &cs_args),
           "cs_args");
+    check(dev->CreateComputeShader(hist_blob->GetBufferPointer(), hist_blob->GetBufferSize(), nullptr, &cs_hist),
+          "cs_height_hist");
     check(dev->CreateVertexShader(vsp_blob->GetBufferPointer(), vsp_blob->GetBufferSize(), nullptr, &vs_points),
           "vs_points");
     check(dev->CreateVertexShader(vsl_blob->GetBufferPointer(), vsl_blob->GetBufferSize(), nullptr, &vs_lines),
@@ -342,6 +395,22 @@ int main(int argc, char** argv) {
         check(dev->CreateTexture2D(&d, nullptr, &color_tex), "color tex");
         check(dev->CreateShaderResourceView(color_tex.Get(), nullptr, &color_srv), "color srv");
     }
+    // Per-pixel nearest observed distance over the 3x3 neighborhood, for carving.
+    ComPtr<ID3D11Texture2D> min_dist_tex;
+    ComPtr<ID3D11ShaderResourceView> min_dist_srv;
+    ComPtr<ID3D11UnorderedAccessView> min_dist_uav;
+    {
+        D3D11_TEXTURE2D_DESC d{};
+        d.Width = kMaxWidth;
+        d.Height = kMaxHeight;
+        d.MipLevels = d.ArraySize = 1;
+        d.SampleDesc.Count = 1;
+        d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+        d.Format = DXGI_FORMAT_R32_FLOAT;
+        check(dev->CreateTexture2D(&d, nullptr, &min_dist_tex), "min dist tex");
+        check(dev->CreateShaderResourceView(min_dist_tex.Get(), nullptr, &min_dist_srv), "min dist srv");
+        check(dev->CreateUnorderedAccessView(min_dist_tex.Get(), nullptr, &min_dist_uav), "min dist uav");
+    }
 
     PointCloud cloud;
     if (!cloud.create(dev, opt.capacity, opt.table_bits != 0 ? opt.table_bits : table_bits_for(opt.capacity))) {
@@ -367,10 +436,10 @@ int main(int argc, char** argv) {
         ctx->CSSetUnorderedAccessViews(0, 5, uavs, nullptr);
     };
     auto unbind_compute = [&]() {
-        ID3D11ShaderResourceView* null_srvs[2] = {};
-        ID3D11UnorderedAccessView* null_uavs[5] = {};
-        ctx->CSSetShaderResources(0, 2, null_srvs);
-        ctx->CSSetUnorderedAccessViews(0, 5, null_uavs, nullptr);
+        ID3D11ShaderResourceView* null_srvs[3] = {};
+        ID3D11UnorderedAccessView* null_uavs[6] = {};
+        ctx->CSSetShaderResources(0, 3, null_srvs);
+        ctx->CSSetUnorderedAccessViews(0, 6, null_uavs, nullptr);
     };
     auto update_args = [&]() {
         ctx->CSSetShader(cs_args.Get(), nullptr, 0);
@@ -379,6 +448,21 @@ int main(int argc, char** argv) {
         ctx->Dispatch(1, 1, 1);
         unbind_compute();
     };
+
+    // Point quads, one batch's worth: 4 vertices each, drawn as two triangles. The draw repeats it
+    // (one instance per batch) and the vertex shader finds the point from the instance and vertex ids.
+    ComPtr<ID3D11Buffer> quad_ib;
+    {
+        std::vector<uint16_t> idx(size_t(shaders::kQuadsPerBatch) * 6);
+        for (uint32_t q = 0; q < shaders::kQuadsPerBatch; ++q) {
+            const uint16_t b = uint16_t(q * 4);
+            const uint16_t tri[6] = {b, uint16_t(b + 1), uint16_t(b + 2), b, uint16_t(b + 2), uint16_t(b + 3)};
+            std::memcpy(&idx[q * 6], tri, sizeof(tri));
+        }
+        D3D11_BUFFER_DESC d{UINT(idx.size() * sizeof(uint16_t)), D3D11_USAGE_IMMUTABLE, D3D11_BIND_INDEX_BUFFER};
+        D3D11_SUBRESOURCE_DATA init{idx.data()};
+        check(dev->CreateBuffer(&d, &init, &quad_ib), "quad ib");
+    }
 
     constexpr UINT kMaxLineVerts = 65536;
     ComPtr<ID3D11Buffer> line_vb;
@@ -430,8 +514,35 @@ int main(int argc, char** argv) {
     }
     int stat_frame = 0, stat_fresh_from = 0;   // copies made before stat_fresh_from predate a clear
     uint32_t point_count = 0, free_count = 0;  // slots ever allocated, slots freed by carving
-    float cloud_low = 0, cloud_high = 0;       // the cloud's height extremes (valid if have_bounds)
+
+    // Height histogram for the automatic color range, a few times a second, read back without
+    // stalling. Coloring over the 1st to 99th percentile keeps a few stray points (sky, far
+    // geometry) from squashing everything else into one end of the ramp.
+    constexpr UINT kHistBytes = (2 + shaders::kHistBins) * 4;
+    ComPtr<ID3D11Buffer> hist_buf, hist_stage;
+    ComPtr<ID3D11UnorderedAccessView> hist_uav;
+    auto hist_cb = make_cbuffer<HistCB>(dev);
+    {
+        D3D11_BUFFER_DESC d{kHistBytes, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS, 0,
+                            D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS};
+        check(dev->CreateBuffer(&d, nullptr, &hist_buf), "hist");
+        D3D11_UNORDERED_ACCESS_VIEW_DESC u{DXGI_FORMAT_R32_TYPELESS, D3D11_UAV_DIMENSION_BUFFER};
+        u.Buffer.NumElements = kHistBytes / 4;
+        u.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+        check(dev->CreateUnorderedAccessView(hist_buf.Get(), &u, &hist_uav), "hist uav");
+        d = {kHistBytes, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ};
+        check(dev->CreateBuffer(&d, nullptr, &hist_stage), "hist staging");
+    }
+    bool hist_pending = false;       // a copy in hist_stage waiting to be read
+    float hist_lo = 0, hist_hi = 0;  // the bins of the pending histogram
+    double hist_timer = 0;
+    float cloud_low = 0, cloud_high = 0;  // the cloud's height extremes, as shown (valid if have_bounds)
+    float range_low = 0, range_high = 0;  // its 1st and 99th percentile heights (the auto color range)
     bool have_bounds = false;
+
+    // Marks: 0 capture (carve + ingest) 1 ... 2 point draw 3.
+    GpuTimer gpu_timer;
+    gpu_timer.create(dev);
 
     RingReader ring;
     Frame frame;
@@ -459,6 +570,8 @@ int main(int argc, char** argv) {
         trail.clear();
         point_count = free_count = 0;
         have_bounds = false;
+        hist_pending = false;  // counts the old points
+        hist_timer = 1e9;      // measure the new ones right away
         stat_fresh_from = stat_frame + kStatStages;
     };
     // Rebuilds the pool with the panel's voxel size and capacity. If the GPU can't allocate that
@@ -501,6 +614,7 @@ int main(int argc, char** argv) {
         const float dt = float(std::min(t - last, 0.1));
         last = t;
 
+        gpu_timer.begin(ctx);
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
@@ -517,7 +631,7 @@ int main(int argc, char** argv) {
         }
         if (app.key_pressed('H')) color_mode ^= 1;
         if (app.key_pressed('T')) show_trail = !show_trail;
-        if (app.key_pressed('X')) carve = !carve;
+        if (app.key_pressed('M')) carve = !carve;
         if (app.key_pressed(VK_SPACE)) paused = !paused;
         if (app.key_pressed(VK_OEM_PLUS) || app.key_pressed(VK_ADD)) point_size = std::min(point_size + 1, 16.0f);
         if (app.key_pressed(VK_OEM_MINUS) || app.key_pressed(VK_SUBTRACT))
@@ -544,6 +658,10 @@ int main(int argc, char** argv) {
             if (cs != 0) clear_cloud();
             seen_clear = cs;
         }
+        // Carving is a pass over the whole pool, so it runs for one frame per viewer frame at most:
+        // when the viewer falls behind, a backlog of frames doesn't multiply its cost.
+        bool carved = false;
+        gpu_timer.mark(ctx, 0);
         for (uint32_t i = 0; i < kSlotCount && ring.is_open() && ring.read_next(frame); ++i) {
             const FrameHeader& h = frame.header;
             if (h.flags & kFlagPaused) continue;
@@ -597,19 +715,28 @@ int main(int argc, char** argv) {
             ID3D11ShaderResourceView* srvs[2] = {depth_srv.Get(), color_srv.Get()};
             ctx->CSSetConstantBuffers(0, 1, frame_cb.GetAddressOf());
             ctx->CSSetShaderResources(0, 2, srvs);
-            bind_uavs(false);
             // Carve first, so this frame's own points aren't tested against itself
             // and freed slots can be reused right away.
-            if (carve) {
+            if (carve && !carved) {
+                carved = true;
+                ctx->CSSetShader(cs_min_dist.Get(), nullptr, 0);
+                ctx->CSSetUnorderedAccessViews(5, 1, min_dist_uav.GetAddressOf(), nullptr);
+                ctx->Dispatch((h.width + 7) / 8, (h.height + 7) / 8, 1);
+                ID3D11UnorderedAccessView* null_uav = nullptr;
+                ctx->CSSetUnorderedAccessViews(5, 1, &null_uav, nullptr);
+                ctx->CSSetShaderResources(2, 1, min_dist_srv.GetAddressOf());
+                bind_uavs(false);
                 ctx->CSSetShader(cs_carve.Get(), nullptr, 0);
-                ctx->DispatchIndirect(cloud.args.Get(), 16);
+                ctx->DispatchIndirect(cloud.args.Get(), 20);
             }
+            bind_uavs(false);
             ctx->CSSetShader(cs_ingest.Get(), nullptr, 0);
             ctx->Dispatch((h.width + 7) / 8, (h.height + 7) / 8, 1);
             unbind_compute();
             update_args();
             ++ingested;
         }
+        gpu_timer.mark(ctx, 1);
 
         // Stats readback (a couple of frames late, never stalls).
         ctx->CopyResource(stat_stage[stat_frame % kStatStages].Get(), cloud.counter.Get());
@@ -620,11 +747,6 @@ int main(int argc, char** argv) {
                 const uint32_t* c = static_cast<const uint32_t*>(m.pData);
                 point_count = c[0];
                 free_count = c[1];
-                have_bounds = c[3] != 0;
-                if (have_bounds) {
-                    cloud_low = height_from_key(~c[2]);
-                    cloud_high = height_from_key(c[3]);
-                }
                 ctx->Unmap(s, 0);
             }
         }
@@ -643,6 +765,8 @@ int main(int argc, char** argv) {
             std::snprintf(overlay, sizeof(overlay), "%.2fM / %.1fM points%s", live / 1e6, cloud.capacity / 1e6,
                           full ? " (FULL)" : "");
             ImGui::ProgressBar(float(used) / float(cloud.capacity), ImVec2(-FLT_MIN, 0), overlay);
+            ImGui::TextDisabled("%.0f fps, GPU: capture %.2f ms, points %.2f ms", fps, gpu_timer.ms[0],
+                                gpu_timer.ms[2]);
             if (ImGui::Button("Clear points (C)")) clear_cloud();
             ImGui::SameLine();
             if (ImGui::Button("Save .ply (P)")) save_ply(dev, ctx, cloud, opt.out.empty() ? default_scan_path() : opt.out);
@@ -676,7 +800,7 @@ int main(int argc, char** argv) {
             ImGui::SliderFloat("Max range (m)", &opt.max_range, 10, 20000, "%.0f", ImGuiSliderFlags_Logarithmic);
             ImGui::SetNextItemWidth(160);
             ImGui::SliderFloat("Near cut (m)", &opt.near_cut, 0, 10, "%.2f");
-            ImGui::Checkbox("Carve out moved things (X)", &carve);
+            ImGui::Checkbox("Carve out moved things (M)", &carve);
             if (carve) {
                 ImGui::SetNextItemWidth(160);
                 ImGui::SliderFloat("Carve margin (m)", &opt.carve_margin, 0.01f, 5, "%.2f", ImGuiSliderFlags_Logarithmic);
@@ -691,7 +815,8 @@ int main(int argc, char** argv) {
             ImGui::Checkbox("Height range from the cloud", &auto_height);
             if (auto_height) {
                 if (have_bounds)
-                    ImGui::TextDisabled("lowest %.1f m, highest %.1f m", cloud_low, cloud_high);
+                    ImGui::TextDisabled("coloring %.1f to %.1f m (lowest %.1f, highest %.1f)", range_low,
+                                        range_high, cloud_low, cloud_high);
                 else
                     ImGui::TextDisabled("(no points yet)");
             } else {
@@ -699,8 +824,8 @@ int main(int argc, char** argv) {
                 ImGui::DragFloatRange2("Height range (m)", &opt.height_min, &opt.height_max, 0.5f, -100000, 100000,
                                        "%.1f", "%.1f");
                 if (have_bounds && ImGui::Button("Set to the cloud's")) {
-                    opt.height_min = cloud_low;
-                    opt.height_max = cloud_high;
+                    opt.height_min = range_low;
+                    opt.height_max = range_high;
                 }
             }
 
@@ -713,21 +838,21 @@ int main(int argc, char** argv) {
             ImGui::SameLine();
             if (ImGui::Checkbox("Attach to camera (V)", &attach) && attach) follow = false;
             if (follow) attach = false;
-            ImGui::TextDisabled("Right-drag look, WASD move, Q/E down/up, Shift fast, wheel speed");
-            ImGui::TextDisabled("Arrows tilt the view, L levels it (display only)");
+            ImGui::TextDisabled("Right-drag look, WASD/arrows move, Q/E down/up, Shift fast, wheel speed");
+            ImGui::TextDisabled("Z/X roll, PgUp/PgDn tilt the view, L levels it (display only)");
             ImGui::End();
         }
 
-        // Tilt: the arrows tilt about world X and Z, Shift faster, L levels. Display only (.ply files
+        // Tilt: PgUp/PgDn tilt about world X, Z/X roll about world Z, Shift faster, L levels. Display only (.ply files
         // keep the capture's frame). It pivots about where the player was when it left level, so the
         // scene doesn't swing away.
         {
             const bool was_level = tilt_x == 0 && tilt_z == 0;
             const float rate = (app.key_down(VK_SHIFT) ? 40.0f : 10.0f) * dt;
-            if (app.key_down(VK_UP)) tilt_x += rate;
-            if (app.key_down(VK_DOWN)) tilt_x -= rate;
-            if (app.key_down(VK_LEFT)) tilt_z += rate;
-            if (app.key_down(VK_RIGHT)) tilt_z -= rate;
+            if (app.key_down(VK_PRIOR)) tilt_x += rate;
+            if (app.key_down(VK_NEXT)) tilt_x -= rate;
+            if (app.key_down('Z')) tilt_z += rate;
+            if (app.key_down('X')) tilt_z -= rate;
             // No limit: a capture can come in on its side or upside down. Just keep the angles in range.
             tilt_x = std::remainder(tilt_x, 360.0f);
             tilt_z = std::remainder(tilt_z, 360.0f);
@@ -792,10 +917,10 @@ int main(int argc, char** argv) {
             const float f[3] = {std::sin(cam_yaw) * cp, std::sin(cam_pitch), std::cos(cam_yaw) * cp};
             const float r[3] = {std::cos(cam_yaw), 0, -std::sin(cam_yaw)};
             for (int k = 0; k < 3; ++k) {
-                if (app.key_down('W')) cam_pos[k] += f[k] * speed;
-                if (app.key_down('S')) cam_pos[k] -= f[k] * speed;
-                if (app.key_down('D')) cam_pos[k] += r[k] * speed;
-                if (app.key_down('A')) cam_pos[k] -= r[k] * speed;
+                if (app.key_down('W') || app.key_down(VK_UP)) cam_pos[k] += f[k] * speed;
+                if (app.key_down('S') || app.key_down(VK_DOWN)) cam_pos[k] -= f[k] * speed;
+                if (app.key_down('D') || app.key_down(VK_RIGHT)) cam_pos[k] += r[k] * speed;
+                if (app.key_down('A') || app.key_down(VK_LEFT)) cam_pos[k] -= r[k] * speed;
             }
             if (app.key_down('E')) cam_pos[1] += speed;
             if (app.key_down('Q')) cam_pos[1] -= speed;
@@ -821,10 +946,74 @@ int main(int argc, char** argv) {
         dcb.px_to_ndc[1] = 2.0f / float(app.height);
         dcb.point_size = point_size;
         dcb.color_mode = color_mode;
-        dcb.height_min = auto_height && have_bounds ? cloud_low : opt.height_min;
-        dcb.height_max = auto_height && have_bounds ? cloud_high : opt.height_max;
+        dcb.capacity = cloud.capacity;
+        dcb.height_min = auto_height && have_bounds ? range_low : opt.height_min;
+        dcb.height_max = auto_height && have_bounds ? range_high : opt.height_max;
         if (!(dcb.height_max - dcb.height_min > 0.01f)) dcb.height_max = dcb.height_min + 0.01f;  // flat cloud
         upload(ctx, draw_cb.Get(), dcb);
+
+        // Auto color range: read the last height histogram if it's done, then start the next one.
+        if (hist_pending) {
+            D3D11_MAPPED_SUBRESOURCE m;
+            if (ctx->Map(hist_stage.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m) == S_OK) {
+                const uint32_t* h = static_cast<const uint32_t*>(m.pData);
+                const uint32_t* bins = h + 2;
+                hist_pending = false;
+                have_bounds = h[1] != 0;
+                if (have_bounds) {
+                    cloud_low = height_from_key(~h[0]);
+                    cloud_high = height_from_key(h[1]);
+                    range_low = cloud_low, range_high = cloud_high;
+                    if (hist_hi > hist_lo) {
+                        uint64_t total = 0;
+                        for (uint32_t i = 0; i < shaders::kHistBins; ++i) total += bins[i];
+                        const float bin_size = (hist_hi - hist_lo) / float(shaders::kHistBins);
+                        // The height below which a fraction q of the points lie, interpolated in its bin.
+                        auto percentile = [&](double q) {
+                            const double target = q * double(total);
+                            double below = 0;
+                            for (uint32_t i = 0; i < shaders::kHistBins; ++i) {
+                                if (below + bins[i] >= target && bins[i] > 0)
+                                    return hist_lo + (float(i) + float((target - below) / bins[i])) * bin_size;
+                                below += bins[i];
+                            }
+                            return hist_hi;
+                        };
+                        range_low = std::clamp(percentile(0.01), cloud_low, cloud_high);
+                        range_high = std::clamp(percentile(0.99), cloud_low, cloud_high);
+                    } else {
+                        hist_timer = 1e9;  // that one only found the extremes: bin over them next
+                    }
+                }
+                ctx->Unmap(hist_stage.Get(), 0);
+            }
+        }
+        hist_timer += dt;
+        if (!hist_pending && hist_timer > 0.25) {
+            hist_timer = 0;
+            // Bin over the extremes last measured. The tilt or new points can move them; the next
+            // histogram catches up.
+            hist_lo = have_bounds ? cloud_low : 0;
+            hist_hi = have_bounds ? cloud_high : 0;
+            HistCB hcb{};
+            std::memcpy(hcb.height_axis, dcb.height_axis, sizeof(hcb.height_axis));
+            hcb.lo = hist_lo;
+            hcb.hi = hist_hi;
+            hcb.capacity = cloud.capacity;
+            hcb.bins = shaders::kHistBins;
+            upload(ctx, hist_cb.Get(), hcb);
+            const UINT zero[4] = {};
+            ctx->ClearUnorderedAccessViewUint(hist_uav.Get(), zero);
+            ID3D11UnorderedAccessView* uavs[2] = {hist_uav.Get(), cloud.counter_uav.Get()};
+            ctx->CSSetShader(cs_hist.Get(), nullptr, 0);
+            ctx->CSSetConstantBuffers(0, 1, hist_cb.GetAddressOf());
+            ctx->CSSetShaderResources(0, 1, cloud.points_srv.GetAddressOf());
+            ctx->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
+            ctx->DispatchIndirect(cloud.args.Get(), 20);  // one thread per slot, like carving
+            unbind_compute();
+            ctx->CopyResource(hist_stage.Get(), hist_buf.Get());
+            hist_pending = true;
+        }
 
         // Lines: player frustum + trail.
         std::vector<LineVertex> lines;
@@ -874,13 +1063,17 @@ int main(int argc, char** argv) {
         ctx->VSSetConstantBuffers(0, 1, draw_cb.GetAddressOf());
         ctx->PSSetShader(ps.Get(), nullptr, 0);
 
+        gpu_timer.mark(ctx, 2);
         ctx->IASetInputLayout(nullptr);
+        ctx->IASetIndexBuffer(quad_ib.Get(), DXGI_FORMAT_R16_UINT, 0);
         ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ctx->VSSetShader(vs_points.Get(), nullptr, 0);
-        ctx->VSSetShaderResources(0, 1, cloud.points_srv.GetAddressOf());
-        ctx->DrawInstancedIndirect(cloud.args.Get(), 0);
-        ID3D11ShaderResourceView* null_srv = nullptr;
-        ctx->VSSetShaderResources(0, 1, &null_srv);
+        ID3D11ShaderResourceView* point_srvs[2] = {cloud.points_srv.Get(), cloud.counter_srv.Get()};
+        ctx->VSSetShaderResources(0, 2, point_srvs);
+        ctx->DrawIndexedInstancedIndirect(cloud.args.Get(), 0);
+        ID3D11ShaderResourceView* null_srvs[2] = {};
+        ctx->VSSetShaderResources(0, 2, null_srvs);
+        gpu_timer.mark(ctx, 3);
 
         if (!lines.empty()) {
             D3D11_MAPPED_SUBRESOURCE m;
@@ -897,6 +1090,7 @@ int main(int argc, char** argv) {
         ImGui::Render();
         ctx->OMSetRenderTargets(1, app.back_rtv.GetAddressOf(), nullptr);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        gpu_timer.end(ctx);
         app.present(true);
 
         ++fps_frames;
