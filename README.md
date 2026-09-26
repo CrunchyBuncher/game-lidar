@@ -96,7 +96,7 @@ To uninstall, run the ReShade installer again and uninstall, then delete the add
 |---|---|
 | Right-drag | Look around |
 | WASD / Q E | Move / down, up (Shift: faster, wheel: base speed) |
-| `F` | Follow the player |
+| `F` | Follow the player (right-drag orbits around them, wheel zooms, `R` resets the view) |
 | `H` | Color by height / captured color (the game's scene colors, D3D9 and D3D11) |
 | `T` | Show the player's trail |
 | `M` | Toggle carving |

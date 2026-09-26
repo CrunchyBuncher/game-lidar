@@ -12,10 +12,14 @@ using namespace reshade::api;
 namespace lidar::depth {
 namespace {
 
+// What each render target 0 got in one depth pass. The scene's color is the one drawn into most: the
+// last one can be a later pass over part of the scene with the same depth (UE3's velocity buffer).
+using RtStats = std::vector<std::pair<uint64_t, DrawStats>>;
+
 struct DsFrameStats {
     DrawStats total;
     DrawStats segment;  // since the last depth clear
-    resource color{0};  // render target 0 at the last draw
+    RtStats segment_rts;  // the segment's draws by render target 0 (none bound: not counted)
     uint32_t clears = 0;  // depth clears so far: the current pass' number
     bool cleared = false;
     bool reversed_clear = false;
@@ -25,6 +29,19 @@ void add(DrawStats& d, const DrawStats& s) {
     d.vertices += s.vertices;
     d.drawcalls += s.drawcalls;
     d.drawcalls_indirect += s.drawcalls_indirect;
+}
+
+DrawStats& rt_stats(RtStats& rts, uint64_t rt) {
+    for (auto& [h, s] : rts)
+        if (h == rt) return s;
+    return rts.emplace_back(rt, DrawStats{}).second;
+}
+
+resource busiest_rt(const RtStats& rts) {
+    const std::pair<uint64_t, DrawStats>* best = nullptr;
+    for (const auto& e : rts)
+        if (best == nullptr || e.second.better_than(best->second)) best = &e;
+    return {best ? best->first : 0};
 }
 
 // Per command list / queue. The immediate D3D11 context is both, so it gets queue state.
@@ -41,11 +58,13 @@ struct __declspec(uuid("5b2f7a0e-3c1d-4e8a-9f61-0d7c2b4a8e15")) CmdState {
         for (const auto& [h, s] : src.stats) {
             DsFrameStats& d = stats[h];
             add(d.total, s.total);
-            if (s.cleared)
+            if (s.cleared) {
                 d.segment = s.segment;
-            else
+                d.segment_rts = s.segment_rts;
+            } else {
                 add(d.segment, s.segment);
-            if (s.color != 0) d.color = s.color;
+                for (const auto& [rt, rs] : s.segment_rts) add(rt_stats(d.segment_rts, rt), rs);
+            }
             d.clears += s.clears;
             d.cleared |= s.cleared;
             d.reversed_clear |= s.reversed_clear;
@@ -122,8 +141,9 @@ bool on_draw(command_list* cmd, uint32_t vertices, uint32_t instances, uint32_t,
     if (s.current_ds == 0) return false;
     const auto lock = lock_if_queue(s);
     DsFrameStats& st = s.stats[s.current_ds.handle];
-    st.color = s.current_rt;
-    for (DrawStats* d : {&st.total, &st.segment}) {
+    DrawStats* rt = s.current_rt != 0 ? &rt_stats(st.segment_rts, s.current_rt.handle) : nullptr;
+    for (DrawStats* d : {&st.total, &st.segment, rt}) {
+        if (d == nullptr) continue;
         d->vertices += vertices * instances;
         d->drawcalls += 1;
     }
@@ -138,8 +158,9 @@ bool on_draw_indirect(command_list* cmd, indirect_command type, resource, uint64
     if (s.current_ds == 0) return false;
     const auto lock = lock_if_queue(s);
     DsFrameStats& st = s.stats[s.current_ds.handle];
-    st.color = s.current_rt;
-    for (DrawStats* d : {&st.total, &st.segment}) {
+    DrawStats* rt = s.current_rt != 0 ? &rt_stats(st.segment_rts, s.current_rt.handle) : nullptr;
+    for (DrawStats* d : {&st.total, &st.segment, rt}) {
+        if (d == nullptr) continue;
         d->drawcalls += count;
         d->drawcalls_indirect += count;
     }
@@ -159,9 +180,10 @@ bool on_clear_depth_stencil(command_list* cmd, resource_view dsv, const float* d
         DsFrameStats& st = s.stats[ds.handle];
         if (*depth != 1.0f) st.reversed_clear = true;
         segment = st.segment;
-        color = st.color;
+        color = busiest_rt(st.segment_rts);
         pass = st.clears++;
         st.segment = {};
+        st.segment_rts.clear();
         st.cleared = true;
     }
     // Outside the lock: the hook captures, which takes the addon's own lock.
@@ -210,7 +232,7 @@ std::vector<Candidate> end_frame(device* dev, uint32_t frame_w, uint32_t frame_h
         c.desc = it->second;
         c.stats = s.total;
         c.last_segment = s.segment;
-        c.color = s.color;
+        c.color = busiest_rt(s.segment_rts);
         c.last_pass = s.clears;
         c.reversed_clear = s.reversed_clear;
         c.fits_frame = c.desc.texture.samples <= 1 &&

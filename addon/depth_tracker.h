@@ -25,7 +25,7 @@ struct Candidate {
     reshade::api::resource_desc desc;
     DrawStats stats;
     DrawStats last_segment;       // drawn since its last depth clear (or the frame's start)
-    reshade::api::resource color{0};  // render target 0 at the last draw into it (0: none)
+    reshade::api::resource color{0};  // the render target 0 last_segment drew into most (0: none)
     uint32_t last_pass = 0;       // that pass' number: depth clears before it (cam::PassKey)
     bool reversed_clear = false;  // cleared to something other than 1.0 this frame
     bool fits_frame = false;      // aspect ratio / size similar to the back buffer
@@ -40,7 +40,7 @@ void init_device(reshade::api::device* dev);
 // Called before a depth clear of a depth-stencil that was drawn into since its last one, on the
 // clearing thread: `segment` is what that pass drew, `pass` its number (cam::PassKey). Games that
 // reuse the scene depth-stencil for a later pass (UE3) only have the scene in it until that clear.
-// `color` is render target 0 at that pass' last draw (0: none). nullptr to stop.
+// `color` is the render target 0 that pass drew into most (0: none). nullptr to stop.
 using ClearHook = void (*)(reshade::api::command_list* cmd, reshade::api::resource ds, reshade::api::resource color,
                            const DrawStats& segment, uint32_t pass);
 void set_clear_hook(ClearHook hook);

@@ -9,7 +9,7 @@
 //                     [--color-update first|closest|latest]
 //                     [--size 1600x900] [--out file.ply] [--save-after s] [--exit-after s]
 // Keys:  right-drag look, WASD move, Q/E down/up, Shift fast, wheel speed,
-//        F follow player, V attach to the player's camera, H color mode, T trail,
+//        F follow player (right-drag orbits it, wheel zooms, R resets), V attach to the player's camera, H color mode, T trail,
 //        M carving, +/- point size, arrows tilt the view, L level it, C clear,
 //        P save .ply, Space pause ingest, F1 settings panel, Esc quit.
 // The settings panel changes voxel size, capacity, range, carving and colors while it runs.
@@ -560,6 +560,10 @@ int main(int argc, char** argv) {
     // Viewer camera: start above the level looking down at it.
     float cam_pos[3] = {0.0f, 45.0f, -75.0f};
     float cam_yaw = 0.0f, cam_pitch = -0.5f, cam_speed = 10.0f;
+    // Follow camera: orbits the player's camera, from behind their heading by default. Right-drag
+    // swings it around (yaw relative to the heading, so it still turns with them), the wheel zooms, R resets.
+    constexpr float kFollowDist = 8.94f, kFollowPitch = -0.46f;  // 8 m back and 4 m up, looking at them
+    float follow_yaw = 0.0f, follow_pitch = kFollowPitch, follow_dist = kFollowDist;
     float point_size = 2.0f;
     uint32_t color_mode = 0;
     bool follow = false, attach = false, show_trail = true, paused = false, saved = false, carve = opt.carve;
@@ -857,7 +861,10 @@ int main(int argc, char** argv) {
             ImGui::SameLine();
             if (ImGui::Checkbox("Attach to camera (V)", &attach) && attach) follow = false;
             if (follow) attach = false;
-            ImGui::TextDisabled("Right-drag look, WASD/arrows move, Q/E down/up, Shift fast, wheel speed");
+            if (follow)
+                ImGui::TextDisabled("Right-drag orbit the player, wheel zoom (%.1f m), R reset", follow_dist);
+            else
+                ImGui::TextDisabled("Right-drag look, WASD/arrows move, Q/E down/up, Shift fast, wheel speed");
             ImGui::TextDisabled("Z/X roll, PgUp/PgDn tilt the view, L levels it (display only)");
             ImGui::End();
         }
@@ -918,13 +925,22 @@ int main(int argc, char** argv) {
             XMFLOAT4X4 shown;  // the player's camera as displayed (tilted)
             XMStoreFloat4x4(&shown, XMLoadFloat4x4(&player_inv_view) * tilt);
             const XMFLOAT3 p{shown._41, shown._42, shown._43};
-            const float fx = shown._31, fz = shown._33;
-            const float len = std::max(std::sqrt(fx * fx + fz * fz), 1e-4f);
-            cam_pos[0] = p.x - fx / len * 8.0f;
-            cam_pos[1] = p.y + 4.0f;
-            cam_pos[2] = p.z - fz / len * 8.0f;
-            cam_yaw = std::atan2(fx, fz);
-            cam_pitch = -0.35f;
+            if (app.rmb_down()) {
+                follow_yaw = std::remainder(follow_yaw + app.mouse_dx * 0.003f, XM_2PI);
+                follow_pitch = std::clamp(follow_pitch - app.mouse_dy * 0.003f, -1.55f, 1.55f);
+            }
+            follow_dist = std::clamp(follow_dist * std::pow(1.0f / 1.2f, app.wheel), 0.5f, 2000.0f);
+            if (app.key_pressed('R')) {
+                follow_yaw = 0;
+                follow_pitch = kFollowPitch;
+                follow_dist = kFollowDist;
+            }
+            cam_yaw = std::atan2(shown._31, shown._33) + follow_yaw;
+            cam_pitch = follow_pitch;
+            const float cp = std::cos(cam_pitch);
+            cam_pos[0] = p.x - std::sin(cam_yaw) * cp * follow_dist;
+            cam_pos[1] = p.y - std::sin(cam_pitch) * follow_dist;
+            cam_pos[2] = p.z - std::cos(cam_yaw) * cp * follow_dist;
         } else {
             if (app.rmb_down()) {
                 cam_yaw += app.mouse_dx * 0.003f;
