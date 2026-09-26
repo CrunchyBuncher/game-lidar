@@ -19,8 +19,9 @@ public:
     bool init(reshade::api::device* dev);
     void release();
 
-    bool capture(reshade::api::command_queue* queue, reshade::api::resource depth, uint32_t capture_width,
-                 const FrameHeader& header) override;
+    // Depth only: `color` is ignored for now.
+    bool capture(reshade::api::command_queue* queue, reshade::api::resource depth, reshade::api::resource color,
+                 uint32_t capture_width, const FrameHeader& header) override;
     void publish(reshade::api::command_queue* queue, RingWriter& ring) override;
 
     // Tracks depth-stencil states on D3D12 devices (see above).

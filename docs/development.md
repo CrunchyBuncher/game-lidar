@@ -19,6 +19,10 @@ a downsampled depth image plus the camera's view and projection matrices.
   scene depth at present (heuristics after ReShade's generic_depth). A `DepthCapture` copies it,
   point-samples it down to the capture size with a compute shader and reads it back through a
   ring of staging buffers, without stalling the game.
+- **Color:** the tracker also remembers the render target bound at the last draw into each
+  depth-stencil. D3D9 and D3D11 sample it at the same pixels and moment as depth (so before the
+  HUD, in games that draw it elsewhere), if it's the depth buffer's size; HDR values are clamped,
+  not tone-mapped. The overlay says why a frame has no color. Voxels keep their first color.
 - **Camera path:** `camera_tracker` latches the profile's constant-buffer window at the draws into
   each depth-stencil. The bytes come from a `CbufferSource`. At present, the latch for the captured
   depth-stencil becomes the frame's pose. Without a profile, frames go out camera-relative with a

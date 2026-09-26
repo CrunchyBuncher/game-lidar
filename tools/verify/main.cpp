@@ -90,7 +90,8 @@ int verify_ring(int frames_wanted, float tol) {
 // Both fake_games are frozen at the same camera, so the addon's depth must match the reference
 // pixel for pixel. Frames with a pose (the addon's camera sniffer) are unprojected with their own
 // matrices, which must also match the reference's. Pose-less frames borrow the reference's view,
-// so the addon's fallback projection is what gets checked.
+// so the addon's fallback projection is what gets checked. Color, where both frames have it, must
+// match within a few steps per channel (rasterization differs slightly between APIs).
 int verify_addon(int frames_wanted, float tol, float depth_tol) {
     RingReader ref_ring, ring;
     Frame ref, f;
@@ -112,6 +113,9 @@ int verify_addon(int frames_wanted, float tol, float depth_tol) {
     float max_diff = 0, view_diff = 0;
     size_t differ = 0, mismatched = 0, compared = 0;
     int with_pose = 0;
+    int with_color = 0;
+    size_t color_compared = 0, color_off = 0;  // off: a channel more than kColorTol steps away
+    constexpr int kColorTol = 8;
     while (frames < frames_wanted && GetTickCount64() < deadline) {
         if (!ring.is_open() && !ring.try_open()) {
             Sleep(100);
@@ -134,6 +138,16 @@ int verify_addon(int frames_wanted, float tol, float depth_tol) {
             differ += d != 0;
             mismatched += d > depth_tol;
             ++compared;
+        }
+        if ((f.header.flags & kFlagHasColor) && (ref.header.flags & kFlagHasColor)) {
+            ++with_color;
+            for (size_t i = 0; i < size_t(f.header.width) * f.header.height; ++i) {
+                bool off = false;
+                for (int c = 0; c < 24; c += 8)
+                    off |= std::abs(int((f.color[i] >> c) & 0xFF) - int((ref.color[i] >> c) & 0xFF)) > kColorTol;
+                color_off += off;
+                ++color_compared;
+            }
         }
         if (f.header.flags & kFlagPoseValid) {
             ++with_pose;
@@ -165,7 +179,14 @@ int verify_addon(int frames_wanted, float tol, float depth_tol) {
     std::printf("frames with the addon's pose: %d of %d", with_pose, frames);
     if (with_pose > 0) std::printf(", view vs reference: max |diff| %.3g", view_diff);
     std::printf("\n");
-    return report(err, tol) != 0 || mismatched != 0 ? 1 : 0;
+    const bool color_bad = color_off * 100 > color_compared;  // more than 1% of pixels
+    if (with_color > 0)
+        std::printf("frames with color: %d of %d, %zu of %zu pixels off by more than %d steps%s\n", with_color, frames,
+                    color_off, color_compared, kColorTol, color_bad ? " (over 1%: FAIL)" : "");
+    else
+        std::printf("frames with color: 0 of %d%s\n", frames,
+                    ref.header.flags & kFlagHasColor ? "" : " (the reference has no color either)");
+    return report(err, tol) != 0 || mismatched != 0 || color_bad ? 1 : 0;
 }
 
 int verify_ply(const char* path, float tol) {

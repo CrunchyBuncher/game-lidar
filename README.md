@@ -83,7 +83,7 @@ per-object world·view·proj matrices. The profile format is described in
 
 ### Settings
 Everything is in the LiDAR tab, and saved under `[LIDAR]` in the game's `ReShade.ini`
-(`Enabled`, `CaptureWidth`, `Profile`, `FovY`, `Near`, `Far`, `DepthMode`). For unattended
+(`Enabled`, `Color`, `CaptureWidth`, `Profile`, `FovY`, `Near`, `Far`, `DepthMode`). For unattended
 discovery there are `DiscoveryAutoStart=1`, `DiscoveryAutoSave=<seconds>` and `DiscoverySamples`.
 Only edit the ini while the game is closed: ReShade rewrites it from memory.
 
@@ -95,7 +95,7 @@ To uninstall, run the ReShade installer again and uninstall, then delete the add
 | Right-drag | Look around |
 | WASD / Q E | Move / down, up (Shift: faster, wheel: base speed) |
 | `F` | Follow the player |
-| `H` | Color by height / captured color |
+| `H` | Color by height / captured color (the game's scene colors, D3D9 and D3D11) |
 | `T` | Show the player's trail |
 | `X` | Toggle carving |
 | `+` / `-` | Point size |

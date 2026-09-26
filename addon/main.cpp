@@ -62,6 +62,7 @@ enum class DepthMode : int { Standard = 0, Reversed = 1, ReversedInfinite = 2 };
 
 struct Settings {
     bool enabled = true;
+    bool color = true;  // also capture the scene's color, where the backend can
     int capture_width = 480;
     std::string profile = kDefaultProfile;  // relative to the game's folder
     // Fallback projection for frames without a camera pose. Defaults match fake_game.
@@ -81,6 +82,7 @@ struct Settings {
         reshade::get_config_value(nullptr, kSection, "DiscoverySamples", discovery_samples);
         discovery_samples = std::clamp(discovery_samples, 4, 512);
         reshade::get_config_value(nullptr, kSection, "Enabled", enabled);
+        reshade::get_config_value(nullptr, kSection, "Color", color);
         reshade::get_config_value(nullptr, kSection, "CaptureWidth", capture_width);
         char buf[1024];
         size_t n = sizeof(buf);
@@ -92,6 +94,7 @@ struct Settings {
     }
     void save() const {
         reshade::set_config_value(nullptr, kSection, "Enabled", enabled);
+        reshade::set_config_value(nullptr, kSection, "Color", color);
         reshade::set_config_value(nullptr, kSection, "CaptureWidth", capture_width);
         reshade::set_config_value(nullptr, kSection, "Profile", profile.c_str());
         reshade::set_config_value(nullptr, kSection, "FovY", fov_y_deg);
@@ -462,7 +465,7 @@ const char* api_name(device_api api) {
 }
 
 void register_active_handlers();  // below, next to the handlers it registers
-void on_depth_clear(command_list* cmd, resource ds, const depth::DrawStats& pass, uint32_t pass_index);
+void on_depth_clear(command_list* cmd, resource ds, resource color, const depth::DrawStats& pass, uint32_t pass_index);
 
 // Until a supported device shows up, the addon's only handler is init_device. Registering an
 // event can change how ReShade hooks the game (on D3D9, map events wrap every buffer Lock), so on
@@ -529,14 +532,14 @@ void on_init_device(device* dev) {
 
 // Before a depth clear: if it's the captured depth-stencil and this pass is its busiest so far this
 // frame, snapshot it (the frame's final contents may be a later pass that isn't the scene).
-void on_depth_clear(command_list* cmd, resource ds, const depth::DrawStats& pass, uint32_t pass_index) {
+void on_depth_clear(command_list* cmd, resource ds, resource color, const depth::DrawStats& pass, uint32_t pass_index) {
     const std::lock_guard lock(g_mutex);
     if (cmd->get_device() != g_device || g_capture == nullptr || !g_init_error.empty() || !g_settings.enabled ||
         ds.handle != g_selected)
         return;
     if (g_snapshot.ds == ds.handle && !pass.better_than(g_snapshot.pass)) return;
     const watchdog::Step step("depth clear: snapshot");
-    if (g_capture->snapshot(ds, uint32_t(g_settings.capture_width))) g_snapshot = {ds.handle, pass, pass_index};
+    if (g_capture->snapshot(ds, g_settings.color ? color : resource{0}, uint32_t(g_settings.capture_width))) g_snapshot = {ds.handle, pass, pass_index};
 }
 
 void on_destroy_device(device* dev) {
@@ -614,7 +617,8 @@ void on_present(command_queue* queue, swapchain* sc, const rect*, const rect*, u
         // With a camera, a frame it couldn't pose is dropped: the viewer would take it as camera-relative
         // and start over. Without one, unposed frames are all there is (a live view).
         if (posed || active_camera() == nullptr) {
-            g_capture->capture(queue, pick->resource, uint32_t(g_settings.capture_width), h);
+            g_capture->capture(queue, pick->resource, g_settings.color ? pick->color : resource{0},
+                               uint32_t(g_settings.capture_width), h);
             g_snapshot_used = use_snapshot ? std::optional(snapshot) : std::nullopt;
         } else {
             g_capture->drop_snapshot();
@@ -968,6 +972,14 @@ void draw_overlay(effect_runtime*) {
                 static_cast<unsigned long long>(g_capture->published()), g_capture->width(), g_capture->height(),
                 static_cast<unsigned long long>(g_capture->skipped()));
     changed |= ImGui::SliderInt("Capture width", &g_settings.capture_width, 64, int(kMaxWidth));
+    changed |= ImGui::Checkbox("Color", &g_settings.color);
+    ImGui::SameLine();
+    if (!g_settings.color)
+        ImGui::TextDisabled("(off: the viewer colors by height)");
+    else if (g_capture->color_note().empty())
+        ImGui::TextDisabled("(the scene's render target, sampled with depth)");
+    else
+        ImGui::TextColored(ImVec4(1, 0.8f, 0.2f, 1), "none: %s", g_capture->color_note().c_str());
 
     changed |= draw_camera_section();
     draw_discovery_section();

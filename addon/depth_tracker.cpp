@@ -15,6 +15,7 @@ namespace {
 struct DsFrameStats {
     DrawStats total;
     DrawStats segment;  // since the last depth clear
+    resource color{0};  // render target 0 at the last draw
     uint32_t clears = 0;  // depth clears so far: the current pass' number
     bool cleared = false;
     bool reversed_clear = false;
@@ -31,10 +32,12 @@ struct __declspec(uuid("5b2f7a0e-3c1d-4e8a-9f61-0d7c2b4a8e15")) CmdState {
     explicit CmdState(bool queue) : is_queue(queue) {}
     const bool is_queue;
     resource current_ds{0};
+    resource current_rt{0};  // render target 0
     std::unordered_map<uint64_t, DsFrameStats> stats;
 
     void merge(const CmdState& src) {
         current_ds = src.current_ds;
+        current_rt = src.current_rt;
         for (const auto& [h, s] : src.stats) {
             DsFrameStats& d = stats[h];
             add(d.total, s.total);
@@ -42,6 +45,7 @@ struct __declspec(uuid("5b2f7a0e-3c1d-4e8a-9f61-0d7c2b4a8e15")) CmdState {
                 d.segment = s.segment;
             else
                 add(d.segment, s.segment);
+            if (s.color != 0) d.color = s.color;
             d.clears += s.clears;
             d.cleared |= s.cleared;
             d.reversed_clear |= s.reversed_clear;
@@ -106,9 +110,11 @@ void on_destroy_resource(device* dev, resource res) {
     dd->depth_stencils.erase(res.handle);
 }
 
-void on_bind_depth_stencil(command_list* cmd, uint32_t, const resource_view*, resource_view dsv) {
+void on_bind_depth_stencil(command_list* cmd, uint32_t count, const resource_view* rtvs, resource_view dsv) {
     auto& s = *cmd->get_private_data<CmdState>();
-    s.current_ds = dsv != 0 ? cmd->get_device()->get_resource_from_view(dsv) : resource{0};
+    device* const dev = cmd->get_device();
+    s.current_ds = dsv != 0 ? dev->get_resource_from_view(dsv) : resource{0};
+    s.current_rt = count > 0 && rtvs[0] != 0 ? dev->get_resource_from_view(rtvs[0]) : resource{0};
 }
 
 bool on_draw(command_list* cmd, uint32_t vertices, uint32_t instances, uint32_t, uint32_t) {
@@ -116,6 +122,7 @@ bool on_draw(command_list* cmd, uint32_t vertices, uint32_t instances, uint32_t,
     if (s.current_ds == 0) return false;
     const auto lock = lock_if_queue(s);
     DsFrameStats& st = s.stats[s.current_ds.handle];
+    st.color = s.current_rt;
     for (DrawStats* d : {&st.total, &st.segment}) {
         d->vertices += vertices * instances;
         d->drawcalls += 1;
@@ -131,6 +138,7 @@ bool on_draw_indirect(command_list* cmd, indirect_command type, resource, uint64
     if (s.current_ds == 0) return false;
     const auto lock = lock_if_queue(s);
     DsFrameStats& st = s.stats[s.current_ds.handle];
+    st.color = s.current_rt;
     for (DrawStats* d : {&st.total, &st.segment}) {
         d->drawcalls += count;
         d->drawcalls_indirect += count;
@@ -144,19 +152,21 @@ bool on_clear_depth_stencil(command_list* cmd, resource_view dsv, const float* d
     auto& s = *cmd->get_private_data<CmdState>();
     const resource ds = cmd->get_device()->get_resource_from_view(dsv);
     DrawStats segment;
+    resource color{0};
     uint32_t pass = 0;
     {
         const auto lock = lock_if_queue(s);
         DsFrameStats& st = s.stats[ds.handle];
         if (*depth != 1.0f) st.reversed_clear = true;
         segment = st.segment;
+        color = st.color;
         pass = st.clears++;
         st.segment = {};
         st.cleared = true;
     }
     // Outside the lock: the hook captures, which takes the addon's own lock.
     if (const ClearHook hook = g_clear_hook.load(); hook != nullptr && segment.drawcalls > 0)
-        hook(cmd, ds, segment, pass);
+        hook(cmd, ds, color, segment, pass);
     return false;
 }
 
@@ -200,6 +210,7 @@ std::vector<Candidate> end_frame(device* dev, uint32_t frame_w, uint32_t frame_h
         c.desc = it->second;
         c.stats = s.total;
         c.last_segment = s.segment;
+        c.color = s.color;
         c.last_pass = s.clears;
         c.reversed_clear = s.reversed_clear;
         c.fits_frame = c.desc.texture.samples <= 1 &&

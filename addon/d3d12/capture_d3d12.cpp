@@ -277,7 +277,8 @@ bool D3D12Capture::ensure_targets(const resource_desc& src, uint32_t capture_wid
     return true;
 }
 
-bool D3D12Capture::capture(command_queue* queue, resource depth, uint32_t capture_width, const FrameHeader& header) {
+bool D3D12Capture::capture(command_queue* queue, resource depth, resource, uint32_t capture_width,
+                           const FrameHeader& header) {
     const resource_desc src = dev_->get_resource_desc(depth);
     if (src.type != resource_type::texture_2d) {
         error_ = "depth buffer is not a 2D texture";

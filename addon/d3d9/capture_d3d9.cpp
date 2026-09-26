@@ -22,13 +22,22 @@ float4 dims : register(c0);  // src width, src height, dst width, dst height
 
 float4 vs_main(float4 p : POSITION) : POSITION { return p; }
 
-float4 ps_main(float2 vpos : VPOS) : COLOR0 {
+// Texture coordinate of the source pixel for target pixel vpos.
+float4 src_uv(float2 vpos) {
     float2 num = (2 * floor(vpos) + 1) * dims.xy, den = 2 * dims.zw;
     float2 s = floor(num / den);
     s += step((s + 1) * den, num);  // quotient one too small
     s -= step(num + 1, s * den);    // one too large
     s = min(s, dims.xy - 1);
-    return tex2Dlod(src_depth, float4((s + 0.5) / dims.xy, 0, 0)).rrrr;
+    return float4((s + 0.5) / dims.xy, 0, 0);
+}
+
+float4 ps_main(float2 vpos : VPOS) : COLOR0 { return tex2Dlod(src_depth, src_uv(vpos)).rrrr; }
+
+// The scene's color (same sampler), into A8R8G8B8, whose bytes are B, G, R, A: swapped so they
+// come out R, G, B, A as protocol.h wants. Clamped to [0, 1] (HDR isn't mapped).
+float4 ps_color(float2 vpos : VPOS) : COLOR0 {
+    return float4(saturate(tex2Dlod(src_depth, src_uv(vpos)).bgr), 1);
 }
 )";
 
@@ -156,7 +165,7 @@ bool D3D9Capture::init(device* dev) {
     dev_->GetCreationParameters(&cp);
     vertex_processing_ = cp.BehaviorFlags;
 
-    for (const char* entry : {"vs_main", "ps_main"}) {
+    for (const char* entry : {"vs_main", "ps_main", "ps_color"}) {
         const bool vs = entry[0] == 'v';
         ComPtr<ID3DBlob> code, errors;
         if (FAILED(D3DCompile(kDownsampleHlsl9, std::strlen(kDownsampleHlsl9), "lidar_downsample9", nullptr, nullptr,
@@ -165,7 +174,8 @@ bool D3D9Capture::init(device* dev) {
             return false;
         }
         const auto* bytecode = static_cast<const DWORD*>(code->GetBufferPointer());
-        if (vs ? FAILED(dev_->CreateVertexShader(bytecode, &vs_)) : FAILED(dev_->CreatePixelShader(bytecode, &ps_))) {
+        IDirect3DPixelShader9** ps = std::strcmp(entry, "ps_color") == 0 ? &color_ps_ : &ps_;
+        if (vs ? FAILED(dev_->CreateVertexShader(bytecode, &vs_)) : FAILED(dev_->CreatePixelShader(bytecode, ps))) {
             error_ = "failed to create the downsample shaders (needs shader model 3)";
             return false;
         }
@@ -188,6 +198,7 @@ void D3D9Capture::release() {
         if (DeviceData* dd = rdev_->get_private_data<DeviceData>(); dd != nullptr && dd->capture == this)
             dd->capture = nullptr;
     decl_.Reset();
+    color_ps_.Reset();
     ps_.Reset();
     vs_.Reset();
     dev_.Reset();
@@ -202,7 +213,11 @@ void D3D9Capture::release_targets() {
         sys_[i].Reset();
         done_[i].Reset();
         copied_[i].Reset();
+        color_rt_[i].Reset();
+        color_sys_[i].Reset();
     }
+    color_copy_.Reset();
+    color_desc_ = {};
     src_w_ = src_h_ = 0;
     cap_w_ = cap_h_ = 0;
 }
@@ -219,7 +234,11 @@ bool D3D9Capture::ensure_targets(uint32_t src_w, uint32_t src_h, uint32_t captur
             FAILED(dev_->CreateOffscreenPlainSurface(cap_w, cap_h, D3DFMT_R32F, D3DPOOL_SYSTEMMEM, &sys_[i],
                                                      nullptr)) ||
             FAILED(dev_->CreateQuery(D3DQUERYTYPE_EVENT, &done_[i])) ||
-            FAILED(dev_->CreateQuery(D3DQUERYTYPE_EVENT, &copied_[i]))) {
+            FAILED(dev_->CreateQuery(D3DQUERYTYPE_EVENT, &copied_[i])) ||
+            FAILED(dev_->CreateRenderTarget(cap_w, cap_h, D3DFMT_A8R8G8B8, D3DMULTISAMPLE_NONE, 0, FALSE,
+                                            &color_rt_[i], nullptr)) ||
+            FAILED(dev_->CreateOffscreenPlainSurface(cap_w, cap_h, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM,
+                                                     &color_sys_[i], nullptr))) {
             release_targets();
             error_ = "failed to create the capture targets (R32F render target)";
             return false;
@@ -232,28 +251,33 @@ bool D3D9Capture::ensure_targets(uint32_t src_w, uint32_t src_h, uint32_t captur
     return true;
 }
 
-bool D3D9Capture::snapshot(resource depth, uint32_t capture_width) {
+bool D3D9Capture::snapshot(resource depth, resource color, uint32_t capture_width) {
     if (pending_.size() >= kReadback) return false;  // next_slot_ is still being read back
     D3DSURFACE_DESC src{};
-    if (!downsample(depth, capture_width, src)) return false;
+    bool has_color = false;
+    if (!downsample(depth, color, capture_width, src, has_color)) return false;
     staged_ = next_slot_;
     staged_w_ = src.Width;
     staged_h_ = src.Height;
+    staged_color_ = has_color;
     return true;
 }
 
-bool D3D9Capture::capture(command_queue*, resource depth, uint32_t capture_width, const FrameHeader& header) {
+bool D3D9Capture::capture(command_queue*, resource depth, resource color, uint32_t capture_width,
+                          const FrameHeader& header) {
     D3DSURFACE_DESC src{};
+    bool has_color = false;
     if (staged_ >= 0 && staged_ == next_slot_) {
         src.Width = staged_w_;
         src.Height = staged_h_;
+        has_color = staged_color_;
     } else {
         staged_ = -1;
         if (pending_.size() >= kReadback) {
             ++skipped_;
             return true;
         }
-        if (!downsample(depth, capture_width, src)) return false;
+        if (!downsample(depth, color, capture_width, src, has_color)) return false;
     }
     staged_ = -1;
     const int s = next_slot_;
@@ -265,11 +289,56 @@ bool D3D9Capture::capture(command_queue*, resource depth, uint32_t capture_width
     p.header.src_width = src.Width;
     p.header.src_height = src.Height;
     p.header.depth_format = uint32_t(DepthFormat::Float32Ndc);
+    if (has_color) p.header.flags |= kFlagHasColor;
     pending_.push_back(p);
     return true;
 }
 
-bool D3D9Capture::downsample(resource depth, uint32_t capture_width, D3DSURFACE_DESC& src) {
+bool D3D9Capture::copy_color(resource color, const D3DSURFACE_DESC& depth) {
+    if (color == 0) {
+        color_note_ = "no render target was bound with the depth buffer";
+        return false;
+    }
+    auto* res = reinterpret_cast<IDirect3DResource9*>(color.handle);
+    ComPtr<IDirect3DSurface9> surface;
+    if (res->GetType() == D3DRTYPE_TEXTURE)
+        static_cast<IDirect3DTexture9*>(res)->GetSurfaceLevel(0, &surface);
+    else if (res->GetType() == D3DRTYPE_SURFACE)
+        surface = static_cast<IDirect3DSurface9*>(res);
+    if (!surface) {
+        color_note_ = "the render target is not a 2D surface";
+        return false;
+    }
+    D3DSURFACE_DESC d{};
+    surface->GetDesc(&d);
+    if (d.Width != depth.Width || d.Height != depth.Height || d.MultiSampleType != D3DMULTISAMPLE_NONE) {
+        color_note_ = "the render target is " + std::to_string(d.Width) + "x" + std::to_string(d.Height) +
+                      (d.MultiSampleType != D3DMULTISAMPLE_NONE ? " MSAA" : "") + ", not the depth buffer's size";
+        return false;
+    }
+    if (!color_copy_ || d.Width != color_desc_.Width || d.Height != color_desc_.Height ||
+        d.Format != color_desc_.Format) {
+        color_copy_.Reset();
+        color_desc_ = {};
+        if (FAILED(dev_->CreateTexture(d.Width, d.Height, 1, D3DUSAGE_RENDERTARGET, d.Format, D3DPOOL_DEFAULT,
+                                       &color_copy_, nullptr))) {
+            color_note_ = "can't copy render target format " + std::to_string(int(d.Format));
+            return false;
+        }
+        color_desc_ = d;
+    }
+    ComPtr<IDirect3DSurface9> dst;
+    color_copy_->GetSurfaceLevel(0, &dst);
+    if (FAILED(dev_->StretchRect(surface.Get(), nullptr, dst.Get(), nullptr, D3DTEXF_NONE))) {
+        color_note_ = "copying the render target failed";
+        return false;
+    }
+    color_note_.clear();
+    return true;
+}
+
+bool D3D9Capture::downsample(resource depth, resource color, uint32_t capture_width, D3DSURFACE_DESC& src,
+                             bool& has_color) {
     auto* res = reinterpret_cast<IDirect3DResource9*>(depth.handle);
     if (res->GetType() == D3DRTYPE_TEXTURE)
         static_cast<IDirect3DTexture9*>(res)->GetLevelDesc(0, &src);
@@ -286,6 +355,10 @@ bool D3D9Capture::downsample(resource depth, uint32_t capture_width, D3DSURFACE_
     }
     if (!ensure_targets(src.Width, src.Height, capture_width)) return false;
     error_.clear();
+    if (color != 0)
+        has_color = copy_color(color, src);
+    else
+        color_note_ = "turned off";
 
     const int s = next_slot_;
     {
@@ -338,6 +411,16 @@ bool D3D9Capture::downsample(resource depth, uint32_t capture_width, D3DSURFACE_
             error_ = "the downsample draw failed";
             return false;
         }
+        if (has_color) {  // same pass on the color copy
+            dev_->SetRenderTarget(0, color_rt_[s].Get());
+            dev_->SetViewport(&vp);
+            dev_->SetPixelShader(color_ps_.Get());
+            dev_->SetTexture(0, color_copy_.Get());
+            if (FAILED(dev_->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, tri, sizeof(tri[0])))) {
+                color_note_ = "the color downsample draw failed";
+                has_color = false;
+            }
+        }
     }
     done_[s]->Issue(D3DISSUE_END);
     return true;
@@ -353,7 +436,9 @@ void D3D9Capture::publish(command_queue*, RingWriter& ring) {
         if (!p.copied) {
             const HRESULT q = done_[p.slot]->GetData(nullptr, 0, 0);
             if (q == S_FALSE) break;  // still running
+            const bool has_color = (p.header.flags & kFlagHasColor) != 0;
             if (q != S_OK || FAILED(dev_->GetRenderTargetData(rt_[p.slot].Get(), sys_[p.slot].Get())) ||
+                (has_color && FAILED(dev_->GetRenderTargetData(color_rt_[p.slot].Get(), color_sys_[p.slot].Get()))) ||
                 FAILED(copied_[p.slot]->Issue(D3DISSUE_END))) {
                 pending_.pop_front();  // lost with the device
                 continue;
@@ -367,8 +452,11 @@ void D3D9Capture::publish(command_queue*, RingWriter& ring) {
             pending_.pop_front();
             continue;
         }
-        D3DLOCKED_RECT lr{};
+        D3DLOCKED_RECT lr{}, clr{};
+        const bool has_color = (p.header.flags & kFlagHasColor) != 0;
         if (q == S_OK && SUCCEEDED(sys_[p.slot]->LockRect(&lr, nullptr, D3DLOCK_READONLY | D3DLOCK_DONOTWAIT))) {
+            const bool color_locked =
+                has_color && SUCCEEDED(color_sys_[p.slot]->LockRect(&clr, nullptr, D3DLOCK_READONLY | D3DLOCK_DONOTWAIT));
             if (ring.is_open()) {
                 Slot* slot = ring.begin_frame();
                 slot->frame = p.header;
@@ -376,9 +464,16 @@ void D3D9Capture::publish(command_queue*, RingWriter& ring) {
                 for (uint32_t y = 0; y < h; ++y)
                     std::memcpy(&slot->depth[y * w], static_cast<const uint8_t*>(lr.pBits) + y * lr.Pitch,
                                 w * sizeof(float));
+                if (color_locked)
+                    for (uint32_t y = 0; y < h; ++y)
+                        std::memcpy(&slot->color[y * w], static_cast<const uint8_t*>(clr.pBits) + y * clr.Pitch,
+                                    w * sizeof(uint32_t));
+                else
+                    slot->frame.flags &= ~kFlagHasColor;
                 ring.commit();
                 ++published_;
             }
+            if (color_locked) color_sys_[p.slot]->UnlockRect();
             sys_[p.slot]->UnlockRect();
         }
         pending_.pop_front();  // published, or lost with the device
