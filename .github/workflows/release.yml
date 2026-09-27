@@ -21,7 +21,7 @@ jobs:
       # Static CRT, so the viewer runs without the VC++ redistributable installed.
       CMAKE_ARGS: -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # No -G: use whichever Visual Studio the runner has.
       - name: Build x64 (viewer, addon, tests)
