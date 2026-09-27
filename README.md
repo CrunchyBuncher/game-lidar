@@ -1,7 +1,12 @@
-# game-lidar
+# Game-Lidar: a 3D lidar scanner for any\* game
 
-**Turn the game you're playing into a 3D map.** Just play normally, and everywhere you look gets
-scanned into a live 3D point cloud in a separate window. Then fly through it.
+**Scan your game just by playing it.** A ReShade addon streams the game's depth buffer and camera,
+and the viewer turns that stream into a live, lidar-style 3D point cloud.
+
+**Supports ReShade 6.8.0 and DirectX 9, 11 and 12.**
+
+<sub>\*Single-player games that render through DirectX 9, 11 or 12. See
+[Before you start](#use-it-in-a-game).</sub>
 
 ![A game running with the addon on the left, the viewer building its point cloud live on the right](docs/media/hero.gif)
 
