@@ -1,33 +1,49 @@
 # game-lidar
 
-**Scan PC games like a LiDAR.** A ReShade addon reads the depth buffer and the game's camera
-while you play, and a standalone viewer turns it into a live 3D point cloud of the level.
+**Turn the game you're playing into a 3D map.** Just play normally, and everywhere you look gets
+scanned into a live 3D point cloud in a separate window. Then fly through it.
 
 ![A game running with the addon on the left, the viewer building its point cloud live on the right](docs/media/hero.gif)
 
-<sub>The addon capturing a game (left) while the viewer builds the scan from nothing (right).
+<sub>A game (left) being scanned live into the viewer (right), starting from nothing.
 [MP4](docs/media/hero.mp4)</sub>
+
+- **Fly through your scan** with a free camera. The viewer is its own app, so you can explore while you
+  play, with the game paused, or after you've closed it.
+- **See the level from above.** Get a bird's-eye view of a map, see how areas connect, and find
+  the places you haven't been yet.
+- **Follow yourself** through the scan in third person, with a trail of where you've walked.
+- **"Attach to camera"** offers a look through the main game's camera, and lets you experience the game through lidar.
+- **Scan in the game's own colors**, or color by height to read the terrain.
+- **Export to `.ply`** for Blender, MeshLab, CloudCompare and friends.
+
+> [!IMPORTANT]
+> **game-lidar is a tool, not a one-click mod.** Every game stores its depth and camera
+> differently, so each game needs a few minutes of setup the first time: checking the depth
+> buffer, running camera discovery, and tuning settings. Until then, scans come out poor or
+> scrambled. Once it looks right, save the profile and the game is set up automatically from then
+> on.
+
+## Features
+- **Live world-space scans.** Every frame is placed using the game's own camera, so the level's scan
+  builds up as you move through it.
+- **Camera discovery.** No profile for your game yet? Walk around for about 20 seconds and the
+  addon ranks the likely camera matrices for you to try and save.
+- **Self-cleaning.** Points left behind by things that moved (NPCs, doors) are carved away when you
+  look through where they were.
+- **D3D9, D3D11 and D3D12**, 32- and 64-bit games. Tested in D3D9 and D3D11 games; D3D12 is
+  untested.
 
 ## How it works
 ```
 game ── ReShade ── lidar_capture addon ──▶ shared memory ──▶ lidar_viewer
                    (depth + camera)                          (point cloud)
 ```
-- **The addon** runs inside the game through [ReShade](https://reshade.me). Each frame it finds the
-  scene's depth buffer, reads a downsampled copy back without stalling the game, and pairs it with
-  the camera matrices it picks out of the game's shader constants.
-- **The viewer** is a separate app. It unprojects every depth frame into world space on the GPU,
-  merges the points into one cloud, and lets you fly around it while you keep playing.
-
-## Features
-- **Live world-space scans.** Every frame's depth is placed with the game's own camera, so the
-  level builds up as you move around it.
-- **Automatic camera discovery.** No profile for your game? Walk around for about 20 seconds and
-  the addon finds the camera matrices in the game's shader constants and saves a profile.
-- **Self-cleaning.** Points left behind by things that moved (NPCs, doors) are carved away when you
-  look through where they were.
-- **Export to `.ply`** for Blender, MeshLab, CloudCompare and friends.
-- **D3D9, D3D11 and D3D12**, 32- and 64-bit games. Tested in DX9 and DX11 games.
+- **The addon** runs inside the game through [ReShade](https://reshade.me). Each frame, it copies a
+  downsampled depth buffer without stalling the game and pairs it with the camera matrices it
+  reads from the game's shader constants.
+- **The viewer** is a separate app. It turns each depth frame into world-space points on the GPU
+  and merges them into one cloud.
 
 <p align="center">
   <img src="docs/media/addon_overlay.gif" alt="The LiDAR tab in the ReShade overlay" width="80%">
@@ -44,34 +60,39 @@ depth buffer in use. <b>Clear viewer points</b> wipes the scan from inside the g
 - OpenGL, Vulkan and D3D10 aren't supported. The addon stays inactive and the game runs normally.
 
 **Setup:**
-1. **Install ReShade 6.8.0 with add-on support** (the "with full add-on support" download). The
+1. **Install [ReShade 6.8.0 with add-on support](https://reshade.me/downloads/ReShade_Setup_6.8.0_Addon.exe)**
+   (the "with full add-on support" download). The
    version has to match: ReShade refuses add-ons built for another version. In the installer,
    pick the game's executable and **DirectX 10/11/12** (or **Direct3D 9** for a D3D9 game).
-   Effects are optional; you can skip them all.
+   You can skip all the effects. Not sure which API the game uses? After the first launch,
+   `ReShade.log` next to the exe names it (`D3D11CreateDevice`, `IDirect3D9::CreateDevice`, ...).
+   Older games can be D3D9 even on a modern system (e.g. Unreal Engine 3 titles).
 2. **Copy the addon next to the game's executable**, in the folder where ReShade put `dxgi.dll` /
    `d3d9.dll`: `lidar_capture.addon64` for 64-bit games, `lidar_capture.addon32` for 32-bit ones.
    Some games keep the exe in a subfolder (e.g. `bin\x64\` or `Binaries\Win64\`).
 3. **Start the game** and press **Home** to open the ReShade overlay. The **Add-ons** tab should list
    "game-lidar capture", and there's a new **LiDAR** tab. If not, check `ReShade.log` next to the exe.
 4. **Start the viewer** (`lidar_viewer.exe`), before or after the game.
-5. **In the LiDAR tab**, check that the depth buffer marked *captured* is the scene depth (the one
-   with the most draws, at screen size). Pick it by hand if the automatic choice is wrong.
-
-Not sure which API a game uses? `ReShade.log` names the device it hooked (`D3D11CreateDevice`,
-`IDirect3D9::CreateDevice`, ...). Older games can be D3D9 even on a modern system (e.g. Unreal
-Engine 3 titles).
+5. **Check the depth buffer.** In the LiDAR tab, the buffer marked *captured* should be the scene
+   depth (screen-sized, with the most draws). The automatic choice is usually right; pick another
+   by hand if not.
+6. **Find the camera with Discovery.** Every game keeps its camera matrices in different shader
+   constants (registers), so the addon has to find them. Run Discovery (below) and try candidates
+   until the scan lines up with itself in the viewer.
+7. **Save the profile** once the scan looks right. The next time you start the game it loads
+   automatically, so discovery is a one-time step.
 
 ### Profiles and discovery
-A profile tells the addon where the game keeps its camera. With one, you get a proper world-space
-scan. Without one, frames go out relative to the camera, so the viewer shows a live snapshot of
-what's on screen (set **Fallback projection** to the game's FOV and near/far for that).
+A profile tells the addon where the game keeps its camera. Without one, the viewer can't build up
+a map: it only shows what's on screen right now, relative to the camera (set **Fallback
+projection** to the game's FOV and near/far for that).
 
-To find a game's profile, open **Discovery** in the LiDAR tab, press **Start**, then move and turn
-the camera for about 20 seconds (in game, not in a menu or cutscene). Candidates are ranked by how
-well they behave like a camera and how well they reproject one depth frame onto a later one; a good
-one shows its score in green. **Use** previews a candidate in the viewer (turn 360° in place: the
-level should line up with itself). **Save** writes it as `lidar_profile.toml` next to the exe and
-loads it. **Write report** saves everything discovery found to `lidar_discovery.txt`.
+To find the camera, open **Discovery** in the LiDAR tab, press **Start**, then move and turn the
+camera for about 20 seconds (in game, not in a menu or cutscene). Candidates are ranked by how
+camera-like they behave and how well they line up consecutive depth frames; good ones score in
+green. **Use** previews a candidate in the viewer: turn 360° in place, and the level should line up
+with itself. **Save** writes it to `lidar_profile.toml` next to the exe. **Write report** saves
+everything discovery found to `lidar_discovery.txt`. Not every game will have registers with a very high score. You can still click and "use" through them to find it on your own from there. 
 
 Discovery handles separate view and projection matrices, a combined view-projection, and
 per-object world·view·proj matrices. The profile format is described in
@@ -82,14 +103,17 @@ per-object world·view·proj matrices. The profile format is described in
 (mostly pre-2004) have no shader constants to find.
 
 ### Settings
-Everything is in the LiDAR tab, and saved under `[LIDAR]` in the game's `ReShade.ini`
-(`Enabled`, `Color`, `ColorCropLeft/Top/Right/Bottom`, `CaptureWidth`, `Profile`, `FovY`, `Near`, `Far`,
-`DepthMode`). If the game's HUD shows up in the colors, crop it out under Color crop (HUD): the
-outline on screen is the area that keeps its color, and depth still covers the whole screen. For unattended
-discovery there are `DiscoveryAutoStart=1`, `DiscoveryAutoSave=<seconds>` and `DiscoverySamples`.
-Only edit the ini while the game is closed: ReShade rewrites it from memory.
+Everything is in the LiDAR tab and saved under `[LIDAR]` in the game's `ReShade.ini`.
 
-To uninstall, run the ReShade installer again and uninstall, then delete the addon file.
+- **HUD in the colors?** Crop it out under **Color crop (HUD)**. Only the area inside the on-screen
+  outline keeps its color; depth still covers the whole screen. Mixed results. It's there if you want it. Otherwise, keep the GUI and fool around with settings to get the best result.
+- **Unattended discovery:** set `DiscoveryAutoStart=1`, `DiscoveryAutoSave=<seconds>` and
+  `DiscoverySamples` in the ini.
+
+Only edit the ini while the game is closed, because ReShade overwrites it with its in-memory
+settings.
+
+**To uninstall**, uninstall ReShade with its installer, then delete the addon file.
 
 ## Viewer
 | Input | Action |
