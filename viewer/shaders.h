@@ -262,6 +262,17 @@ cbuffer Draw : register(b0) {
     uint capacity;
     float pad_;
     float4 height_axis;  // height as shown (tilted): dot(float4(pos, 1), height_axis)
+    // Display-only cutaways, in the capture's frame. Disabled ones are set so they never hide:
+    // the plane to (0, 0, 0, -1), the cylinder's radius to 0.
+    float4 cut_plane;  // hides points where dot(float4(pos, 1), cut_plane) > 0
+    // Cylinder along cut_a -> cut_a + cut_ab (a point above the player's camera -> the viewer's),
+    // standing on the base plane through cut_a: only points on the viewer's side of it, where
+    // dot(float4(pos, 1), cut_base) > 0, are hidden.
+    float3 cut_a;
+    float cut_r2;  // its radius squared
+    float3 cut_ab;
+    float cut_inv_ab2;  // 1 / dot(cut_ab, cut_ab)
+    float4 cut_base;
 };
 
 struct PointData { float3 pos; uint color; };
@@ -295,6 +306,10 @@ VSOut vs_points(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     if (idx >= min(counter.Load(0), capacity)) return o;  // past the last point of the last batch
     PointData p = points[idx];
     if (isnan(p.pos.x)) return o;  // deleted
+    if (dot(float4(p.pos, 1), cut_plane) > 0) return o;  // above the cut plane
+    float3 ap = p.pos - cut_a;
+    float3 off = ap - cut_ab * min(dot(ap, cut_ab) * cut_inv_ab2, 1.0);  // the base plane ends it at the player
+    if (dot(off, off) < cut_r2 && dot(float4(p.pos, 1), cut_base) > 0) return o;  // inside the line-of-sight cylinder
     o.pos = mul(float4(p.pos, 1), view_proj);
     o.pos.xy += corners[vid & 3] * px_to_ndc * point_size * 0.5 * o.pos.w;
     if (color_mode == 0) {

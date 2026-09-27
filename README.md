@@ -129,6 +129,8 @@ settings.
 | `H` | Color by height / captured color (the game's scene colors, D3D9 and D3D11) |
 | `T` | Show the player's trail |
 | `M` | Toggle carving |
+| `U` | Hide points above the player's camera (offset, and level or following the camera's up, in the panel) |
+| `O` | Hide points between your view and the player's camera, down to a base level with the player's camera (radius, and an offset that slides the base toward you, in the panel) |
 | `+` / `-` | Point size |
 | `C` | Clear the scan |
 | `P` | Save a `.ply` to `scans/` |

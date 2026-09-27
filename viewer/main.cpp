@@ -10,7 +10,8 @@
 //                     [--size 1600x900] [--out file.ply] [--save-after s] [--exit-after s]
 // Keys:  right-drag look, WASD move, Q/E down/up, Shift fast, wheel speed,
 //        F follow player (right-drag orbits it, wheel zooms, R resets), V attach to the player's camera, H color mode, T trail,
-//        M carving, +/- point size, arrows tilt the view, L level it, C clear,
+//        M carving, U hide above the player, O hide between you and the player,
+//        +/- point size, arrows tilt the view, L level it, C clear,
 //        P save .ply, Space pause ingest, F1 settings panel, Esc quit.
 // The settings panel changes voxel size, capacity, range, carving and colors while it runs.
 #include <DirectXMath.h>
@@ -67,6 +68,22 @@ float height_from_key(uint32_t key) {
     float f;
     std::memcpy(&f, &u, sizeof(f));
     return f;
+}
+
+// A camera's position, forward and up from its inverse view and projection. Forward and up come
+// from unprojecting the screen center and top edge, which holds whichever handedness the game
+// uses. half_fov_y is the vertical half angle. False if the matrices are degenerate.
+bool camera_axes(FXMMATRIX inv_view, CXMMATRIX inv_proj, XMVECTOR& apex, XMVECTOR& fwd, XMVECTOR& up,
+                 float& half_fov_y) {
+    const XMVECTOR vc = XMVector3TransformCoord(XMVectorSet(0, 0, 0.5f, 1), inv_proj);  // view space
+    XMVECTOR vt = XMVector3TransformCoord(XMVectorSet(0, 1, 0.5f, 1), inv_proj);
+    vt = XMVectorScale(vt, XMVectorGetZ(vc) / XMVectorGetZ(vt));  // the top edge at the center's depth
+    apex = XMVector3TransformCoord(XMVectorZero(), inv_view);
+    fwd = XMVector3Normalize(XMVector3TransformCoord(vc, inv_view) - apex);
+    up = XMVector3Normalize(XMVector3TransformCoord(vt, inv_view) - XMVector3TransformCoord(vc, inv_view));
+    half_fov_y = std::atan2(XMVectorGetY(vt), std::fabs(XMVectorGetZ(vc)));
+    return !XMVector3IsNaN(fwd) && !XMVector3IsNaN(up) &&
+           XMVectorGetX(XMVector3LengthSq(XMVector3Cross(fwd, up))) > 1e-6f;
 }
 
 struct Options {
@@ -131,6 +148,10 @@ struct DrawCB {
     uint32_t capacity;
     float pad;
     float height_axis[4];  // a point's height as shown: dot((pos, 1), height_axis), for the tilt
+    float cut_plane[4];    // hides points where dot((pos, 1), cut_plane) > 0; (0, 0, 0, -1) is off
+    float cut_a[3], cut_r2;  // line-of-sight cylinder from cut_a to cut_a + cut_ab; radius 0 is off
+    float cut_ab[3], cut_inv_ab2;
+    float cut_base[4];  // the cylinder hides only where dot((pos, 1), cut_base) > 0
 };
 struct HistCB {
     float height_axis[4];
@@ -572,6 +593,12 @@ int main(int argc, char** argv) {
     // Display-only tilt (degrees about world X and Z) around a pivot, for leveling a tilted scan.
     float tilt_x = 0, tilt_z = 0;
     XMFLOAT3 tilt_pivot{0, 0, 0};
+    // Display-only cutaways that clear the view of the player. The plane hides everything above the
+    // player's camera plus an offset, level (as displayed) or square to the camera's up. The cylinder
+    // hides everything within a radius of the line from the viewer's camera to the player's, down to
+    // a base plane of the same orientation, which its own offset slides along that line.
+    bool cut_plane_on = false, cut_plane_camera_up = false, cut_sight_on = false;
+    float cut_plane_offset = 0.5f, cut_sight_radius = 1.5f, cut_sight_offset = 0.0f;
     float ui_voxel = opt.voxel, ui_capacity_m = float(opt.capacity) / float(1 << 20);
     std::string pool_message;
 
@@ -643,6 +670,8 @@ int main(int argc, char** argv) {
         if (app.key_pressed('H')) color_mode ^= 1;
         if (app.key_pressed('T')) show_trail = !show_trail;
         if (app.key_pressed('M')) carve = !carve;
+        if (app.key_pressed('U')) cut_plane_on = !cut_plane_on;
+        if (app.key_pressed('O')) cut_sight_on = !cut_sight_on;
         if (app.key_pressed(VK_SPACE)) paused = !paused;
         if (app.key_pressed(VK_OEM_PLUS) || app.key_pressed(VK_ADD)) point_size = std::min(point_size + 1, 16.0f);
         if (app.key_pressed(VK_OEM_MINUS) || app.key_pressed(VK_SUBTRACT))
@@ -866,6 +895,30 @@ int main(int argc, char** argv) {
             else
                 ImGui::TextDisabled("Right-drag look, WASD/arrows move, Q/E down/up, Shift fast, wheel speed");
             ImGui::TextDisabled("Z/X roll, PgUp/PgDn tilt the view, L levels it (display only)");
+
+            ImGui::SeparatorText("Clear the view (display only)");
+            ImGui::Checkbox("Hide above the player (U)", &cut_plane_on);
+            if (cut_plane_on) {
+                ImGui::SetNextItemWidth(160);
+                ImGui::SliderFloat("Offset above camera (m)", &cut_plane_offset, -5, 20, "%.2f");
+            }
+            ImGui::Checkbox("Hide between you and the player (O)", &cut_sight_on);
+            if (cut_sight_on) {
+                ImGui::SetNextItemWidth(160);
+                ImGui::SliderFloat("Radius (m)", &cut_sight_radius, 0.1f, 20, "%.2f", ImGuiSliderFlags_Logarithmic);
+                ImGui::SetNextItemWidth(160);
+                ImGui::SliderFloat("Offset toward you (m)", &cut_sight_offset, -5, 20, "%.2f");
+                if (attach) ImGui::TextDisabled("(off while attached to the camera)");
+            }
+            if (cut_plane_on || cut_sight_on) {  // the orientation of both bases
+                int up = cut_plane_camera_up ? 1 : 0;
+                ImGui::TextUnformatted("Base");
+                ImGui::SameLine();
+                ImGui::RadioButton("level", &up, 0);
+                ImGui::SameLine();
+                ImGui::RadioButton("follows camera's up", &up, 1);
+                cut_plane_camera_up = up == 1;
+            }
             ImGui::End();
         }
 
@@ -898,19 +951,12 @@ int main(int argc, char** argv) {
         XMVECTOR attach_fwd{}, attach_up{};
         if (attach && have_player) {
             // Look through the player's camera (as displayed, so tilted) with its full orientation,
-            // roll included, and its field of view. Forward and up come from unprojecting the screen
-            // center and top edge, which holds whichever handedness the game uses. Detaching leaves
-            // the free-fly camera where the player's was.
-            const XMMATRIX inv_proj = XMLoadFloat4x4(&player_inv_proj);
-            const XMMATRIX shown = XMLoadFloat4x4(&player_inv_view) * tilt;
-            XMVECTOR vc = XMVector3TransformCoord(XMVectorSet(0, 0, 0.5f, 1), inv_proj);  // view space
-            XMVECTOR vt = XMVector3TransformCoord(XMVectorSet(0, 1, 0.5f, 1), inv_proj);
-            vt = XMVectorScale(vt, XMVectorGetZ(vc) / XMVectorGetZ(vt));  // the top edge at the center's depth
-            const XMVECTOR apex = XMVector3TransformCoord(XMVectorZero(), shown);
-            attach_fwd = XMVector3Normalize(XMVector3TransformCoord(vc, shown) - apex);
-            attach_up = XMVector3Normalize(XMVector3TransformCoord(vt, shown) - XMVector3TransformCoord(vc, shown));
-            attached = !XMVector3IsNaN(attach_fwd) && !XMVector3IsNaN(attach_up) &&
-                       XMVectorGetX(XMVector3LengthSq(XMVector3Cross(attach_fwd, attach_up))) > 1e-6f;
+            // roll included, and its field of view. Detaching leaves the free-fly camera where the
+            // player's was.
+            XMVECTOR apex;
+            float half;
+            attached = camera_axes(XMLoadFloat4x4(&player_inv_view) * tilt, XMLoadFloat4x4(&player_inv_proj), apex,
+                                   attach_fwd, attach_up, half);
             if (attached) {
                 XMFLOAT3 f, p;
                 XMStoreFloat3(&f, attach_fwd);
@@ -918,7 +964,6 @@ int main(int argc, char** argv) {
                 cam_pos[0] = p.x, cam_pos[1] = p.y, cam_pos[2] = p.z;
                 cam_yaw = std::atan2(f.x, f.z);
                 cam_pitch = std::clamp(std::asin(std::clamp(f.y, -1.0f, 1.0f)), -1.55f, 1.55f);
-                const float half = std::atan2(XMVectorGetY(vt), std::fabs(XMVectorGetZ(vc)));
                 if (std::isfinite(half) && half > 0.05f && half < 1.4f) fov_y = 2.0f * half;
             }
         } else if (follow && have_player) {
@@ -976,6 +1021,53 @@ int main(int argc, char** argv) {
             XMStoreFloat4x4(&tm, tilt);
             dcb.height_axis[0] = tm._12, dcb.height_axis[1] = tm._22, dcb.height_axis[2] = tm._32;
             dcb.height_axis[3] = tm._42;
+        }
+        // Cutaways, in the capture's frame (the points before the tilt).
+        dcb.cut_plane[3] = -1;  // off: never hides
+        if (have_player && (cut_plane_on || (cut_sight_on && !attach))) {
+            // Both are planes, level (up as displayed: the tilted y, which the tilt levels) or square to
+            // the camera's own up, through their base point.
+            XMVECTOR n = XMVectorSet(dcb.height_axis[0], dcb.height_axis[1], dcb.height_axis[2], 0);
+            {
+                XMVECTOR apex, fwd, up;
+                float half;
+                if (cut_plane_camera_up &&
+                    camera_axes(XMLoadFloat4x4(&player_inv_view), XMLoadFloat4x4(&player_inv_proj), apex, fwd, up, half))
+                    n = up;
+            }
+            const XMVECTOR player = XMVectorSet(player_inv_view._41, player_inv_view._42, player_inv_view._43, 1);
+            auto plane_through = [&](FXMVECTOR p) {  // positive above p
+                XMFLOAT4 f;
+                XMStoreFloat4(&f, XMVectorSetW(n, -XMVectorGetX(XMVector3Dot(n, p))));
+                return f;
+            };
+            if (cut_plane_on) {  // the player's camera raised by its offset
+                const XMFLOAT4 plane = plane_through(player + XMVectorScale(n, cut_plane_offset));
+                std::memcpy(dcb.cut_plane, &plane, sizeof(dcb.cut_plane));
+            }
+            if (cut_sight_on && !attach) {  // attached, the line has no length: it would just hide what's near
+                // From the base up to the viewer, hiding only on the viewer's side of the base (above it,
+                // unless the viewer is below), so the floor under the player stays. The base starts at
+                // the player's camera moved along the line by its offset: toward the viewer, or past
+                // the player when negative. It stops short of the viewer.
+                const XMVECTOR eye = XMVector3TransformCoord(XMVectorSet(cam_pos[0], cam_pos[1], cam_pos[2], 1),
+                                                             XMMatrixInverse(nullptr, tilt));
+                const float dist = XMVectorGetX(XMVector3Length(eye - player));
+                const XMVECTOR base =
+                    player + XMVectorScale(eye - player, std::min(cut_sight_offset, 0.9f * dist) / std::max(dist, 1e-6f));
+                const XMFLOAT4 plane = plane_through(base);
+                const XMVECTOR ab = eye - base;
+                XMFLOAT3 a, abf;
+                XMStoreFloat3(&a, base);
+                XMStoreFloat3(&abf, ab);
+                std::memcpy(dcb.cut_a, &a, sizeof(dcb.cut_a));
+                std::memcpy(dcb.cut_ab, &abf, sizeof(dcb.cut_ab));
+                dcb.cut_r2 = cut_sight_radius * cut_sight_radius;
+                dcb.cut_inv_ab2 = 1.0f / std::max(XMVectorGetX(XMVector3LengthSq(ab)), 1e-8f);
+                const float side = XMVectorGetX(XMVector3Dot(n, ab)) < 0 ? -1.0f : 1.0f;
+                dcb.cut_base[0] = side * plane.x, dcb.cut_base[1] = side * plane.y;
+                dcb.cut_base[2] = side * plane.z, dcb.cut_base[3] = side * plane.w;
+            }
         }
         dcb.px_to_ndc[0] = 2.0f / float(app.width);
         dcb.px_to_ndc[1] = 2.0f / float(app.height);
