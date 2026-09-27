@@ -121,6 +121,19 @@ struct CameraStatus {
     uint64_t recent = 0;  // the last 64 captured frames, bit set: no pose (newest in bit 0)
 };
 
+// The poses of the last second, logged as ranges: a profile that latches more than one camera (another
+// view's buffer at the same register, a camera-relative matrix) shows up as FOV/aspect ranges or
+// position jumps.
+struct PoseStats {
+    uint32_t posed = 0, unposed = 0;
+    float fov_min = 0, fov_max = 0, aspect_min = 0, aspect_max = 0;
+    double max_step = 0;          // meters between consecutive posed frames
+    double pos[3] = {}, last[3] = {};
+    bool have_last = false;
+    std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+};
+PoseStats g_pose_stats;
+
 // Touched from the game's render thread (present) and the overlay, which ReShade draws on the
 // same thread; the mutex covers games that differ.
 std::mutex g_mutex;
@@ -172,6 +185,27 @@ std::filesystem::path game_dir() {
     return std::filesystem::path(std::wstring(buf, n)).parent_path();
 }
 
+// Which of a pass' cameras the pose follows (other views' buffers can share the register, e.g. UE's
+// cube captures and a second camera): the one near the last pose. A camera far from it only takes over
+// after kSwitchFrames frames without a near one (a cut), so a view that wins a frame or two doesn't
+// move the pose.
+struct Follow {
+    bool have = false;
+    double pos[3] = {};  // game units
+    uint64_t frame = 0;  // g_frame of the last pose
+    uint32_t far_frames = 0;
+};
+Follow g_follow;
+constexpr uint32_t kSwitchFrames = 15;
+constexpr double kFollowMeters = 3;     // per frame since the last pose
+constexpr uint64_t kFollowFrames = 30;  // a last pose older than this is forgotten
+
+// Whether `proj` fits a depth buffer of aspect ratio `target` (0: unknown, anything does). Cube captures
+// and shadow maps are square; a scene camera has the depth buffer's shape.
+bool aspect_fits(const float proj[16], float target) {
+    return target <= 0 || std::abs(analyze_projection(proj).aspect / target - 1) < 0.1f;
+}
+
 // The camera in use: a previewed discovery candidate, or the profile's.
 const CameraProfile* active_camera() {
     if (g_preview) return &*g_preview;
@@ -181,17 +215,26 @@ const CameraProfile* active_camera() {
 // Points the camera tracker at the active camera. Caller holds g_mutex.
 void configure_camera() {
     g_camera = {};
+    g_follow = {};
     g_solver = mv::Solver();
     g_mv = {};
     const CameraProfile* c = active_camera();
     if (c != nullptr && g_source != nullptr && c->model_view()) {
         // The constant projection is latched like any camera; the per-draw window is recorded at every draw.
-        const cam::LatchRequest req{c->key, c->proj_offset, 64, Latch::First};
+        cam::LatchRequest req{c->key, c->proj_offset, 64, Latch::First};
+        req.accept = [camera = *c](const std::vector<uint8_t>& w, float aspect) {
+            float proj[16];
+            return decode_projection(camera, w.data(), w.size(), proj) && aspect_fits(proj, aspect);
+        };
         cam::configure(g_device, g_source.get(), &req);
         const cam::DrawRequest draws{c->key, c->view_offset};
         cam::configure_draws(g_device, g_source.get(), &draws);
     } else if (c != nullptr && g_source != nullptr) {
-        const cam::LatchRequest req{c->key, c->window_offset(), c->window_size(), c->latch};
+        cam::LatchRequest req{c->key, c->window_offset(), c->window_size(), c->latch};
+        req.accept = [camera = *c](const std::vector<uint8_t>& w, float aspect) {
+            float view[16], proj[16];
+            return decode_camera(camera, w.data(), w.size(), view, proj) && aspect_fits(proj, aspect);
+        };
         cam::configure(g_device, g_source.get(), &req);
         cam::configure_draws(g_device, nullptr, nullptr);
     } else {
@@ -403,9 +446,76 @@ bool solve_model_view(const CameraProfile& camera, const cam::CbufferRead& proj_
     return true;
 }
 
+// Where the camera is in the world, in the game's units (view = [R 0; t 1], row vectors: p = -t * R^T).
+void camera_position(const float view[16], double pos[3]) {
+    for (int i = 0; i < 3; ++i)
+        pos[i] = -(double(view[12]) * view[i * 4] + double(view[13]) * view[i * 4 + 1] + double(view[14]) * view[i * 4 + 2]);
+}
+
+// Decodes the pass' latched cameras and picks the one to follow (see Follow). Returns false, with
+// g_camera.why set, if there's none this frame.
+bool pick_camera(const CameraProfile& camera, const std::vector<cam::LatchedRead>& latched, float aspect,
+                 float view[16], float proj[16]) {
+    struct Option {
+        float view[16], proj[16];
+        double pos[3];
+        uint32_t draws;
+    };
+    std::vector<Option> options;
+    for (const cam::LatchedRead& l : latched) {
+        Option o;
+        if (!decode_camera(camera, l.read.bytes.data(), l.read.bytes.size(), o.view, o.proj, &g_camera.why)) continue;
+        if (!l.accepted) {  // decodes, so it's the shape
+            char buf[128];
+            std::snprintf(buf, sizeof(buf), "the projection's aspect ratio (%.2f) isn't the depth buffer's (%.2f)",
+                          analyze_projection(o.proj).aspect, aspect);
+            g_camera.why = buf;
+            continue;
+        }
+        camera_position(o.view, o.pos);
+        o.draws = l.draws;
+        options.push_back(o);
+    }
+    if (options.empty()) return false;
+    size_t chosen = 0;  // without a pose to follow: the one most draws had
+    for (size_t i = 1; i < options.size(); ++i)
+        if (options[i].draws > options[chosen].draws) chosen = i;
+    if (g_follow.have && g_frame - g_follow.frame <= kFollowFrames) {
+        auto dist = [&](const Option& o) {
+            return std::sqrt((o.pos[0] - g_follow.pos[0]) * (o.pos[0] - g_follow.pos[0]) +
+                             (o.pos[1] - g_follow.pos[1]) * (o.pos[1] - g_follow.pos[1]) +
+                             (o.pos[2] - g_follow.pos[2]) * (o.pos[2] - g_follow.pos[2]));
+        };
+        size_t nearest = 0;
+        for (size_t i = 1; i < options.size(); ++i)
+            if (dist(options[i]) < dist(options[nearest])) nearest = i;
+        const double limit =
+            kFollowMeters * camera.units_per_meter * double(std::max<uint64_t>(1, g_frame - g_follow.frame));
+        if (dist(options[nearest]) <= limit) {
+            chosen = nearest;
+            g_follow.far_frames = 0;
+        } else if (++g_follow.far_frames < kSwitchFrames) {
+            char buf[128];
+            std::snprintf(buf, sizeof(buf), "the camera jumped %.1f m (followed if it stays there)",
+                          dist(options[nearest]) / camera.units_per_meter);
+            g_camera.why = buf;
+            return false;
+        } else {
+            g_follow.far_frames = 0;  // it stayed: a cut
+        }
+    }
+    const Option& o = options[chosen];
+    std::memcpy(view, o.view, sizeof(o.view));
+    std::memcpy(proj, o.proj, sizeof(o.proj));
+    g_follow.have = true;
+    std::copy_n(o.pos, 3, g_follow.pos);
+    g_follow.frame = g_frame;
+    return true;
+}
+
 // Fills the header's pose from this frame's latch (or model-view solve) for the captured depth-stencil.
-// The camera latched in `pass`: the one the captured depth comes from.
-bool apply_camera(const cam::FrameLatches& latches, const cam::FrameDraws& draws, cam::PassKey pass,
+// The camera latched in `pass`: the one the captured depth comes from, whose aspect ratio is `aspect`.
+bool apply_camera(const cam::FrameLatches& latches, const cam::FrameDraws& draws, cam::PassKey pass, float aspect,
                   FrameHeader& h) {
     const uint64_t depth_stencil = pass.ds;
     const CameraProfile* camera = active_camera();
@@ -414,15 +524,14 @@ bool apply_camera(const cam::FrameLatches& latches, const cam::FrameDraws& draws
         return false;
     }
     const auto it = latches.find(pass);
-    if (it == latches.end()) {
+    if (it == latches.end() || it->second.empty()) {
         g_camera.state = CameraStatus::NoLatch;
         return false;
     }
     float view[16], proj[16];
     const bool ok = camera->model_view()
-                        ? solve_model_view(*camera, it->second, draws, depth_stencil, view, proj)
-                        : decode_camera(*camera, it->second.bytes.data(), it->second.bytes.size(), view, proj,
-                                        &g_camera.why);
+                        ? solve_model_view(*camera, it->second.front().read, draws, depth_stencil, view, proj)
+                        : pick_camera(*camera, it->second, aspect, view, proj);
     if (!ok) {
         g_camera.state = CameraStatus::Rejected;
         return false;
@@ -457,6 +566,52 @@ void log_camera_changes() {
         msg += " (model-view: segment " + std::to_string(g_mv.segment) + ", " + std::to_string(g_mv.draws) +
                " draws, " + std::to_string(g_mv.known) + " known, " + std::to_string(g_mv.inliers) + " agree)";
     log_info(msg);
+}
+
+// Counts this frame into g_pose_stats, and logs them once a second.
+void track_pose(bool posed) {
+    PoseStats& s = g_pose_stats;
+    if (posed) {
+        // Camera position in the world: view = [R 0; t 1] (row vectors), so p = -t * R^T.
+        const float* v = g_camera.view;
+        double p[3];
+        for (int i = 0; i < 3; ++i) p[i] = -(v[12] * v[i * 4] + v[13] * v[i * 4 + 1] + v[14] * v[i * 4 + 2]);
+        if (s.have_last)
+            s.max_step = std::max(s.max_step, std::sqrt((p[0] - s.last[0]) * (p[0] - s.last[0]) +
+                                                        (p[1] - s.last[1]) * (p[1] - s.last[1]) +
+                                                        (p[2] - s.last[2]) * (p[2] - s.last[2])));
+        std::copy_n(p, 3, s.last);
+        std::copy_n(p, 3, s.pos);
+        s.have_last = true;
+        const float fov = g_camera.info.fov_y_deg, aspect = g_camera.info.aspect;
+        if (s.posed++ == 0) {
+            s.fov_min = s.fov_max = fov;
+            s.aspect_min = s.aspect_max = aspect;
+        }
+        s.fov_min = std::min(s.fov_min, fov), s.fov_max = std::max(s.fov_max, fov);
+        s.aspect_min = std::min(s.aspect_min, aspect), s.aspect_max = std::max(s.aspect_max, aspect);
+    } else {
+        ++s.unposed;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - s.since < std::chrono::seconds(1)) return;
+    if (s.posed + s.unposed > 0 && active_camera() != nullptr) {
+        char buf[256];
+        if (s.posed > 0)
+            std::snprintf(buf, sizeof(buf),
+                          "Camera, last second: %u posed, %u not; FOV %.1f-%.1f, aspect %.2f-%.2f, at (%.1f, %.1f, "
+                          "%.1f) m, largest step %.2f m",
+                          s.posed, s.unposed, s.fov_min, s.fov_max, s.aspect_min, s.aspect_max, s.pos[0], s.pos[1],
+                          s.pos[2], s.max_step);
+        else
+            std::snprintf(buf, sizeof(buf), "Camera, last second: 0 posed, %u not", s.unposed);
+        log_info(buf);
+    }
+    const bool keep = s.have_last;
+    const double last[3] = {s.last[0], s.last[1], s.last[2]};
+    s = {};
+    s.have_last = keep;  // steps span the seconds
+    std::copy_n(last, 3, s.last);
 }
 
 const char* api_name(device_api api) {
@@ -613,8 +768,10 @@ void on_present(command_queue* queue, swapchain* sc, const rect*, const rect*, u
         h.frame_index = g_frame;
         h.timestamp_qpc = uint64_t(t0.QuadPart);
         const cam::PassKey pass{pick->resource.handle, use_snapshot ? snapshot.pass_index : pick->last_pass};
-        const bool posed = apply_camera(latches, draws, pass, h);
+        const float aspect = float(pick->desc.texture.width) / float(std::max(1u, pick->desc.texture.height));
+        const bool posed = apply_camera(latches, draws, pass, aspect, h);
         log_camera_changes();
+        track_pose(posed);
         g_camera.recent = (g_camera.recent << 1) | (posed ? 0 : 1);
         if (posed) {
             ++g_camera.with_pose;

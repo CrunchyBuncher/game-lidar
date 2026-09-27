@@ -8,6 +8,11 @@
 //  * --cbv-tables: one descriptor table [b1 at offset 0, b0 appended]. The CBVs are created once
 //    in a CPU-only heap and copied into a shader-visible ring every frame, as engines do.
 //    Root signature version 1.0.
+//  * --decoy-draws N: N draws of no instances open the scene pass with b0 bound to other views'
+//    constants, as with UE's per-shader register assignment, cycling through: a scaled (non-rigid)
+//    matrix where the camera has its view with a valid 90-degree square projection; a valid camera
+//    with that square projection (a cube capture); a valid camera elsewhere in the level with the
+//    scene's projection (a second view). None of them is the scene camera.
 //  * The depth buffer ends each frame in PIXEL_SHADER_RESOURCE (as if post-processing read it),
 //    so a capture can't assume it's still in DEPTH_WRITE at present.
 #include <d3d12.h>
@@ -150,6 +155,8 @@ struct Renderer {
 
     ComPtr<ID3D12Resource> constants;  // upload heap, persistently mapped
     uint8_t* constants_ptr = nullptr;
+    ComPtr<ID3D12Resource> decoy;  // --decoy-draws: the other views' constants, kCbAlign apart (static)
+    static constexpr UINT kDecoys = 3;
 
     // --cbv-tables: CBVs per frame (camera, object per draw) in a CPU-only heap, and a
     // shader-visible ring of tables (per frame, per draw: [object, camera]).
@@ -233,6 +240,24 @@ struct Renderer {
                                 D3D12_RESOURCE_STATE_GENERIC_READ);
         check(constants->Map(0, &none, reinterpret_cast<void**>(&constants_ptr)), "Map(constants)");
 
+        if (opt.decoy_draws != 0) {
+            const XMMATRIX square = make_proj(opt.depth, XM_PIDIV2, 1.0f);
+            const XMMATRIX elsewhere =
+                XMMatrixLookAtLH(XMVectorSet(20, 8, 25, 1), XMVectorSet(0, 0, 0, 1), XMVectorSet(0, 1, 0, 0));
+            CameraCB others[kDecoys] = {};
+            XMStoreFloat4x4(&others[0].view, XMMatrixScaling(2, 2, 2));
+            XMStoreFloat4x4(&others[0].proj, square);
+            XMStoreFloat4x4(&others[1].view, elsewhere);
+            XMStoreFloat4x4(&others[1].proj, square);
+            XMStoreFloat4x4(&others[2].view, elsewhere);
+            XMStoreFloat4x4(&others[2].proj,
+                            make_proj(opt.depth, XMConvertToRadians(opt.fov_deg), float(app.width) / float(app.height)));
+            for (CameraCB& o : others) XMStoreFloat4x4(&o.view_proj, XMLoadFloat4x4(&o.view) * XMLoadFloat4x4(&o.proj));
+            decoy = make_buffer(dev.Get(), kCbAlign * kDecoys, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+            check(decoy->Map(0, &none, &p), "Map(decoy)");
+            for (UINT i = 0; i < kDecoys; ++i) std::memcpy(static_cast<uint8_t*>(p) + kCbAlign * i, &others[i], sizeof(CameraCB));
+            decoy->Unmap(0, nullptr);
+        }
         if (opt.cbv_tables) {
             cbv_size = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
             cbv_cpu = make_heap(dev.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kFrames * (1 + kDraws), false);
@@ -353,6 +378,10 @@ struct Renderer {
             ID3D12DescriptorHeap* heaps[] = {cbv_gpu.Get()};
             cmd->SetDescriptorHeaps(1, heaps);
         } else {
+            for (UINT i = 0; i < opt.decoy_draws; ++i) {
+                cmd->SetGraphicsRootConstantBufferView(1, decoy->GetGPUVirtualAddress() + kCbAlign * (i % kDecoys));
+                cmd->DrawInstanced(3, 0, 0, 0);
+            }
             cmd->SetGraphicsRootConstantBufferView(1, base);  // b0: camera
         }
         for (UINT d = 0; d < UINT(draws.size()); ++d) {

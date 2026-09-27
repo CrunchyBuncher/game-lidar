@@ -1,0 +1,17 @@
+# Metal Gear Solid Delta (UE5, D3D12). Found by discovery mode; verified in game (steady pose while
+# walking, with the addon's per-pass candidate latching). Vertex b0 holds UE's View uniform buffer at
+# most draws, with ViewToClip @ 448. UE assigns registers per shader, so b0 holds other buffers at some
+# draws: the latch skips windows that don't decode as a camera.
+# Untested alternative: layout = "viewproj+proj", view_offset = 64 (RelativeWorldToClip).
+
+[camera]
+stage       = "vertex"
+slot        = 0
+layout      = "invviewproj+proj"
+view_offset = 1680
+proj_offset = 448
+major       = "row"
+handed      = "left"
+latch       = "first"
+up          = "z"
+units_per_meter = 50

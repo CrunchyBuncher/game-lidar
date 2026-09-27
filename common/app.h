@@ -45,6 +45,7 @@ private:
     static LRESULT CALLBACK wnd_proc(HWND, UINT, WPARAM, LPARAM);
     LRESULT handle(UINT msg, WPARAM wp, LPARAM lp);
     void create_back_buffer();
+    void unfocus();
 
     bool keys_[256] = {};
     bool pressed_[256] = {};

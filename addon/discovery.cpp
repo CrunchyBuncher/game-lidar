@@ -78,7 +78,16 @@ struct Record {
     float first[16];   // at the first sampled draw where the pattern held
     float common[16];  // the value most sampled draws had
     uint16_t distinct = 0;
+    // The values in draw order: runs of consecutive sampled draws (indices into the frame's samples)
+    // with the same value. Decoding pairs matrices from the same draws with these, as the camera
+    // tracker reads them: one buffer, at one draw.
+    struct Run {
+        uint16_t from = 0, to = 0;  // inclusive
+        float f[16];
+    };
+    std::vector<Run> runs;
 };
+constexpr size_t kMaxRuns = 8;  // per record: the camera tracker tries this many places or so too
 
 struct Hypothesis {
     Loc loc;
@@ -457,6 +466,13 @@ struct Discovery::State {
     std::deque<std::shared_ptr<DepthFrame>> depths;
     uint64_t last_frame = 0;  // latest analyzed sample frame
     std::vector<uint8_t> window;
+    // decode_by_draw's: sampled draws where the candidate's matrices hold one value (pair: both).
+    struct Segment {
+        uint32_t from = 0, weight = 0;
+        const float* a = nullptr;
+        const float* b = nullptr;
+    };
+    std::vector<Segment> segments;
     std::unordered_map<uint64_t, uint32_t> window_bits;  // classify_matrix by window content
     Snapshot snapshots[2];                               // latest, and the one before (report)
     std::deque<Census> censuses;                         // latest last (report)
@@ -491,11 +507,12 @@ struct Discovery::State {
 
         // Every window's classification, once per distinct buffer content.
         std::unordered_map<uint64_t, std::vector<std::pair<uint32_t, uint32_t>>> classified;
-        std::unordered_map<Loc, std::vector<const float*>, LocHash> values;  // in draw order
+        // Per location: (sample index, value), in draw order.
+        std::unordered_map<Loc, std::vector<std::pair<uint32_t, const float*>>, LocHash> values;
         std::unordered_set<BufId, BufIdHash> bound;
         uint32_t buffers = 0;
-        for (const cam::DrawSample& s : sf.samples.samples) {
-            for (const cam::BoundBuffer& b : s.buffers) {
+        for (uint32_t si = 0; si < uint32_t(sf.samples.samples.size()); ++si) {
+            for (const cam::BoundBuffer& b : sf.samples.samples[si].buffers) {
                 ++buffers;
                 const BufId id{b.key.stage, b.key.slot, b.key.space, b.key.size};
                 bound.insert(id);
@@ -519,12 +536,12 @@ struct Discovery::State {
                     for (uint32_t k = 0; k < 8; ++k)
                         if (bits & (1u << k)) {
                             const Loc loc{id, off, (k & 1) != 0, MatrixKind(k >> 1)};
-                            values[loc].push_back(reinterpret_cast<const float*>(bytes.data() + off));
+                            values[loc].emplace_back(si, reinterpret_cast<const float*>(bytes.data() + off));
                         }
                 if (translated_bufs.contains(id))
                     for (uint32_t off = 0; off + 64 <= bytes.size(); off += 16) {
                         const auto* f = reinterpret_cast<const float*>(bytes.data() + off);
-                        if (looks_like_position(f)) values[Loc{id, off, false, MatrixKind::Translation}].push_back(f);
+                        if (looks_like_position(f)) values[Loc{id, off, false, MatrixKind::Translation}].emplace_back(si, f);
                     }
             }
         }
@@ -543,15 +560,19 @@ struct Discovery::State {
             const size_t n = translation ? 12 : 64;
             Record r;
             r.frame = sf.frame;
-            std::memcpy(r.first, v.front(), sizeof(r.first));
+            std::memcpy(r.first, v.front().second, sizeof(r.first));
             // The most common value (first seen wins ties).
             std::unordered_map<uint64_t, std::pair<uint32_t, const float*>> counts;
-            const float* best = v.front();
+            const float* best = v.front().second;
             uint32_t best_count = 0;
-            for (const float* p : v) {
+            for (const auto& [si, p] : v) {
                 auto& [count, first] = counts[hash_bytes(p, n)];
                 if (count++ == 0) first = p;
                 if (count > best_count) best_count = count, best = first;
+                if (!r.runs.empty() && r.runs.back().to + 1u == si && std::memcmp(r.runs.back().f, p, n) == 0)
+                    r.runs.back().to = uint16_t(si);
+                else if (r.runs.size() < kMaxRuns)
+                    std::memcpy(r.runs.emplace_back(Record::Run{uint16_t(si), uint16_t(si)}).f, p, sizeof(float) * 16);
             }
             std::memcpy(r.common, best, sizeof(r.common));
             r.distinct = uint16_t(std::min<size_t>(counts.size(), 0xFFFF));
@@ -814,6 +835,7 @@ struct Discovery::State {
         if (ra == nullptr || (c.pair && rb == nullptr)) return 1;
         const bool common = c.profile.latch == Latch::Common;
         const CameraProfile& p = c.profile;
+        if (!p.has_translation) return decode_by_draw(c, *ra, rb, view, proj, view_f, proj_f);
         window.assign(p.window_size(), 0);
         std::memcpy(window.data() + (p.view_offset - p.window_offset()), common ? ra->common : ra->first, 64);
         if (rb) std::memcpy(window.data() + (p.proj_offset - p.window_offset()), common ? rb->common : rb->first, 64);
@@ -830,6 +852,51 @@ struct Discovery::State {
         if (view_f) std::memcpy(view_f, v, sizeof(v));
         if (proj_f) std::memcpy(proj_f, pr, sizeof(pr));
         return 0;
+    }
+
+    // Without a translation: the camera the tracker would latch. The matrices come from the same draws
+    // (the same buffer), and the pick is the first draw whose window decodes, or for Latch::Common, the
+    // value most draws had among those that decode. Returns 2 if none decodes.
+    int decode_by_draw(const Candidate& c, const Record& ra, const Record* rb, mat::Mat& view, mat::Mat& proj,
+                       float* view_f, float* proj_f) {
+        segments.clear();
+        for (const Record::Run& x : ra.runs) {
+            if (rb == nullptr) {
+                segments.push_back({x.from, x.to - x.from + 1u, x.f, nullptr});
+                continue;
+            }
+            for (const Record::Run& y : rb->runs) {
+                const uint32_t from = std::max(x.from, y.from), to = std::min(x.to, y.to);
+                if (from <= to) segments.push_back({from, to - from + 1, x.f, y.f});
+            }
+        }
+        std::sort(segments.begin(), segments.end(), [](const Segment& l, const Segment& r) { return l.from < r.from; });
+        if (c.profile.latch == Latch::Common) {  // most draws first; the first seen wins ties
+            for (size_t i = 0; i < segments.size(); ++i)
+                for (size_t j = i + 1; j < segments.size(); ++j)
+                    if (std::memcmp(segments[i].a, segments[j].a, 64) == 0 &&
+                        (segments[i].b == nullptr || std::memcmp(segments[i].b, segments[j].b, 64) == 0)) {
+                        segments[i].weight += segments[j].weight;
+                        segments[j].weight = 0;
+                    }
+            std::stable_sort(segments.begin(), segments.end(),
+                             [](const Segment& l, const Segment& r) { return l.weight > r.weight; });
+        }
+        const CameraProfile& p = c.profile;
+        window.assign(p.window_size(), 0);
+        for (const Segment& sg : segments) {
+            if (sg.weight == 0) break;
+            std::memcpy(window.data() + (p.view_offset - p.window_offset()), sg.a, 64);
+            if (sg.b) std::memcpy(window.data() + (p.proj_offset - p.window_offset()), sg.b, 64);
+            float v[16], pr[16];
+            if (!decode_camera(p, window.data(), window.size(), v, pr)) continue;
+            view = mat::load(v, false);
+            proj = mat::load(pr, false);
+            if (view_f) std::memcpy(view_f, v, sizeof(v));
+            if (proj_f) std::memcpy(proj_f, pr, sizeof(pr));
+            return 0;
+        }
+        return 2;
     }
 
     // The solver's view at `frame`, and the projection hypothesis' value.

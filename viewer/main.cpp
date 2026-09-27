@@ -12,7 +12,7 @@
 //        F follow player (right-drag orbits it, wheel zooms, R resets), V attach to the player's camera, H color mode, T trail,
 //        M carving, U hide above the player, O hide between you and the player,
 //        +/- point size, arrows tilt the view, L level it, C clear,
-//        P save .ply, Space pause ingest, F1 settings panel, Esc quit.
+//        P save .ply, Space pause ingest, F1 settings panel, Esc unfocus.
 // The settings panel changes voxel size, capacity, range, carving and colors while it runs.
 #include <DirectXMath.h>
 

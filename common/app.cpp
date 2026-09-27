@@ -126,6 +126,19 @@ bool App::pump() {
 
 void App::present(bool vsync) { swap->Present(vsync ? 1 : 0, 0); }
 
+// Hands the foreground to the next visible window below ours (like alt-tab) so the
+// program keeps running in the background instead of exiting.
+void App::unfocus() {
+    for (HWND next = GetWindow(hwnd, GW_HWNDNEXT); next; next = GetWindow(next, GW_HWNDNEXT)) {
+        if (!IsWindowVisible(next) || IsIconic(next) || (GetWindowLongW(next, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) ||
+            GetWindow(next, GW_OWNER))
+            continue;
+        SetForegroundWindow(next);
+        return;
+    }
+    SetFocus(nullptr);  // nothing to switch to: at least stop taking keyboard input
+}
+
 void App::set_title(const std::wstring& title) { SetWindowTextW(hwnd, title.c_str()); }
 
 LRESULT CALLBACK App::wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -159,7 +172,7 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
         case WM_SYSKEYDOWN:
             if (!(lp & (1 << 30))) pressed_[wp & 0xFF] = true;
             keys_[wp & 0xFF] = true;
-            if (wp == VK_ESCAPE) quit_ = true;
+            if (wp == VK_ESCAPE) unfocus();
             return 0;
         case WM_KEYUP:
         case WM_SYSKEYUP:

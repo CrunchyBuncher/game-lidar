@@ -11,6 +11,7 @@
 #include <reshade.hpp>
 
 #include <cstdint>
+#include <functional>
 #include <unordered_map>
 #include <vector>
 
@@ -24,6 +25,13 @@ struct LatchRequest {
     CbufferKey key;
     uint32_t offset = 0, size = 0;  // byte window to read, relative to the bound range
     Latch latch = Latch::First;
+    // Whether a window holds a usable camera for a depth-stencil of aspect ratio `aspect` (width /
+    // height, 0 if unknown). A pass latches the windows that pass, so draws whose register holds some
+    // other buffer don't cost the frame (UE assigns registers per shader: vertex b0 is the view's
+    // buffer at some draws only). If none passes, the pass still latches one (the reason it's
+    // rejected is worth showing). Empty: every window passes. Called from draw threads: must be
+    // thread-safe.
+    std::function<bool(const std::vector<uint8_t>& window, float aspect)> accept;
 };
 
 // A pass of a depth-stencil: its draws between two depth clears in a frame, numbered by the depth
@@ -38,9 +46,18 @@ struct PassKeyHash {
     size_t operator()(const PassKey& k) const { return std::hash<uint64_t>()(k.ds ^ (uint64_t(k.pass) << 48)); }
 };
 
-// Per depth-stencil pass: the window read at its first (or last) draw that had the cbuffer bound,
-// or for Latch::Common, the value most of its draws had.
-using FrameLatches = std::unordered_map<PassKey, CbufferRead, PassKeyHash>;
+// A window a pass latched: how many of the pass' draws read it, and whether it passed
+// LatchRequest::accept.
+struct LatchedRead {
+    CbufferRead read;
+    uint32_t draws = 0;
+    bool accepted = false;
+};
+// Per depth-stencil pass: the distinct windows that passed LatchRequest::accept, in latch order (first
+// drawn first; Latch::Last: last drawn first; Latch::Common: most draws first). More than one when
+// other views' buffers share the register: the caller picks the camera. If none passed, one that
+// didn't.
+using FrameLatches = std::unordered_map<PassKey, std::vector<LatchedRead>, PassKeyHash>;
 
 // A draw call's arguments as ReShade reports them (D3D9 UP draws: count only, the rest 0).
 enum class DrawType : uint8_t { Draw, Indexed, Indirect };

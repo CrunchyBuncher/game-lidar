@@ -17,38 +17,80 @@ uint64_t hash_bytes(const std::vector<uint8_t>& b) {
     return h;
 }
 
+// The aspect ratio (width / height) of depth-stencil `ds`, 0 if unknown: the scene camera's has to match.
+float target_aspect(device* dev, uint64_t ds) {
+    const resource_desc d = dev->get_resource_desc(resource{ds});
+    return d.type == resource_type::texture_2d && d.texture.height != 0 ? float(d.texture.width) / float(d.texture.height)
+                                                                         : 0.0f;
+}
+
+bool accepted(const LatchRequest& req, const CbufferRead& read, float aspect) {
+    return !req.accept || req.accept(read.bytes, aspect);
+}
+
+// A pass keeps each distinct accepted window (with how many draws had it), up to this many: other views
+// can share the register (UE: cube captures, a second camera), so which one is the camera is decided at
+// present, against the frames before (main.cpp).
+constexpr size_t kMaxAlternatives = 8;
+
+// Adds `r` to `list`, one entry per distinct window (draws add up). `front`: it came first.
+void add_alternative(std::vector<LatchedRead>& list, LatchedRead&& r, bool front) {
+    for (LatchedRead& e : list)
+        if (e.read.bytes == r.read.bytes) {
+            e.draws += r.draws;
+            return;
+        }
+    list.insert(front ? list.begin() : list.end(), std::move(r));
+}
+
+// Keeps only the accepted windows if there are any, else the first (the reason it's rejected is worth
+// showing), and at most kMaxAlternatives.
+void settle(std::vector<LatchedRead>& list) {
+    if (std::any_of(list.begin(), list.end(), [](const LatchedRead& e) { return e.accepted; }))
+        std::erase_if(list, [](const LatchedRead& e) { return !e.accepted; });
+    else if (list.size() > 1)
+        list.resize(1);
+    if (list.size() > kMaxAlternatives) list.resize(kMaxAlternatives);
+}
+
 // Latch::Common: how many draws saw each distinct value.
 struct Tally {
     struct Entry {
         uint32_t count = 0;
         uint32_t order = 0;  // first seen, for ties
+        bool accepted = false;
         CbufferRead read;
     };
     std::unordered_map<uint64_t, Entry> values;
     std::vector<CbufferRead> pending;  // not readable at the draw (D3D12): counted once resolved
     uint32_t next_order = 0;
+    float aspect = 0;
+    bool aspect_known = false;
 
-    void count(const CbufferRead& read, uint32_t n = 1, uint32_t order_bias = 0) {
+    void count(const CbufferRead& read, const LatchRequest& req) {
         Entry& e = values[hash_bytes(read.bytes)];
         if (e.count == 0) {
-            e.order = order_bias + next_order++;
+            e.order = next_order++;
+            e.accepted = accepted(req, read, aspect);
             e.read = read;
         }
-        e.count += n;
+        ++e.count;
     }
-    void resolve(CbufferSource* source) {
+    void resolve(CbufferSource* source, const LatchRequest& req) {
         for (CbufferRead& r : pending)
-            if (r.ready || (source != nullptr && source->resolve(r))) count(r);
+            if (r.ready || (source != nullptr && source->resolve(r))) count(r, req);
         pending.clear();
     }
     // Moves `src` in, after this tally's own draws.
-    void merge(Tally& src, CbufferSource* source) {
-        src.resolve(source);
+    void merge(Tally& src, CbufferSource* source, const LatchRequest& req) {
+        if (!aspect_known) aspect = src.aspect, aspect_known = src.aspect_known;
+        src.resolve(source, req);
         const uint32_t bias = next_order;
         for (auto& [h, e] : src.values) {
             Entry& d = values[h];
             if (d.count == 0) {
                 d.order = bias + e.order;
+                d.accepted = e.accepted;
                 d.read = std::move(e.read);
             }
             d.count += e.count;
@@ -56,13 +98,58 @@ struct Tally {
         next_order = bias + src.next_order;
         src = {};
     }
-    const CbufferRead* winner() const {
-        const Entry* best = nullptr;
-        for (const auto& [h, e] : values)
-            if (best == nullptr || e.count > best->count || (e.count == best->count && e.order < best->order)) best = &e;
-        return best ? &best->read : nullptr;
+    // The values, most common first (the first seen wins ties), settled.
+    std::vector<LatchedRead> alternatives() const {
+        std::vector<const Entry*> order;
+        for (const auto& [h, e] : values) order.push_back(&e);
+        std::sort(order.begin(), order.end(), [](const Entry* a, const Entry* b) {
+            return a->count != b->count ? a->count > b->count : a->order < b->order;
+        });
+        std::vector<LatchedRead> out;
+        for (const Entry* e : order) out.push_back({e->read, e->count, e->accepted});
+        settle(out);
+        return out;
     }
 };
+
+// Latch::First / Last: a pass' reads, until they can be resolved and checked. Only reads from distinct
+// places are kept (most draws bind the same buffer), up to kMaxCandidates: enough for the camera's
+// buffer to turn up among the other buffers the register holds, without resolving every draw's.
+constexpr size_t kMaxCandidates = 16;
+constexpr uint32_t kMaxTries = 64;  // ready reads rejected in a pass before it stops reading
+
+struct Candidates {
+    std::vector<CbufferRead> reads;  // in draw order
+    std::vector<uint32_t> draws;     // per read: the draws that read that place
+    bool settled = false;            // reads is one ready, accepted read (Latch::First: done)
+    uint32_t tries = 0;
+    float aspect = 0;
+    bool aspect_known = false;
+};
+
+bool same_place(const CbufferRead& a, const CbufferRead& b) {
+    return a.buffer == b.buffer && a.offset == b.offset && a.deferred.descriptor_heap == b.deferred.descriptor_heap &&
+           a.deferred.descriptor == b.deferred.descriptor;
+}
+
+using PassLatches = std::unordered_map<PassKey, std::vector<LatchedRead>, PassKeyHash>;
+
+// `c`'s reads that resolve, as settled alternatives in latch order (Latch::Last: the last first).
+std::vector<LatchedRead> pick(Candidates& c, CbufferSource* source, const LatchRequest& req) {
+    std::vector<LatchedRead> out;
+    auto take = [&](size_t i) {
+        CbufferRead& r = c.reads[i];
+        if (!r.ready && (source == nullptr || !source->resolve(r))) return;
+        const bool ok = accepted(req, r, c.aspect);
+        add_alternative(out, {std::move(r), c.draws[i], ok}, false);
+    };
+    if (req.latch == Latch::Last)
+        for (size_t i = c.reads.size(); i-- > 0;) take(i);
+    else
+        for (size_t i = 0; i < c.reads.size(); ++i) take(i);
+    settle(out);
+    return out;
+}
 
 // Per command list / queue. The immediate D3D11 context is both, so it gets queue state.
 struct __declspec(uuid("8e3a51c7-2b94-4f6d-9c08-d4a7e61f3b25")) CmdState {
@@ -70,7 +157,8 @@ struct __declspec(uuid("8e3a51c7-2b94-4f6d-9c08-d4a7e61f3b25")) CmdState {
     const bool is_queue;
     resource current_ds{0};
     std::unordered_map<uint64_t, uint32_t> passes;  // per depth-stencil: depth clears so far
-    FrameLatches latches;
+    PassLatches latches;                                             // from command lists merged in
+    std::unordered_map<PassKey, Candidates, PassKeyHash> candidates;  // this one's own draws
     std::unordered_map<PassKey, Tally, PassKeyHash> tallies;  // Latch::Common
     FrameSamples samples;                         // discovery
     FrameDraws draws;                             // model-view camera, or discovery
@@ -104,18 +192,38 @@ uint32_t pass_of(const std::unordered_map<uint64_t, uint32_t>& passes, uint64_t 
     return it != passes.end() ? it->second : 0;
 }
 
-// `src`'s passes follow `dst_passes`' (a command list executed after what the queue has so far).
-void merge_latches(CbufferSource* source, Latch latch, const std::unordered_map<uint64_t, uint32_t>& dst_passes,
-                   FrameLatches& dst, FrameLatches& src) {
-    for (auto& [key, read] : src) {
-        if (!read.ready && (source == nullptr || !source->resolve(read))) continue;
-        const PassKey k{key.ds, key.pass + pass_of(dst_passes, key.ds)};
-        if (latch == Latch::Last)
-            dst[k] = std::move(read);
+// `later` into `into`, which came first. Latch::Last puts the later windows first.
+void combine(Latch latch, std::vector<LatchedRead>& into, std::vector<LatchedRead>&& later) {
+    if (latch == Latch::Last)
+        for (auto it = later.rbegin(); it != later.rend(); ++it) add_alternative(into, std::move(*it), true);
+    else
+        for (LatchedRead& e : later) add_alternative(into, std::move(e), false);
+    settle(into);
+}
+
+// `src`'s latches and candidates into `dst`. `src`'s passes follow `dst_passes`' (a command list
+// executed after what the queue has so far).
+void merge_latches(CbufferSource* source, const LatchRequest& req,
+                   const std::unordered_map<uint64_t, uint32_t>& dst_passes, PassLatches& dst, CmdState& src) {
+    // Within `src`, what was merged into it counts as before its own draws (a queue's: the immediate
+    // context's).
+    for (auto& [key, c] : src.candidates) {
+        std::vector<LatchedRead> l = pick(c, source, req);
+        if (l.empty()) continue;
+        if (const auto it = src.latches.find(key); it != src.latches.end())
+            combine(req.latch, it->second, std::move(l));
         else
-            dst.try_emplace(k, std::move(read));
+            src.latches.emplace(key, std::move(l));
     }
-    src.clear();
+    src.candidates.clear();
+    for (auto& [key, l] : src.latches) {
+        const PassKey k{key.ds, key.pass + pass_of(dst_passes, key.ds)};
+        if (const auto it = dst.find(k); it != dst.end())
+            combine(req.latch, it->second, std::move(l));
+        else
+            dst.emplace(k, std::move(l));
+    }
+    src.latches.clear();
 }
 
 void merge_draws(FrameDraws& dst, FrameDraws& src) {
@@ -156,8 +264,9 @@ void complete_geometry(const DeviceData& dd, CmdState& s) {
 
 void merge(const DeviceData& dd, CmdState& dst, CmdState& src) {
     complete_geometry(dd, src);
-    merge_latches(dd.source, dd.req.latch, dst.passes, dst.latches, src.latches);
-    for (auto& [key, t] : src.tallies) dst.tallies[{key.ds, key.pass + pass_of(dst.passes, key.ds)}].merge(t, dd.source);
+    merge_latches(dd.source, dd.req, dst.passes, dst.latches, src);
+    for (auto& [key, t] : src.tallies)
+        dst.tallies[{key.ds, key.pass + pass_of(dst.passes, key.ds)}].merge(t, dd.source, dd.req);
     src.tallies.clear();
     for (const auto& [ds, n] : src.passes) dst.passes[ds] += n;
     src.passes.clear();
@@ -193,19 +302,61 @@ void on_bind_depth_stencil(command_list* cmd, uint32_t, const resource_view*, re
 
 void latch_profile(command_list* cmd, CmdState& s, const DeviceData& dd) {
     const PassKey key{s.current_ds.handle, pass_of(s.passes, s.current_ds.handle)};
-    if (dd.req.latch == Latch::First && s.latches.contains(key)) return;  // first one wins
-    if (!dd.source->read_at_draw(cmd, dd.req.key, dd.req.offset, dd.req.size, s.scratch)) return;
-    if (dd.req.latch != Latch::Common) {
-        std::swap(s.latches[key], s.scratch);
+    const LatchRequest& req = dd.req;
+    if (req.latch == Latch::Common) {
+        if (!dd.source->read_at_draw(cmd, req.key, req.offset, req.size, s.scratch)) return;
+        Tally& t = s.tallies[key];
+        if (!t.aspect_known) t.aspect = target_aspect(cmd->get_device(), key.ds), t.aspect_known = true;
+        if (s.scratch.ready) {
+            t.count(s.scratch, req);
+        } else {
+            t.pending.push_back(std::move(s.scratch));
+            s.scratch = {};
+        }
         return;
     }
-    Tally& t = s.tallies[key];
-    if (s.scratch.ready) {
-        t.count(s.scratch);
-    } else {
-        t.pending.push_back(std::move(s.scratch));
+    Candidates& c = s.candidates[key];
+    if ((c.settled && req.latch == Latch::First) || c.tries >= kMaxTries) return;
+    if (!dd.source->read_at_draw(cmd, req.key, req.offset, req.size, s.scratch)) return;
+    if (!c.aspect_known) c.aspect = target_aspect(cmd->get_device(), key.ds), c.aspect_known = true;
+    if (s.scratch.ready) {  // checked now (D3D11, D3D9)
+        if (c.settled && c.reads.front().bytes == s.scratch.bytes) {  // Latch::Last: the same camera
+            ++c.draws.front();
+            return;
+        }
+        if (accepted(req, s.scratch, c.aspect)) {
+            c.reads.clear();
+            c.draws.clear();
+            c.settled = true;
+        } else {
+            ++c.tries;
+            if (!c.reads.empty()) return;  // only the first rejected one is kept, to say why
+        }
+        c.reads.push_back(std::move(s.scratch));
+        c.draws.push_back(1);
         s.scratch = {};
+        return;
     }
+    // Checked once resolved (D3D12): keep it, unless it's a place already kept.
+    const auto same = std::find_if(c.reads.begin(), c.reads.end(),
+                                   [&](const CbufferRead& r) { return same_place(r, s.scratch); });
+    if (same != c.reads.end()) {
+        const ptrdiff_t i = same - c.reads.begin();
+        ++c.draws[size_t(i)];
+        if (req.latch == Latch::Last) {  // now the latest
+            std::rotate(same, same + 1, c.reads.end());
+            std::rotate(c.draws.begin() + i, c.draws.begin() + i + 1, c.draws.end());
+        }
+        return;
+    }
+    if (c.reads.size() >= kMaxCandidates) {
+        if (req.latch == Latch::First) return;
+        c.reads.erase(c.reads.begin());
+        c.draws.erase(c.draws.begin());
+    }
+    c.reads.push_back(std::move(s.scratch));
+    c.draws.push_back(1);
+    s.scratch = {};
 }
 
 // Every draw's call, geometry and window (model-view camera, discovery). Only where the source reads
@@ -294,6 +445,7 @@ void on_reset_command_list(command_list* cmd) {
     s.passes.clear();
     s.pending_geometry = s.pending_copy = nullptr;
     s.latches.clear();
+    s.candidates.clear();
     s.tallies.clear();
     s.samples.clear();
     s.draws.clear();
@@ -315,6 +467,7 @@ void clear_queues(DeviceData& dd) {
         s.pending_geometry = s.pending_copy = nullptr;
         s.passes.clear();
         s.latches.clear();
+        s.candidates.clear();
         s.tallies.clear();
         s.samples.clear();
         s.draws.clear();
@@ -389,10 +542,10 @@ FrameLatches end_frame(device* dev, FrameSamples* samples, FrameDraws* draws) {
     const std::unique_lock lock(g_mutex);
     CmdState all(true);
     for (command_queue* q : dd->queues) merge(*dd, all, *q->get_private_data<CmdState>());
-    out = std::move(all.latches);
+    for (auto& [key, l] : all.latches) out.emplace(key, std::move(l));
     for (auto& [key, t] : all.tallies) {
-        t.resolve(dd->source);
-        if (const CbufferRead* r = t.winner()) out[key] = *r;
+        t.resolve(dd->source, dd->req);
+        if (std::vector<LatchedRead> l = t.alternatives(); !l.empty()) out[key] = std::move(l);
     }
     dd->last_draws.clear();
     for (const auto& [ds, s] : all.samples) dd->last_draws[ds] = s.draws;

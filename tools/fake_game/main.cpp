@@ -22,7 +22,7 @@
 //                  [--depth standard|reversed|reversed-infinite] [--capture-width 480]
 //                  [--capture-every 1] [--fov 70] [--no-npc] [--no-color]
 //                  [--size 1280x720] [--duration seconds] [--no-publish]
-//                  [--ring NAME] [--freeze T] [--tint-until T]
+//                  [--ring NAME] [--freeze T] [--tint-until T] [--decoy-draws N]
 //        --no-publish: render only, leave the ring to the ReShade addon.
 //        --ring: publish to another mapping (e.g. a reference for `lidar_verify addon`).
 //        --freeze: hold the scripted camera at path time T seconds.
@@ -30,7 +30,10 @@
 //                      stand-in for an effect over the scene, to test the viewer's color updates.
 //        --d3d12-debug: D3D12 debug layer on; its warnings/errors go to stderr (exit code 3 on errors).
 //        --d24: D3D11 with a D24S8 depth buffer instead of D32F, the reference for D3D9's 24-bit depth.
-// Keys:  M toggle manual camera (WASD/QE + right-drag), Space pause capture, Esc quit.
+//        --decoy-draws: D3D12 root CBVs: N draws (of no instances) before the scene each frame, with b0
+//                       bound to other views' constants (a cube capture, a second camera), as in UE,
+//                       whose registers are assigned per shader.
+// Keys:  M toggle manual camera (WASD/QE + right-drag), Space pause capture, Esc unfocus.
 #include "fake_game.h"
 
 #include <algorithm>
@@ -122,6 +125,8 @@ Options parse(int argc, char** argv) {
             o.freeze = float(std::atof(next()));
         } else if (a == "--tint-until") {
             o.tint_until = float(std::atof(next()));
+        } else if (a == "--decoy-draws") {
+            o.decoy_draws = uint32_t(std::max(0, std::atoi(next())));
         } else {
             std::fprintf(stderr, "unknown argument: %s\n", a.c_str());
         }
@@ -269,6 +274,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "--camera-layout modelview only applies to --api d3d9\n");
         return 2;
     }
+    if (opt.decoy_draws != 0 && (opt.api != Api::D3D12 || opt.cbv_tables))
+        std::fprintf(stderr, "--decoy-draws only applies to --api d3d12 without --cbv-tables\n");
     if (opt.d24 && opt.api != Api::D3D11) std::fprintf(stderr, "--d24 only applies to --api d3d11\n");
     if (opt.api != Api::D3D11 && opt.publish) {
         std::fprintf(stderr, "%s renders only: --no-publish implied\n", opt.api == Api::D3D12 ? "D3D12" : "D3D9");

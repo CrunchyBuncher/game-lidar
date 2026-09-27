@@ -23,9 +23,9 @@ public:
     // except the sizes, depth format and color flag, which are filled in here. Returns false (and
     // sets error()) if the depth buffer can't be captured; returns true but skips if the readback
     // pipeline is full.
-    // `color` (0: none) is the render target the scene was drawn into with `depth`. Where the API
-    // has it (D3D9, D3D11), it's sampled at the same pixels and published as kFlagHasColor, if it's
-    // the depth buffer's size and a format that can be sampled; otherwise the frame has no color.
+    // `color` (0: none) is the render target the scene was drawn into with `depth`. It's sampled at
+    // the same pixels and published as kFlagHasColor, if it's the depth buffer's size and a format
+    // that can be sampled (D3D12: and its state is known); otherwise the frame has no color.
     virtual bool capture(reshade::api::command_queue* queue, reshade::api::resource depth,
                          reshade::api::resource color, uint32_t capture_width, const FrameHeader& header) = 0;
 

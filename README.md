@@ -3,7 +3,8 @@
 **Scan your game just by playing it.** A ReShade addon streams the game's depth buffer and camera matrix,
 and the viewer turns that stream into a live, LiDAR-style 3D point cloud.
 
-**Supports games with ReShade 6.8.0. DirectX 9, 11 and 12 are currently supported, with more APIs on the way.**
+**Supports games with ReShade 6.8.0. DirectX 9, 11 and 12 are currently supported, with more APIs on the way.
+Windows only for now, with Linux support planned.**
 
 > **game-lidar is an ongoing project.** It's under active development, expect
 > changing settings and new features as it grows. Bug reports and feedback are welcome.
@@ -61,6 +62,7 @@ depth buffer in use. <b>Clear viewer points</b> wipes the scan from inside the g
 
 ## Use it in a game
 **Before you start:**
+- **Windows only for now.** Linux support is planned for the future.
 - **Single-player games only.** Anti-cheat may block ReShade or ban you for using it.
 - **Turn off MSAA** in the game's video settings: multisampled depth can't be captured. Post-process
   AA (FXAA, TAA, SMAA) is fine. The LiDAR tab warns when MSAA is getting in the way.
@@ -155,7 +157,7 @@ points; about 1.5 GB of GPU memory at 50), `--near-cut 0.3`, `--max-range 500`,
 an effect that tinted a wall from afar is replaced once you get nearer).
 
 ## Build
-Windows only. Requires Visual Studio 2022 or 2026 with the C++ workload (it bundles CMake). There
+Windows only for now (Linux support is planned). Requires Visual Studio 2022 or 2026 with the C++ workload (it bundles CMake). There
 are no other dependencies. Run from PowerShell or a Developer prompt (Git Bash confuses MSBuild).
 
 ```powershell
