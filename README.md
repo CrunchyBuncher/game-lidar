@@ -70,25 +70,30 @@ depth buffer in use. <b>Clear viewer points</b> wipes the scan from inside the g
   support is something I'd like to explore in the future.
 
 **Setup:**
-1. **Install ReShade 6.8 with add-on support** from [reshade.me](https://reshade.me)
+1. **Get game-lidar.** Download the addon and viewer from the
+   [latest release](https://github.com/DanielBallem/game-lidar/releases/latest), or
+   [build them from source](#build).
+2. **Install ReShade 6.8 with add-on support** from [reshade.me](https://reshade.me)
    (the "with full add-on support" download). In the installer,
    pick the game's executable and **DirectX 10/11/12** (or **Direct3D 9** for a D3D9 game).
    You can skip all the effects. Not sure which API the game uses? After the first launch,
    `ReShade.log` next to the exe names it (`D3D11CreateDevice`, `IDirect3D9::CreateDevice`, ...).
    Older games can be D3D9 even on a modern system (e.g. Unreal Engine 3 titles).
-2. **Copy the addon next to the game's executable**, in the folder where ReShade put `dxgi.dll` /
-   `d3d9.dll`: `lidar_capture.addon64` for 64-bit games, `lidar_capture.addon32` for 32-bit ones.
-   Some games keep the exe in a subfolder (e.g. `bin\x64\` or `Binaries\Win64\`).
-3. **Start the game** and press **Home** to open the ReShade overlay. The **Add-ons** tab should list
+3. **Copy the addon into the game's install folder**: `lidar_capture.addon64` for 64-bit games,
+   `lidar_capture.addon32` for 32-bit ones. For some games the addon goes in a `bin` folder (e.g.
+   `bin\x64\` or `Binaries\Win64\`) rather than next to the `.exe` you launch. For others there's no
+   such folder, and it goes in the same folder as the game's `.exe`. Either way, it's the folder
+   where ReShade put `dxgi.dll` / `d3d9.dll`.
+4. **Start the game** and press **Home** to open the ReShade overlay. The **Add-ons** tab should list
    "game-lidar capture", and there's a new **LiDAR** tab. If not, check `ReShade.log` next to the exe.
-4. **Start the viewer** (`lidar_viewer.exe`), before or after the game.
-5. **Check the depth buffer.** In the LiDAR tab, the buffer marked *captured* should be the scene
+5. **Start the viewer** (`lidar_viewer.exe`), before or after the game.
+6. **Check the depth buffer.** In the LiDAR tab, the buffer marked *captured* should be the scene
    depth (screen-sized, with the most draws). The automatic choice is usually right; pick another
    by hand if not.
-6. **Find the camera with Discovery.** Every game keeps its camera matrices in different shader
+7. **Find the camera with Discovery.** Every game keeps its camera matrices in different shader
    constants (registers), so the addon has to find them. Run Discovery (below) and try candidates
    until the scan lines up with itself in the viewer. Click "use" to preview the result.
-7. **Save the profile** once the scan looks right. The next time you start the game it loads
+8. **Save the profile** once the scan looks right. The next time you start the game it loads
    automatically, so discovery is a one-time step.
 
 ### Profiles and discovery
