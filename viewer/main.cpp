@@ -146,12 +146,13 @@ struct DrawCB {
     uint32_t color_mode;
     float height_min, height_max;
     uint32_t capacity;
-    float pad;
+    float px_per_m;  // 0: points are point_size pixels; else world_size metres, clamped to 1..max_px pixels
     float height_axis[4];  // a point's height as shown: dot((pos, 1), height_axis), for the tilt
     float cut_plane[4];    // hides points where dot((pos, 1), cut_plane) > 0; (0, 0, 0, -1) is off
     float cut_a[3], cut_r2;  // line-of-sight cylinder from cut_a to cut_a + cut_ab; radius 0 is off
     float cut_ab[3], cut_inv_ab2;
     float cut_base[4];  // the cylinder hides only where dot((pos, 1), cut_base) > 0
+    float world_size, max_px, pad[2];
 };
 struct HistCB {
     float height_axis[4];
@@ -586,6 +587,10 @@ int main(int argc, char** argv) {
     constexpr float kFollowDist = 8.94f, kFollowPitch = -0.46f;  // 8 m back and 4 m up, looking at them
     float follow_yaw = 0.0f, follow_pitch = kFollowPitch, follow_dist = kFollowDist;
     float point_size = 2.0f;
+    // Distance-scaled points: world_point_scale voxels wide, so they close up into surfaces up close
+    // and shrink to single pixels far away.
+    bool world_points = false;
+    float world_point_scale = 1.5f, world_point_max_px = 64.0f;
     uint32_t color_mode = 0;
     bool follow = false, attach = false, show_trail = true, show_player_cam = true, paused = false, saved = false, carve = opt.carve;
     // Settings panel (F1). Voxel size and capacity only apply with the button: both rebuild the pool.
@@ -883,7 +888,16 @@ int main(int argc, char** argv) {
 
             ImGui::SeparatorText("View");
             ImGui::SetNextItemWidth(160);
-            ImGui::SliderFloat("Point size (+/-)", &point_size, 1, 16, "%.0f");
+            ImGui::Checkbox("Scale points with distance", &world_points);
+            ImGui::SetNextItemWidth(160);
+            if (world_points) {
+                ImGui::SliderFloat("Point size (x voxel)", &world_point_scale, 0.25f, 4.0f, "%.2f");
+                ImGui::SetNextItemWidth(160);
+                ImGui::SliderFloat("Max point size (px)", &world_point_max_px, 2, 256, "%.0f",
+                                   ImGuiSliderFlags_Logarithmic);
+            } else {
+                ImGui::SliderFloat("Point size (+/-)", &point_size, 1, 16, "%.0f");
+            }
             ImGui::Checkbox("Follow the player (F)", &follow);
             ImGui::SameLine();
             ImGui::Checkbox("Trail (T)", &show_trail);
@@ -1074,6 +1088,11 @@ int main(int argc, char** argv) {
         dcb.px_to_ndc[0] = 2.0f / float(app.width);
         dcb.px_to_ndc[1] = 2.0f / float(app.height);
         dcb.point_size = point_size;
+        if (world_points) {
+            dcb.px_per_m = 0.5f * float(app.height) / std::tan(0.5f * fov_y);
+            dcb.world_size = world_point_scale * opt.voxel;
+            dcb.max_px = world_point_max_px;
+        }
         dcb.color_mode = color_mode;
         dcb.capacity = cloud.capacity;
         dcb.height_min = auto_height && have_bounds ? range_low : opt.height_min;

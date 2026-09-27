@@ -260,7 +260,9 @@ cbuffer Draw : register(b0) {
     float height_min;
     float height_max;
     uint capacity;
-    float pad_;
+    // 0: every point is point_size pixels wide. Otherwise points are world_size metres wide, so they
+    // shrink with distance, clamped to 1..max_px pixels; this is pixels per metre at depth 1.
+    float px_per_m;
     float4 height_axis;  // height as shown (tilted): dot(float4(pos, 1), height_axis)
     // Display-only cutaways, in the capture's frame. Disabled ones are set so they never hide:
     // the plane to (0, 0, 0, -1), the cylinder's radius to 0.
@@ -273,6 +275,9 @@ cbuffer Draw : register(b0) {
     float3 cut_ab;
     float cut_inv_ab2;  // 1 / dot(cut_ab, cut_ab)
     float4 cut_base;
+    float world_size;
+    float max_px;
+    float2 pad_;
 };
 
 struct PointData { float3 pos; uint color; };
@@ -311,7 +316,8 @@ VSOut vs_points(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     float3 off = ap - cut_ab * min(dot(ap, cut_ab) * cut_inv_ab2, 1.0);  // the base plane ends it at the player
     if (dot(off, off) < cut_r2 && dot(float4(p.pos, 1), cut_base) > 0) return o;  // inside the line-of-sight cylinder
     o.pos = mul(float4(p.pos, 1), view_proj);
-    o.pos.xy += corners[vid & 3] * px_to_ndc * point_size * 0.5 * o.pos.w;
+    float px = px_per_m > 0 ? clamp(world_size * px_per_m / max(o.pos.w, 1e-6), 1.0, max_px) : point_size;
+    o.pos.xy += corners[vid & 3] * px_to_ndc * px * 0.5 * o.pos.w;
     if (color_mode == 0) {
         // Skip turbo's near-black bottom end so the lowest points (usually the floor) still show.
         float t = saturate((dot(float4(p.pos, 1), height_axis) - height_min) / (height_max - height_min));
