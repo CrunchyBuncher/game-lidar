@@ -71,7 +71,7 @@ depth buffer in use. <b>Clear viewer points</b> wipes the scan from inside the g
 
 **Setup:**
 1. **Get game-lidar.** Download the addon and viewer from the
-   [latest release](https://github.com/DanielBallem/game-lidar/releases/latest), or
+   [latest release](https://github.com/CrunchyBuncher/game-lidar/releases/latest), or
    [build them from source](#build).
 2. **Install ReShade 6.8 with add-on support** from [reshade.me](https://reshade.me)
    (the "with full add-on support" download). In the installer,
