@@ -70,9 +70,8 @@ depth buffer in use. <b>Clear viewer points</b> wipes the scan from inside the g
   support is something I'd like to explore in the future.
 
 **Setup:**
-1. **Install [ReShade 6.8.0 with add-on support](https://reshade.me/downloads/ReShade_Setup_6.8.0_Addon.exe)**
-   (the "with full add-on support" download). The
-   version has to match: ReShade refuses add-ons built for another version. In the installer,
+1. **Install ReShade 6.8 with add-on support** from [reshade.me](https://reshade.me)
+   (the "with full add-on support" download). In the installer,
    pick the game's executable and **DirectX 10/11/12** (or **Direct3D 9** for a D3D9 game).
    You can skip all the effects. Not sure which API the game uses? After the first launch,
    `ReShade.log` next to the exe names it (`D3D11CreateDevice`, `IDirect3D9::CreateDevice`, ...).
@@ -166,7 +165,7 @@ cmake -S . -B build-win32 -G "Visual Studio 18 2026" -A Win32
 cmake --build build-win32 --config Release --target lidar_capture
 ```
 
-The addon is built against ReShade 6.8.0. To use a newer ReShade, bump the ReShade tag and the
+The addon is built against ReShade 6.8.0. To target a newer ReShade, bump the ReShade tag and the
 ImGui commit in `CMakeLists.txt` and rebuild.
 
 ## Development
