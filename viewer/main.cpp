@@ -3,7 +3,7 @@
 // point pool, and renders it with a free-fly camera. Points that a newer frame
 // sees straight through (things that moved away) are carved out.
 //
-// Usage: lidar_viewer [--voxel 0.05] [--capacity-m 50] [--table-bits auto]
+// Usage: lidar_viewer [--voxel 0.1] [--capacity-m 50] [--table-bits auto]
 //                     [--near-cut 0.3] [--max-range 500] [--height-range -1 20]
 //                     [--no-carve] [--carve-margin 0.15] [--carve-rel 0.02]
 //                     [--color-update first|closest|latest]
@@ -87,7 +87,7 @@ bool camera_axes(FXMMATRIX inv_view, CXMMATRIX inv_proj, XMVECTOR& apex, XMVECTO
 }
 
 struct Options {
-    float voxel = 0.05f;
+    float voxel = 0.1f;
     uint32_t capacity = 50u << 20;
     uint32_t table_bits = 0;  // 0: sized for the capacity
     float near_cut = 0.3f;
@@ -587,7 +587,7 @@ int main(int argc, char** argv) {
     float follow_yaw = 0.0f, follow_pitch = kFollowPitch, follow_dist = kFollowDist;
     float point_size = 2.0f;
     uint32_t color_mode = 0;
-    bool follow = false, attach = false, show_trail = true, paused = false, saved = false, carve = opt.carve;
+    bool follow = false, attach = false, show_trail = true, show_player_cam = true, paused = false, saved = false, carve = opt.carve;
     // Settings panel (F1). Voxel size and capacity only apply with the button: both rebuild the pool.
     bool show_ui = true, auto_height = true;
     // Display-only tilt (degrees about world X and Z) around a pivot, for leveling a tilted scan.
@@ -888,6 +888,8 @@ int main(int argc, char** argv) {
             ImGui::SameLine();
             ImGui::Checkbox("Trail (T)", &show_trail);
             ImGui::SameLine();
+            ImGui::Checkbox("Show game camera", &show_player_cam);
+            ImGui::SameLine();
             if (ImGui::Checkbox("Attach to camera (V)", &attach) && attach) follow = false;
             if (follow) attach = false;
             if (follow)
@@ -1144,7 +1146,7 @@ int main(int argc, char** argv) {
 
         // Lines: player frustum + trail.
         std::vector<LineVertex> lines;
-        if (have_player && !attach) {  // attached, it would just frame the screen
+        if (show_player_cam && have_player && !attach) {  // attached, it would just frame the screen
             const XMMATRIX inv_proj = XMLoadFloat4x4(&player_inv_proj);
             const XMMATRIX inv_view = XMLoadFloat4x4(&player_inv_view);
             const XMVECTOR apex = XMVector3TransformCoord(XMVectorZero(), inv_view);

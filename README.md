@@ -137,7 +137,7 @@ settings.
 | `Space` | Pause |
 | `F1` | Hide the UI |
 
-Command-line options: `--voxel 0.05` (point spacing in meters), `--capacity-m 50` (millions of
+Command-line options: `--voxel 0.1` (point spacing in meters), `--capacity-m 50` (millions of
 points; about 1.5 GB of GPU memory at 50), `--near-cut 0.3`, `--max-range 500`,
 `--height-range -1 20`, `--no-carve`, `--carve-margin 0.15`, `--carve-rel 0.02`,
 `--color-update first|closest|latest` (which sighting's color a point keeps; default closest, so
