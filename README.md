@@ -1,5 +1,13 @@
 # Game-LiDAR: a 3D lidar scanner for any\* game
 
+<sub>A Hat in Time, scanned in the game's own colors.</sub>
+
+![A lidar scan of A Hat in Time in the game's own colors](docs/media/a-hat-in-time-coloured.png)
+
+<sub>Kino der Toten, Call of Duty: Black Ops 3.</sub>
+
+![A lidar scan of the Kino der Toten map in Black Ops 3](docs/media/kino-bo3.png)
+
 **Scan your game just by playing it.** A ReShade addon streams the game's depth buffer and camera matrix,
 and the viewer turns that stream into a live, LiDAR-style 3D point cloud.
 
