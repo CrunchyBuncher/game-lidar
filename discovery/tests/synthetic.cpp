@@ -100,6 +100,21 @@ void put_floats(std::vector<uint8_t>& buf, uint32_t offset, const float* f, size
     std::memcpy(buf.data() + offset, f, n * sizeof(float));
 }
 
+uint32_t mix(uint32_t x) {  // a hash for deterministic noise
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    return x ^ (x >> 16);
+}
+
+// A camera orbiting the scene on its own path: a moving view that isn't the player's.
+XMMATRIX other_view(uint32_t k, uint32_t frame) {
+    const float a = 0.013f * float(frame) * (1 + float(k % 3)) + float(k);
+    const XMVECTOR eye = XMVectorSet(15 * std::cos(a), 3.0f + float(k % 4), 10 + 15 * std::sin(a), 1);
+    return XMMatrixLookAtLH(eye, XMVectorSet(0, 1, 10, 1), XMVectorSet(0, 1, 0, 0));
+}
+
 }  // namespace
 
 CameraProfile expected_camera(const Scenario& s) {
@@ -133,6 +148,9 @@ std::vector<disc::RecordedInput> generate(const Scenario& s) {
     const XMMATRIX light_view =
         XMMatrixLookAtLH(XMVectorSet(4, 12, 6, 1), XMVectorSet(0, 0, 10, 1), XMVectorSet(0, 1, 0, 0));
     const XMMATRIX light_proj = XMMatrixPerspectiveFovLH(0.9f, 1, 0.5f, 60);
+    // Near and far a hair apart: any depth reads as the same distance.
+    const XMMATRIX flat_proj = XMMatrixPerspectiveFovLH(2.8f, float(kSrcW) / kSrcH, 1.0f, 1.0002f);
+    constexpr uint32_t kOthers = 8;  // per flood buffer: views, then projections
 
     std::vector<disc::RecordedInput> out;
     std::vector<uint8_t> prev_first(64);  // last frame's matrix at camera offset 0 (level geometry's)
@@ -179,10 +197,23 @@ std::vector<disc::RecordedInput> generate(const Scenario& s) {
                 if (i == 0) first_value.assign(cam.begin(), cam.begin() + 64);
                 if (s.decoys) {
                     put_floats(cam, 192, reinterpret_cast<const float*>(prev_first.data()), 16);
+                    put(cam.data(), 256, pose.view * flat_proj, s.column_major);
                     const float misc[8] = {float(time), float(f), 1.0f / 60, 0, kSrcW, kSrcH, 1.0f / kSrcW, 1.0f / kSrcH};
                     put_floats(cam, 320, misc, 8);
                 }
-                sample.buffers.push_back(buffer(shader_stage::vertex, 0, std::move(cam)));
+                if (f >= s.camera_from) sample.buffers.push_back(buffer(shader_stage::vertex, 0, std::move(cam)));
+                if (s.flood) {
+                    std::vector<uint8_t> others(kOthers * 128);
+                    for (uint32_t k = 0; k < kOthers; ++k) {
+                        put(others.data(), k * 64, other_view(k, f), s.column_major);
+                        put(others.data(), (kOthers + k) * 64,
+                            XMMatrixPerspectiveFovLH(0.5f + 0.1f * float(k), float(kSrcW) / kSrcH, 0.1f * float(k + 1), 500),
+                            s.column_major);
+                    }
+                    for (uint32_t k = 0; k < s.flood; ++k)
+                        sample.buffers.push_back(
+                            buffer(k % 2 ? shader_stage::pixel : shader_stage::vertex, 2 + k / 2, others));
+                }
                 if (s.decoys) {
                     std::vector<uint8_t> obj(kObjectBytes);
                     put(obj.data(), 0, world, s.column_major);
@@ -201,8 +232,22 @@ std::vector<disc::RecordedInput> generate(const Scenario& s) {
         if (f >= s.depth_lag) {
             const uint32_t df = f - s.depth_lag;
             const Pose pose = pose_at(df, s.moving);
-            const std::vector<float> depth =
+            std::vector<float> depth =
                 render_depth(pose.view, jittered(base_proj, df), s.depth_mode != 0, kW, kH, kSrcW, kSrcH);
+            if (s.scene_motion)
+                for (uint32_t y = 0; y < kH; ++y)
+                    for (uint32_t x = 0; x < kW * 6 / 10; ++x) {
+                        float& d = depth[size_t(y) * kW + x];
+                        if (!(d > 0 && d < 1)) continue;  // sky
+                        // Raw depth is about proportional to 1 / distance (standard: 1 - depth).
+                        const float scale = 1 + 0.03f * (float(mix(x * 977 + y * 131 + df * 7919) & 0xFFFF) / 32767.5f - 1);
+                        d = s.depth_mode != 0 ? d * scale : 1 - (1 - d) * scale;
+                    }
+            if (s.garbage_depth && df % s.garbage_depth == s.garbage_depth - 1)
+                for (size_t i = 0; i < depth.size(); ++i) {
+                    const uint32_t bits = (i / 7) % 3 ? mix(uint32_t(i) + df * 65536) : 0x7FC00000u;  // stripes of NaN
+                    std::memcpy(&depth[i], &bits, sizeof(bits));
+                }
             disc::RecordedInput in;
             in.is_depth = true;
             in.depth = std::make_shared<disc::DepthFrame>();

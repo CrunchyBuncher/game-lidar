@@ -8,9 +8,10 @@
 //     most draws saw (world * view * proj uploads differ per draw).
 //  2. Combines hypotheses into camera candidates, each a complete CameraProfile (view+proj pairs in
 //     one buffer, or a single view-projection), decoded exactly as the profile path would.
-//  3. Scores each candidate over time: its view must stay put when the depth image is still and
-//     change when it changes, and reprojecting depth frame N into N+k with its matrices must land on
-//     frame N+k's depth. Only the right matrices pass that consistently.
+//  3. Scores each candidate over time: its view must stay put when the depth image is still, and
+//     reprojecting depth frame N into N+k with its matrices must land on frame N+k's depth for the
+//     static geometry. Only the right matrices pass that consistently; last frame's copies of them
+//     rank below them. Depth frames that aren't depth are left out.
 #pragma once
 #include <cstddef>
 #include <cstdint>
@@ -31,6 +32,8 @@ struct CandidateInfo {
     bool confident = false;
     uint32_t reproj_tests = 0, reproj_passes = 0;
     double reproj_error = 1;  // median relative error over its tests
+    double explained = 0;     // mean share of the changed pixels it reprojects, over its tests
+    bool history = false;     // another candidate's view of the frame before (ranks below the cameras)
     uint32_t temporal_checks = 0, temporal_agree = 0;
     bool have_values = false;  // latest decoded matrices
     float view[16] = {}, proj[16] = {};
@@ -42,6 +45,8 @@ struct Status {
     double seconds = 0;  // input time of the latest input
     uint64_t frames_analyzed = 0, frames_dropped = 0;
     uint64_t depth_frames = 0, still_frames = 0, moving_frames = 0, reproj_rounds = 0;
+    uint64_t depth_rejected = 0;    // depth frames that weren't depth (NaN, garbage), left out
+    uint64_t explained_rounds = 0;  // reprojection rounds some candidate explained (the others judge nobody)
     uint32_t last_samples = 0, last_draws = 0, last_buffers = 0;
     double analyze_ms = 0;      // analyzer time per sample frame (smoothed; measured, not deterministic)
     size_t hypotheses[5] = {};  // per MatrixKind

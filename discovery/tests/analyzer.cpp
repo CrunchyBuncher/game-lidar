@@ -97,6 +97,51 @@ TEST_CASE(analyzer, still_camera) {
     EXPECT(st.reproj_rounds == 0);
 }
 
+// Depth frames that are another resource's memory (MGS Delta: NaN and stripes in up to half the
+// frames) are left out, not taken for a camera jump.
+TEST_CASE(analyzer, garbage_depth) {
+    Scenario s;
+    s.garbage_depth = 3;
+    EXPECT(finds("every third depth frame garbage", s));
+    EXPECT(run(s).depth_rejected > 0);
+}
+
+// Much of the scene moves on its own (MGS Delta's jungle): the right camera explains the static part
+// exactly, but that's under half the pixels that change. Then last frame's camera (the decoy at c12)
+// passes about as often as the camera, and only being a frame behind it gives it away.
+TEST_CASE(analyzer, scene_motion) {
+    for (GameLayout layout : {GameLayout::ViewAndProj, GameLayout::InvViewProjAndProj}) {
+        Scenario s;
+        s.layout = layout;
+        s.scene_motion = true;
+        EXPECT(finds(layout == GameLayout::ViewAndProj ? "view+proj, scene moves" : "invviewproj+proj, scene moves", s));
+    }
+}
+
+// A still camera in a moving scene: the depth changes, but nothing may claim it explains that.
+TEST_CASE(analyzer, still_camera_moving_scene) {
+    Scenario s;
+    s.moving = false;
+    s.scene_motion = true;
+    s.frames = 200;
+    const disc::Status st = run(s);
+    bool confident = false;
+    for (const disc::CandidateInfo& c : st.candidates) confident = confident || c.confident;
+    if (confident) print_top("still camera, scene moves", st, expected_camera(s));
+    EXPECT(!confident);
+    EXPECT(st.reproj_rounds > 0);
+}
+
+// More camera-like combinations than candidates kept at once (UE's View buffer, bound to several
+// stages), and all of them there before the camera is: the ones that fail make room, so the camera
+// still gets its turn.
+TEST_CASE(analyzer, candidate_flood) {
+    Scenario s;
+    s.flood = 20;
+    s.camera_from = 60;
+    EXPECT(finds("20 buffers of other cameras, bound before the camera", s));
+}
+
 // Same inputs, same result: what makes replays and these tests meaningful.
 TEST_CASE(analyzer, deterministic) {
     Scenario s;

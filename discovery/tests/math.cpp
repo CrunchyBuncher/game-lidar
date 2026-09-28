@@ -8,6 +8,7 @@
 
 #include "camera_math.h"
 #include "matrices.h"
+#include "profile.h"
 #include "synthetic.h"
 #include "test.h"
 
@@ -147,5 +148,31 @@ TEST_CASE(math, reproject) {
         EXPECT(right.median_rel < 1e-4);
         EXPECT(still.median_rel > 0.01);
         EXPECT(off.median_rel > 0.005);
+        if (!(right.explained > 0.95 && still.explained < 0.05 && off.explained < 0.5))
+            std::printf("  reproject mode %d explained: right %g, still %g, off %g\n", mode, right.explained,
+                        still.explained, off.explained);
+        EXPECT(right.explained > 0.95);
+        EXPECT(still.explained < 0.05);
+        EXPECT(off.explained < 0.5);
+
+        // Memory that isn't depth: NaN and values outside [0, 1].
+        EXPECT(invalid_depth(a) == 0.0);
+        DepthGrid junk = a;
+        for (size_t i = 0; i < junk.depth.size(); i += 2) junk.depth[i] = i % 4 ? std::nanf("") : -3e38f;
+        EXPECT(invalid_depth(junk) > 0.4);
     }
+}
+
+// A view-projection from MGS Delta's View buffer (pixel b0 @ 6576) that splits into a view and a
+// projection with near 0.9998 and far 1: every depth reads as the same distance, so it "explained"
+// every depth image perfectly and outscored the camera. It isn't a camera.
+TEST_CASE(math, degenerate_projection) {
+    const float vp[16] = {0, 0, -5861.8f, 1, 0.095916f, 0, 0, 0, 0, 0.11989f, 0, 0, 0, 0, 5861.8f, 0};
+    CameraProfile p;
+    p.layout = CameraLayout::ViewProj;
+    float view[16], proj[16];
+    EXPECT(!decode_camera(p, reinterpret_cast<const uint8_t*>(vp), sizeof(vp), view, proj));
+    // A real one of the same shape (reversed infinite, near 10) still decodes.
+    const float ok[16] = {0, 0, 0, 1, 0.095916f, 0, 0, 0, 0, 0.11989f, 0, 0, 0, 0, 10, 0};
+    EXPECT(decode_camera(p, reinterpret_cast<const uint8_t*>(ok), sizeof(ok), view, proj));
 }

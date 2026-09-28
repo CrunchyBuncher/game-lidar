@@ -1090,8 +1090,8 @@ void draw_discovery_section() {
                                   ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap))
                 expanded = expanded == i ? -1 : i;
             ImGui::TableNextColumn();
-            ImGui::Text("%s%s%s", layout_name(c.profile.layout), c.profile.column_major ? " (column)" : "",
-                        c.profile.latch == Latch::Common ? " (common)" : "");
+            ImGui::Text("%s%s%s%s", layout_name(c.profile.layout), c.profile.column_major ? " (column)" : "",
+                        c.profile.latch == Latch::Common ? " (common)" : "", c.history ? " (last frame's)" : "");
             ImGui::TableNextColumn();
             ImGui::TextUnformatted(c.where.c_str());
             ImGui::TableNextColumn();
@@ -1101,7 +1101,7 @@ void draw_discovery_section() {
                 ImGui::Text("%.2f", c.score);
             ImGui::TableNextColumn();
             if (c.reproj_tests)
-                ImGui::Text("%u/%u, err %.2f%%", c.reproj_passes, c.reproj_tests, c.reproj_error * 100);
+                ImGui::Text("%u/%u, explains %.0f%%", c.reproj_passes, c.reproj_tests, c.explained * 100);
             else
                 ImGui::TextDisabled("-");
             ImGui::TableNextColumn();

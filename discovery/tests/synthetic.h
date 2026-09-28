@@ -35,7 +35,21 @@ struct Scenario {
     uint32_t depth_lag = 2;      // frames between a frame's samples and its depth
     bool moving = true;          // false: the camera never moves
     bool decoys = true;          // last frame's view-projection next to the camera, a spot light's
-                                 // view + proj, per-object world matrices, junk constants
+                                 // view + proj, per-object world matrices, junk constants, and a
+                                 // view-projection whose near and far planes (almost) coincide
+    // Every n-th depth frame is another resource's memory, not depth (a transient depth buffer
+    // reused by a later pass when it's copied: NaN, huge values, stripes). 0: none.
+    uint32_t garbage_depth = 0;
+    // The left 60% of the scene moves on its own, a different ±3% of distance every frame (foliage in
+    // wind): the right camera explains well under half of the pixels that change.
+    bool scene_motion = false;
+    // Buffers full of other cameras (moving views and projections), bound in this many slots: more
+    // combinations than discovery keeps candidates for at once (a UE View buffer bound to several
+    // stages).
+    uint32_t flood = 0;
+    // Frames before the camera's buffer is bound at all (a loading screen, a menu): whatever is bound
+    // meanwhile (a flood) has taken every candidate slot by the time it shows up.
+    uint32_t camera_from = 0;
 };
 
 // What discovery should find.

@@ -47,6 +47,11 @@ struct DepthGrid {
     double index_y(double y) const;
 };
 
+// Share of the grid that isn't depth at all: NaN, infinite or outside [0, 1]. A frame read from memory
+// that held something else by then (a transient depth buffer whose memory another pass reused) is
+// mostly this.
+double invalid_depth(const DepthGrid& g);
+
 // Fraction of pixels whose distance changed by more than `rel` between two frames (a sky/geometry
 // flip counts as changed). Needs no projection: raw depth is about proportional to 1/distance
 // (standard: 1 - d, reversed: d).
@@ -59,10 +64,15 @@ double depth_change(const DepthGrid& a, const DepthGrid& b, double rel = 1e-3);
 struct ReprojStats {
     uint32_t tested = 0, landed = 0;  // informative pixels, and those that landed in frame b
     double median_rel = 1.0;  // median |predicted - measured| / measured view z, 1 = failure
+    // Share of the compared pixels within `inlier_error`. The right matrices explain the static
+    // geometry exactly, even where much of the image moves on its own (foliage, characters) or sits
+    // on a depth edge that TAA jitter shifts, which is what spoils the median in such scenes.
+    double explained = 0;
     // Enough informative pixels for a verdict. Too few says nothing about the matrices.
     bool conclusive() const { return tested >= 50; }
 };
 ReprojStats reproject(const DepthGrid& a, const mat::Mat& view_a, const mat::Mat& proj_a, const DepthGrid& b,
-                      const mat::Mat& view_b, const mat::Mat& proj_b, uint32_t stride = 3);
+                      const mat::Mat& view_b, const mat::Mat& proj_b, uint32_t stride = 3,
+                      double inlier_error = 0.005);
 
 }  // namespace lidar

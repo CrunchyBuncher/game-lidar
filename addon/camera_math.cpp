@@ -27,9 +27,17 @@ bool plausible_values(const Mat& m) {
     return nonzero >= 4;
 }
 
-bool is_clear(float d) { return d <= 0.0f || d >= 1.0f; }
+// Sky, or no depth at all (NaN from memory that isn't a depth buffer).
+bool is_clear(float d) { return !(d > 0.0f && d < 1.0f); }
 
 }  // namespace
+
+double invalid_depth(const DepthGrid& g) {
+    if (g.depth.empty()) return 1.0;
+    size_t bad = 0;
+    for (float d : g.depth) bad += !(d >= 0.0f && d <= 1.0f);
+    return double(bad) / double(g.depth.size());
+}
 
 bool is_rigid(const Mat& m) {
     if (!plausible_values(m)) return false;
@@ -221,7 +229,7 @@ double view_distance(double x, double y, float depth, const Mat& inv_proj) {
 }
 
 ReprojStats reproject(const DepthGrid& a, const Mat& view_a, const Mat& proj_a, const DepthGrid& b, const Mat& view_b,
-                      const Mat& proj_b, uint32_t stride) {
+                      const Mat& proj_b, uint32_t stride, double inlier_error) {
     ReprojStats st;
     Mat inv_a, inv_proj_a, inv_proj_b;
     if (!mat::inverse(mat::mul(view_a, proj_a), inv_a) || !mat::inverse(proj_a, inv_proj_a) ||
@@ -291,6 +299,8 @@ ReprojStats reproject(const DepthGrid& a, const Mat& view_a, const Mat& proj_a, 
         }
     }
     if (st.tested == 0 || st.landed * 10 < st.tested || err.empty()) return st;
+    st.explained = double(std::count_if(err.begin(), err.end(), [&](double e) { return e < inlier_error; })) /
+                   double(err.size());
     const auto mid = err.begin() + ptrdiff_t(err.size() / 2);
     std::nth_element(err.begin(), mid, err.end());
     st.median_rel = *mid;

@@ -24,18 +24,30 @@ using Clock = std::chrono::steady_clock;
 
 constexpr size_t kMaxHypotheses = 1024;
 constexpr size_t kMaxTranslations = 256;  // of those, translation vectors
+constexpr uint32_t kPruneAfter = 20;      // frames a hypothesis' buffer was bound before it can be pruned
 constexpr size_t kTranslationsTried = 4;  // per camera-relative candidate, most changing first
 constexpr size_t kRelativeTried = 4;      // camera-relative candidates given translations, best first
 constexpr size_t kHistory = 48;          // frames of values per hypothesis (depth arrives a few frames late)
-constexpr size_t kMaxCandidates = 96;
+// Engines with large uniform buffers (UE's View buffer, bound to several stages) offer over a thousand
+// combinations. When they don't all fit, the ones tested and failed make room for untried ones.
+constexpr size_t kMaxCandidates = 1024;
+constexpr uint32_t kTrial = 6;            // tests before a failing candidate can be retired
 constexpr size_t kDepthFrames = 16;
 constexpr uint32_t kRebuildEvery = 30;   // analyzed frames between candidate rebuilds
 constexpr uint64_t kCensusEvery = 30;    // frames between the report's censuses of every draw
 constexpr double kStill = 0.005;         // depth change below this: the camera didn't move
 constexpr double kMoving = 0.05;         // above: it did
 constexpr double kReprojMotion = 0.08;   // a reprojection test needs at least this much change
-constexpr double kPassError = 0.002;     // median relative depth error of a passing test (right: < 1e-4)
 constexpr double kReprojInterval = 0.1;  // seconds of input time between reprojection rounds
+constexpr double kBadDepth = 0.01;       // share of invalid values (not depth at all) that drops a frame
+// A test passes when the candidate reprojects this share of the changed pixels to within 0.5%, and at
+// least half the share the round's best candidate does. Not the median error: in a scene where
+// foliage sways, characters move and TAA jitter shifts every depth edge, the right camera explains
+// the static geometry exactly but that can be well under half the pixels. A wrong one explains
+// almost none. A round no candidate explains (the scene moved, not the camera) is no verdict.
+constexpr double kInlierError = 0.005;
+constexpr double kInlierPass = 0.15;
+constexpr double kRelativePass = 0.5;
 
 // A buffer as discovery identifies it (a profile's key).
 struct BufId {
@@ -107,14 +119,44 @@ struct Hypothesis {
     double validity() const { return frames_seen ? double(frames_valid) / frames_seen : 0; }
 };
 
+// What the depth checks said about a candidate.
+struct Evidence {
+    uint32_t attempts = 0;  // reprojection rounds it took part in, whether or not any candidate explained them
+    uint32_t reproj_tests = 0, reproj_passes = 0;
+    std::deque<float> errors;  // recent test errors (median)
+    double explained = 0;      // summed share of pixels reprojected, over the tests
+    uint32_t temporal_checks = 0, temporal_agree = 0;
+
+    double temporal() const { return temporal_checks ? double(temporal_agree) / temporal_checks : 0.5; }
+    double error() const {
+        if (errors.empty()) return 1;
+        std::vector<float> e(errors.begin(), errors.end());
+        std::nth_element(e.begin(), e.begin() + ptrdiff_t(e.size() / 2), e.end());
+        return e[e.size() / 2];
+    }
+    double mean_explained() const { return reproj_tests ? explained / reproj_tests : 0; }
+    double score() const {
+        if (reproj_tests >= 3) return 0.75 * reproj_passes / reproj_tests + 0.25 * temporal();
+        return 0.25 * temporal() * std::min(1.0, temporal_checks / 30.0);
+    }
+    bool confident() const {
+        return reproj_tests >= 5 && reproj_passes >= 0.9 * reproj_tests &&
+               (temporal_checks < 10 || temporal() >= 0.8);
+    }
+    // Had its trial and failed most tests, or explained nothing at all (while nothing explains
+    // anything, the right camera isn't among the candidates yet): may make room for an untried one.
+    bool failed() const { return attempts >= kTrial && reproj_passes * 2 < std::max(reproj_tests, 1u); }
+};
+
 struct Candidate {
     CameraProfile profile;
     Loc a, b;  // the first-named matrix, and the projection for pair layouts
     bool pair = false;
     Loc t;  // the translation, if profile.has_translation
-    uint32_t reproj_tests = 0, reproj_passes = 0;
-    std::deque<float> errors;  // recent test errors
-    uint32_t temporal_checks = 0, temporal_agree = 0;
+    Evidence ev;
+    // Its view is another candidate's view of the frame before: that camera's history (engines keep
+    // last frame's matrices for motion vectors and TAA), not the camera the depth was drawn with.
+    bool history = false;
     // The camera's right axis in the world, |component| summed over decoded frames: an FPS camera
     // doesn't roll, so it stays level and the up axis' component stays near 0 as the camera turns.
     double right_abs[3] = {};
@@ -128,22 +170,6 @@ struct Candidate {
     // ModelView: the solver over every frame's draws, and the views it found (nullopt: no pose).
     std::shared_ptr<mv::Solver> solver;
     std::deque<std::pair<uint64_t, std::optional<mat::Mat>>> views;
-
-    double temporal() const { return temporal_checks ? double(temporal_agree) / temporal_checks : 0.5; }
-    double error() const {
-        if (errors.empty()) return 1;
-        std::vector<float> e(errors.begin(), errors.end());
-        std::nth_element(e.begin(), e.begin() + ptrdiff_t(e.size() / 2), e.end());
-        return e[e.size() / 2];
-    }
-    double score() const {
-        if (reproj_tests >= 3) return 0.75 * reproj_passes / reproj_tests + 0.25 * temporal();
-        return 0.25 * temporal() * std::min(1.0, temporal_checks / 30.0);
-    }
-    bool confident() const {
-        return reproj_tests >= 5 && reproj_passes >= 0.9 * reproj_tests &&
-               (temporal_checks < 10 || temporal() >= 0.8);
-    }
 };
 
 int layout_preference(CameraLayout l) {
@@ -160,7 +186,11 @@ int layout_preference(CameraLayout l) {
 }
 
 bool better(const Candidate& x, const Candidate& y) {
-    const int bx = int(x.score() * 20), by = int(y.score() * 20);  // 0.05 buckets, then preferences
+    // A history copy passes most tests its camera passes (both move alike, a frame apart), and more
+    // when noise decides: it never outranks the cameras.
+    if (x.history != y.history) return y.history;
+    const Evidence &ex = x.ev, &ey = y.ev;
+    const int bx = int(ex.score() * 20), by = int(ey.score() * 20);  // 0.05 buckets, then preferences
     if (bx != by) return bx > by;
     if (layout_preference(x.profile.layout) != layout_preference(y.profile.layout))
         return layout_preference(x.profile.layout) < layout_preference(y.profile.layout);
@@ -168,7 +198,7 @@ bool better(const Candidate& x, const Candidate& y) {
     // see (world = identity); the first draw may be any object.
     if (x.profile.latch != y.profile.latch) return x.profile.latch == Latch::Common;
     if (x.profile.key.stage != y.profile.key.stage) return x.profile.key.stage == shader_stage::vertex;
-    if (x.error() != y.error()) return x.error() < y.error();
+    if (ex.error() != ey.error()) return ex.error() < ey.error();
     if (x.profile.key.slot != y.profile.key.slot) return x.profile.key.slot < y.profile.key.slot;
     return x.profile.view_offset < y.profile.view_offset;
 }
@@ -482,6 +512,10 @@ struct Analyzer::State {
     // Buffers holding a camera-relative candidate's matrices: their float3s are tracked as translations.
     std::unordered_set<BufId, BufIdHash> translated_bufs;
     std::map<std::string, Candidate> candidates;  // keyed by the profile text
+    // Candidates that failed and made room for others: they come back into free room, or once every
+    // other proposal has had its turn (the camera may have failed only while nothing moved).
+    std::unordered_set<std::string> retired;
+    size_t refused_untried = 0, refused_retired = 0;  // proposals without room, this rebuild
     std::deque<std::shared_ptr<const DepthFrame>> depths;
     uint64_t last_frame = 0;  // latest analyzed sample frame
     std::vector<uint8_t> window;
@@ -681,7 +715,7 @@ struct Analyzer::State {
             const Hypothesis& h = kv.second;
             // A translation that differs per draw isn't the camera's: make room for others.
             const bool per_draw = h.loc.kind == MatrixKind::Translation && h.per_draw * 5 > h.frames_valid;
-            return h.frames_seen >= 60 && (h.validity() < 0.5 || per_draw);
+            return h.frames_seen >= kPruneAfter && (h.validity() < 0.5 || per_draw);
         });
         translations = 0;
         for (const auto& [loc, h] : hyps) translations += loc.kind == MatrixKind::Translation;
@@ -705,7 +739,8 @@ struct Analyzer::State {
         return std::abs(v.m[3][0]) < 1e-3 && std::abs(v.m[3][1]) < 1e-3 && std::abs(v.m[3][2]) < 1e-3;
     }
 
-    // `supersede`: when full, takes the place of the worst candidate without a translation.
+    // When full, a new candidate takes the place of the worst one that failed its trial (retired: it
+    // only comes back into free room). `supersede`: or of the worst one without a translation.
     void add_candidate(CameraLayout layout, const Hypothesis& a, const Hypothesis* b, Latch latch,
                        const Hypothesis* t = nullptr, bool subtract = false, bool supersede = false) {
         CameraProfile p;
@@ -724,14 +759,24 @@ struct Analyzer::State {
         std::string key = format_profile(p, {});
         if (candidates.contains(key)) return;
         if (candidates.size() >= kMaxCandidates) {
-            if (!supersede) return;
+            if (retired.contains(key)) {
+                ++refused_retired;
+                return;
+            }
             auto worst = candidates.end();
-            for (auto it = candidates.begin(); it != candidates.end(); ++it)
-                if (!it->second.profile.has_translation && (worst == candidates.end() || better(worst->second, it->second)))
-                    worst = it;
-            if (worst == candidates.end()) return;
+            for (auto it = candidates.begin(); it != candidates.end(); ++it) {
+                const Candidate& w = it->second;
+                const bool replaceable = w.ev.failed() || (supersede && !w.profile.has_translation);
+                if (replaceable && (worst == candidates.end() || better(worst->second, w))) worst = it;
+            }
+            if (worst == candidates.end()) {
+                ++refused_untried;
+                return;
+            }
+            retired.insert(worst->first);
             candidates.erase(worst);
         }
+        retired.erase(key);
         candidates.emplace(std::move(key), std::move(c));
     }
 
@@ -838,6 +883,41 @@ struct Analyzer::State {
             }
         }
         add_translated(positions);
+        if (refused_untried == 0 && refused_retired > 0) retired.clear();  // all had a turn: next round
+        refused_untried = refused_retired = 0;
+        mark_history();
+    }
+
+    // Flags the leading candidates whose view, frame after frame while the camera moves, is another
+    // leading candidate's view of the frame before (and not its view of the same frame).
+    void mark_history() {
+        constexpr size_t kTop = 24;
+        constexpr uint64_t kSpan = 16;  // frames compared, back from the latest
+        for (auto& [k, c] : candidates) c.history = false;
+        if (last_frame < kSpan) return;
+        std::vector<Candidate*> top;
+        for (const Candidate* c : ranked()) {
+            if (top.size() >= kTop) break;
+            if (!c->profile.model_view()) top.push_back(const_cast<Candidate*>(c));
+        }
+        std::vector<std::vector<std::optional<mat::Mat>>> views(top.size());  // [candidate][frame]
+        for (size_t i = 0; i < top.size(); ++i)
+            for (uint64_t f = last_frame - kSpan; f <= last_frame; ++f) {
+                mat::Mat v, p;
+                views[i].push_back(decode(*top[i], f, v, p) == 0 ? std::optional(v) : std::nullopt);
+            }
+        for (size_t x = 0; x < top.size(); ++x)
+            for (size_t y = 0; y < top.size() && !top[x]->history; ++y) {
+                if (x == y) continue;
+                uint32_t moving = 0, lagging = 0;
+                for (size_t f = 1; f < views[x].size(); ++f) {
+                    const auto &vx = views[x][f], &vy0 = views[y][f - 1], &vy = views[y][f];
+                    if (!vx || !vy0 || !vy || !view_changed(*vy0, *vy)) continue;
+                    ++moving;
+                    lagging += same_motion(*vx, *vy0) && !same_motion(*vx, *vy);
+                }
+                top[x]->history = moving >= 4 && lagging * 10 >= moving * 8;
+            }
     }
 
     // The candidate's matrices at `frame`, decoded exactly as a profile would. Returns 0 if they
@@ -933,9 +1013,59 @@ struct Analyzer::State {
 
     // ---- 3. Scoring against depth ----------------------------------------------------------
 
+    // Every candidate reprojects `from` into `to`. Candidates reading the same matrices (one uniform
+    // buffer bound to several stages, or both latches agreeing) share one reprojection.
+    void reprojection_round(const DepthFrame& from, const DepthFrame& to) {
+        struct Test {
+            Candidate* c;
+            double explained, error;
+        };
+        std::vector<Test> tests;
+        std::unordered_map<uint64_t, ReprojStats> done;
+        double best = 0;
+        for (auto& [k, c] : candidates) {
+            mat::Mat m[4];  // view and projection at `from`, then at `to`
+            const int ra = decode(c, from.frame, m[0], m[1]), rb = decode(c, to.frame, m[2], m[3]);
+            if (ra == 1 || rb == 1) continue;
+            Test t{&c, 0, 1};
+            if (ra == 0 && rb == 0) {
+                const uint64_t h = hash_bytes(m, sizeof(m));
+                auto it = done.find(h);
+                if (it == done.end())
+                    it = done.emplace(h, reproject(from.grid, m[0], m[1], to.grid, m[2], m[3], 3, kInlierError)).first;
+                // Inconclusive: through its projection hardly any distance changed, though the round
+                // is one where much of the depth did. That's the projection contradicting the depth
+                // (e.g. standard depth read as reversed), not a lack of evidence: it explains nothing.
+                if (it->second.conclusive()) {
+                    t.explained = it->second.explained;
+                    t.error = it->second.median_rel;
+                }
+            }
+            best = std::max(best, t.explained);
+            tests.push_back(t);
+            ++c.ev.attempts;
+        }
+        if (best < kInlierPass) return;  // nothing explains it (the scene moved, not the camera): no verdict
+        ++stats.explained_rounds;
+        for (const Test& t : tests) {
+            Evidence& e = t.c->ev;
+            ++e.reproj_tests;
+            e.reproj_passes += t.explained >= kInlierPass && t.explained >= kRelativePass * best;
+            e.explained += t.explained;
+            e.errors.push_back(float(t.error));
+            if (e.errors.size() > 64) e.errors.pop_front();
+        }
+    }
+
     void add_depth(const std::shared_ptr<const DepthFrame>& df) {
         note_time(df->time);
         ++stats.depth_frames;
+        // Not a depth image: memory another pass had reused when it was copied (transient depth
+        // buffers), or the wrong resource. Comparing against it would look like the camera jumped.
+        if (invalid_depth(df->grid) > kBadDepth) {
+            ++stats.depth_rejected;
+            return;
+        }
         const DepthFrame* prev = nullptr;
         for (auto it = depths.rbegin(); it != depths.rend(); ++it)
             if ((*it)->frame < df->frame) {
@@ -953,8 +1083,13 @@ struct Analyzer::State {
                     mat::Mat v0, p0, v1, p1;
                     const int r0 = decode(c, prev->frame, v0, p0), r1 = decode(c, df->frame, v1, p1);
                     if (r0 == 1 || r1 == 1) continue;
-                    ++c.temporal_checks;
-                    if (r0 == 0 && r1 == 0 && view_changed(v0, v1) == moving) ++c.temporal_agree;
+                    const bool decoded = r0 == 0 && r1 == 0, changed = decoded && view_changed(v0, v1);
+                    // Depth that stays put says the camera did. Depth that changes may be the scene
+                    // moving on its own (foliage, characters, TAA jitter at every edge), so a view that
+                    // stays put then says nothing: reprojection catches a matrix that never moves.
+                    if (moving && decoded && !changed) continue;
+                    ++c.ev.temporal_checks;
+                    if (decoded && changed == moving) ++c.ev.temporal_agree;
                     if (r1 == 0) {
                         for (int i = 0; i < 3; ++i) c.right_abs[i] += std::abs(v1.m[i][0]);
                         ++c.right_frames;
@@ -976,21 +1111,7 @@ struct Analyzer::State {
             if (from != nullptr) {
                 last_reproj = df->time;
                 ++stats.reproj_rounds;
-                for (auto& [k, c] : candidates) {
-                    mat::Mat va, pa, vb, pb;
-                    const int ra = decode(c, from->frame, va, pa), rb = decode(c, df->frame, vb, pb);
-                    if (ra == 1 || rb == 1) continue;
-                    double err = 1;
-                    if (ra == 0 && rb == 0) {
-                        const ReprojStats rs = reproject(from->grid, va, pa, df->grid, vb, pb);
-                        if (!rs.conclusive()) continue;
-                        err = rs.median_rel;
-                    }
-                    ++c.reproj_tests;
-                    c.reproj_passes += err < kPassError;
-                    c.errors.push_back(float(err));
-                    if (c.errors.size() > 64) c.errors.pop_front();
-                }
+                reprojection_round(*from, *df);
             }
         }
 
@@ -1009,16 +1130,19 @@ struct Analyzer::State {
     }
 
     CandidateInfo info(const Candidate& c) {
+        const Evidence& e = c.ev;
         CandidateInfo i;
         i.profile = c.profile;
         i.where = describe(c.profile, registers);
-        i.score = c.score();
-        i.confident = c.confident();
-        i.reproj_tests = c.reproj_tests;
-        i.reproj_passes = c.reproj_passes;
-        i.reproj_error = c.error();
-        i.temporal_checks = c.temporal_checks;
-        i.temporal_agree = c.temporal_agree;
+        i.score = e.score();
+        i.confident = e.confident();
+        i.reproj_tests = e.reproj_tests;
+        i.reproj_passes = e.reproj_passes;
+        i.reproj_error = e.error();
+        i.explained = e.mean_explained();
+        i.history = c.history;
+        i.temporal_checks = e.temporal_checks;
+        i.temporal_agree = e.temporal_agree;
         mat::Mat v, p;
         i.have_values = decode(c, last_frame, v, p, i.view, i.proj) == 0;
         if (i.have_values) {
@@ -1042,18 +1166,22 @@ struct Analyzer::State {
 
     void write_report(std::ostream& f) {
         char line[512];
-        f << "game-lidar discovery report\n" << status_line(status(0)) << "\n\n";
+        f << "game-lidar discovery report\n" << status_line(status(0)) << "\n";
+        std::snprintf(line, sizeof(line), "%zu candidates, %zu retired (failed, made room for others)\n\n",
+                      candidates.size(), retired.size());
+        f << line;
         f << "== Candidates (best first) ==\n";
         int rank = 0;
         for (const Candidate* c : ranked()) {
             const CandidateInfo i = info(*c);
             std::snprintf(line, sizeof(line),
-                          "#%d %-18s %-34s %s-major latch=%-6s score %.2f%s  reproj %u/%u (err %.4f)  "
+                          "#%d %-18s %-34s %s-major latch=%-6s score %.2f%s%s  reproj %u/%u (err %.4f, explains %.0f%%)  "
                           "still/moving %u/%u",
                           ++rank, layout_name(c->profile.layout), i.where.c_str(),
                           c->profile.column_major ? "column" : "row", latch_name(c->profile.latch), i.score,
-                          i.confident ? " CONFIDENT" : "", i.reproj_passes, i.reproj_tests, i.reproj_error,
-                          i.temporal_agree, i.temporal_checks);
+                          i.confident ? " CONFIDENT" : "", i.history ? " LAST-FRAME" : "", i.reproj_passes,
+                          i.reproj_tests, i.reproj_error,
+                          100 * i.explained, i.temporal_agree, i.temporal_checks);
             f << line;
             if (i.have_values && i.info.valid)
                 std::snprintf(line, sizeof(line), "  fov %.1f near %.4g far %.6g %s\n", i.info.fov_y_deg, i.info.near_z,
@@ -1122,26 +1250,28 @@ struct Analyzer::State {
 };
 
 std::string status_line(const Status& s) {
-    char buf[360];
+    char buf[480];
     std::snprintf(buf, sizeof(buf),
                   "%.1f s: %llu frames analyzed (%llu dropped, %.2f ms each), %u draws/%u sampled/%u buffers "
                   "last frame; hypotheses: %zu rigid, %zu proj, %zu viewproj, %zu invviewproj, %zu translation; depth %llu frames "
-                  "(%llu still, %llu moving), %llu reprojection rounds",
+                  "(%llu not depth, %llu still, %llu moving), %llu reprojection rounds (%llu explained)",
                   s.seconds, (unsigned long long)s.frames_analyzed, (unsigned long long)s.frames_dropped, s.analyze_ms,
                   s.last_draws, s.last_samples, s.last_buffers, s.hypotheses[0], s.hypotheses[1], s.hypotheses[2],
                   s.hypotheses[3], s.hypotheses[4],
-                  (unsigned long long)s.depth_frames, (unsigned long long)s.still_frames,
-                  (unsigned long long)s.moving_frames, (unsigned long long)s.reproj_rounds);
+                  (unsigned long long)s.depth_frames, (unsigned long long)s.depth_rejected,
+                  (unsigned long long)s.still_frames, (unsigned long long)s.moving_frames,
+                  (unsigned long long)s.reproj_rounds, (unsigned long long)s.explained_rounds);
     return buf;
 }
 
 std::string candidate_line(const CandidateInfo& c) {
-    char buf[320];
-    int n = std::snprintf(buf, sizeof(buf), "%s at %s, %s-major, latch %s: score %.2f%s, reprojection %u/%u (error %.4f), "
-                                            "still/moving %u/%u",
+    char buf[360];
+    int n = std::snprintf(buf, sizeof(buf), "%s at %s, %s-major, latch %s: score %.2f%s%s, reprojection %u/%u (error %.4f, "
+                                            "explains %.0f%%), still/moving %u/%u",
                           layout_name(c.profile.layout), c.where.c_str(), c.profile.column_major ? "column" : "row",
-                          latch_name(c.profile.latch), c.score, c.confident ? " (confident)" : "", c.reproj_passes,
-                          c.reproj_tests, c.reproj_error, c.temporal_agree, c.temporal_checks);
+                          latch_name(c.profile.latch), c.score, c.confident ? " (confident)" : "",
+                          c.history ? " (last frame's)" : "", c.reproj_passes,
+                          c.reproj_tests, c.reproj_error, 100 * c.explained, c.temporal_agree, c.temporal_checks);
     if (c.have_values && c.info.valid && n >= 0 && size_t(n) < sizeof(buf))
         std::snprintf(buf + n, sizeof(buf) - n, "; FOV %.1f, near %.4g, %s depth", c.info.fov_y_deg, c.info.near_z,
                       c.info.reversed ? "reversed" : "standard");
