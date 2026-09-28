@@ -53,7 +53,7 @@ bool App::create(const wchar_t* title, int w, int h, bool d3d11) {
     width = cr.right - cr.left;
     height = cr.bottom - cr.top;
     if (!d3d11) {  // the caller brings its own device and swap chain
-        ShowWindow(hwnd, SW_SHOW);
+        show();
         return true;
     }
 
@@ -89,8 +89,17 @@ bool App::create(const wchar_t* title, int w, int h, bool d3d11) {
     factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
     create_back_buffer();
 
-    ShowWindow(hwnd, SW_SHOW);
+    show();
     return true;
+}
+
+void App::show() {
+    if (!background) {
+        ShowWindow(hwnd, SW_SHOW);
+        return;
+    }
+    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
 void App::create_back_buffer() {

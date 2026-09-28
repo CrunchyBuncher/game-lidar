@@ -68,8 +68,9 @@ It can start before or after the producer, and reconnects when the game restarts
 | `viewer/` | The point-cloud viewer and its shaders |
 | `common/` | Frame protocol, shared-memory ring, window/device helpers |
 | `profiles/` | Game profiles (`.toml`) |
-| `tests/` | Unit tests (`lidar_tests`): camera math, profiles, discovery, root layouts, model-view solver |
-| `tools/verify/` | `lidar_verify`: checks a live ring or a saved `.ply` |
+| `tests/unit/` | Unit tests (`lidar_tests`), one file per area: ring, unprojection, profiles, discovery, root layouts, model-view solver |
+| `tests/e2e/` | End-to-end tests: the addon in the test game, per graphics API (`run_e2e.ps1`) |
+| `tools/verify/` | `lidar_verify`: checks a live ring, a saved `.ply`, or two captured frames against each other |
 | `tools/fake_game/` | A test game for exercising the addon without a real game (below) |
 
 ## Build
@@ -94,8 +95,60 @@ cmake --build build-win32 --config Release --target lidar_capture lidar_tests
   with a sane pose.
 
 ## Testing
+Close any game with the addon first: the tests share the frame ring with it.
+
+### Unit tests
+One file per area in `tests/unit/`, each a `TEST_CASE(group, name)`. CTest runs one entry per
+group (`unit.ring`, `unit.profile`, ...); add a new file's group to `UNIT_TEST_GROUPS` in
+CMakeLists.txt.
 ```powershell
-build\bin\Release\lidar_tests.exe
+ctest --test-dir build -C Release
+build\bin\Release\lidar_tests.exe --list
+build\bin\Release\lidar_tests.exe profile discovery.reproject
+```
+
+### End-to-end tests
+`tests/e2e/run_e2e.ps1` runs the addon in the test game and checks its frames with `lidar_verify`.
+There is one list of cases (`$Cases`). Each graphics API is an environment (`$Environments`): its
+rig folder, `--api` flag, what the reference needs to match it, and its depth tolerance. Every case
+runs in every selected environment, in all three depth modes, or only the ones in its `Depths`
+(`-Depth all` runs every mode). Cases for a feature only one API has list it in `Apis`, and the
+others skip them. 99% of points must lie within 5 mm of the true scene. With several APIs, the frames each one captured of the frozen
+scene are then compared with each other (`lidar_verify compare`), so the APIs must agree among
+themselves too.
+```powershell
+tests\e2e\run_e2e.ps1                                     # D3D11, D3D12, D3D9, then compare
+tests\e2e\run_e2e.ps1 -Api d3d12                          # one API
+tests\e2e\run_e2e.ps1 -Api d3d11,d3d9 -Case exact -Depth reversed
+```
+It needs a Release build of `lidar_verify`, `lidar_capture` and `fake_game`, and ReShade in
+`sandbox\fake_game\` (the D3D9 rig gets the same DLL as `d3d9.dll` if it has none). The games open
+behind other windows (`fake_game --background`, no console), so they don't take the focus. It sets `Profile` in the rigs' ReShade.ini per case and restores the
+file afterwards. Logs and captured frames go to `build\e2e\`. The whole run takes a few minutes.
+
+### Viewer end-to-end tests
+`tests/e2e/run_viewer_e2e.ps1` checks what the viewer makes of the addon's frames: GPU
+unprojection, voxel dedupe and carving (`run_e2e.ps1` only checks the frames, with `lidar_verify`'s
+CPU unprojection). One flow, two scenarios, in each of the three API environments: 6 runs. Per run,
+the ReShade-injected test game walks its camera path faster than normal (`--speed`, the NPC keeps
+its pace), `lidar_viewer` saves a scan about half a lap in (`--out`, `--save-after`,
+`--exit-after`), and `lidar_verify ply` checks it.
+- `npc-carve`: the NPC on and carving on, at 4x, saved after 8 s. 99.5% of points within 5 mm. The
+  NPC where it stands at save time isn't in the static true scene, so its points count as errors
+  (measured 0.05-0.13%); with carving broken its whole trail stays (0.83-1.16%), which fails. The
+  trail needs the NPC to have walked a while, hence the slower camera: at 8x it would pass.
+- `static`: `--no-npc` and the viewer's `--no-carve`, at 16x, saved after 2 s. 99.9% within 5 mm
+  (measured: none off).
+```powershell
+tests\e2e\run_viewer_e2e.ps1                              # 6 runs, under a minute
+tests\e2e\run_viewer_e2e.ps1 -Api d3d9 -Scenario static
+```
+Both suites share the environments and helpers through `tests/e2e/e2e_common.ps1`. It needs a
+Release build of `lidar_viewer` too; the viewer opens in the background as well
+(`lidar_viewer --background`). Logs and scans go to `build\e2e\viewer-logs\`.
+
+### By hand
+```powershell
 # with a producer running (the addon in a game, or the test game):
 build\bin\Release\lidar_verify.exe ring --frames 60
 build\bin\Release\lidar_verify.exe ply scans\some_scan.ply
@@ -115,7 +168,8 @@ With `--no-publish` the addon does the capturing. Without it, the test game publ
 depth and camera, as a reference producer.
 
 **Options:** `--depth standard|reversed|reversed-infinite`, `--capture-width 480`,
-`--no-npc`, `--no-color`, `--tint-until T`, `--fov 70`, `--no-publish` (leave the ring to the addon). Keys: `M` manual camera (WASD/QE + right-drag),
+`--no-npc`, `--no-color`, `--tint-until T`, `--fov 70`, `--speed X` (walk the camera path X times as
+fast; the NPC keeps its pace), `--no-publish` (leave the ring to the addon). Keys: `M` manual camera (WASD/QE + right-drag),
 `Space` pause capture.
 
 `--api d3d12` renders the same level with D3D12 (render only, so the addon must publish),

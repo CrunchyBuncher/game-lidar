@@ -128,6 +128,7 @@ struct PendingCapture {
 
 int run_d3d11(const Options& opt) {
     App app;
+    app.background = opt.background;
     if (!app.create(L"fake_game", opt.width, opt.height)) return 1;
     ID3D11Device* dev = app.dev.Get();
     ID3D11DeviceContext* ctx = app.ctx.Get();

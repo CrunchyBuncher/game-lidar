@@ -22,10 +22,13 @@
 //                  [--depth standard|reversed|reversed-infinite] [--capture-width 480]
 //                  [--capture-every 1] [--fov 70] [--no-npc] [--no-color]
 //                  [--size 1280x720] [--duration seconds] [--no-publish]
-//                  [--ring NAME] [--freeze T] [--tint-until T] [--decoy-draws N]
+//                  [--ring NAME] [--freeze T] [--speed X] [--tint-until T] [--decoy-draws N]
+//                  [--background]
 //        --no-publish: render only, leave the ring to the ReShade addon.
+//        --background: open behind other windows without taking the focus (the e2e tests).
 //        --ring: publish to another mapping (e.g. a reference for `lidar_verify addon`).
 //        --freeze: hold the scripted camera at path time T seconds.
+//        --speed: move the scripted camera X times as fast (walk, turns, bob); the NPC keeps its pace.
 //        --tint-until: publish magenta color, with the true depth, for the first T seconds (D3D11): a
 //                      stand-in for an effect over the scene, to test the viewer's color updates.
 //        --d3d12-debug: D3D12 debug layer on; its warnings/errors go to stderr (exit code 3 on errors).
@@ -110,6 +113,8 @@ Options parse(int argc, char** argv) {
             o.fov_deg = float(std::atof(next()));
         } else if (a == "--no-npc") {
             o.npc = false;
+        } else if (a == "--background") {
+            o.background = true;
         } else if (a == "--no-color") {
             o.color = false;
         } else if (a == "--size") {
@@ -123,6 +128,8 @@ Options parse(int argc, char** argv) {
             o.ring.assign(n.begin(), n.end());
         } else if (a == "--freeze") {
             o.freeze = float(std::atof(next()));
+        } else if (a == "--speed") {
+            o.speed = float(std::atof(next()));
         } else if (a == "--tint-until") {
             o.tint_until = float(std::atof(next()));
         } else if (a == "--decoy-draws") {
@@ -174,7 +181,7 @@ void CameraRig::update(const App& app, const Options& opt, float dt) {
         if (app.key_down('E')) pose.pos[1] += speed;
         if (app.key_down('Q')) pose.pos[1] -= speed;
     } else {
-        path_time = opt.freeze >= 0 ? opt.freeze : path_time + dt;
+        path_time = opt.freeze >= 0 ? opt.freeze : path_time + dt * opt.speed;
         pose = scene::camera_path(float(path_time));
     }
 }
