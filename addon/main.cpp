@@ -9,7 +9,7 @@
 //
 // Only the DepthCapture and CbufferSource implementations are API-specific (backends.cpp).
 //
-// Discovery mode (discovery.h) runs on top of both paths: the camera tracker samples draws, the
+// Discovery mode (discovery/, its own module) runs on top of both paths: the camera tracker samples draws, the
 // published depth frames are tapped from the ring, and its candidates can be previewed (used as an
 // unsaved profile) or saved as lidar_profile.toml.
 #include <imgui.h>
@@ -57,6 +57,8 @@ constexpr char kSection[] = "LIDAR";
 constexpr char kDefaultProfile[] = "lidar_profile.toml";
 constexpr char kDiscoveryReport[] = "lidar_discovery.txt";
 constexpr uint32_t kDiscoveryBytes = 8192;  // per bound buffer at a sampled draw
+constexpr double kRecordSeconds = 30;       // discovery recordings (discovery/README.md)
+constexpr uint64_t kRecordMaxBytes = 2ull << 30;
 
 enum class DepthMode : int { Standard = 0, Reversed = 1, ReversedInfinite = 2 };
 constexpr const char* kCropKeys[4] = {"ColorCropLeft", "ColorCropTop", "ColorCropRight", "ColorCropBottom"};
@@ -73,16 +75,20 @@ struct Settings {
     float far_z = 1000.0f;
     int depth_mode = int(DepthMode::Reversed);
     // Discovery, read from the ini only (for unattended runs): start with the game, save the best
-    // candidate after this many seconds once it's confident (0 = never), draws sampled per frame.
+    // candidate after this many seconds once it's confident (0 = never), draws sampled per frame,
+    // record the session for this many seconds (0 = don't).
     bool discovery_autostart = false;
     int discovery_autosave = 0;
     int discovery_samples = 48;
+    int discovery_record = 0;
 
     void load() {
         reshade::get_config_value(nullptr, kSection, "DiscoveryAutoStart", discovery_autostart);
         reshade::get_config_value(nullptr, kSection, "DiscoveryAutoSave", discovery_autosave);
         reshade::get_config_value(nullptr, kSection, "DiscoverySamples", discovery_samples);
         discovery_samples = std::clamp(discovery_samples, 4, 512);
+        reshade::get_config_value(nullptr, kSection, "DiscoveryRecord", discovery_record);
+        discovery_record = std::clamp(discovery_record, 0, 600);
         reshade::get_config_value(nullptr, kSection, "Enabled", enabled);
         reshade::get_config_value(nullptr, kSection, "Color", color);
         for (int i = 0; i < 4; ++i) {
@@ -279,9 +285,43 @@ void camera_position(const float view[16], double pos[3]) {
 
 // ---- Discovery ------------------------------------------------------------------------------
 
-void start_discovery() {
+const char* api_text(device_api api) {
+    switch (api) {
+        case device_api::d3d9: return "d3d9";
+        case device_api::d3d11: return "d3d11";
+        case device_api::d3d12: return "d3d12";
+        default: return "other";
+    }
+}
+
+std::string exe_stem() {
+    wchar_t buf[MAX_PATH];
+    const DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    return std::filesystem::path(std::wstring(buf, n)).stem().string();
+}
+
+// lidar_discovery_<exe>_<date>.disc next to the exe.
+std::filesystem::path recording_path() {
+    const std::time_t now = std::time(nullptr);
+    char date[32];
+    std::strftime(date, sizeof(date), "%Y%m%d_%H%M%S", std::localtime(&now));
+    return game_dir() / ("lidar_discovery_" + exe_stem() + "_" + date + ".disc");
+}
+
+// `record_seconds` > 0: also records the session from its start (a recording replays exactly only
+// from the analyzer's first input).
+void start_discovery(double record_seconds = 0) {
     if (g_source == nullptr || g_discovering) return;
     g_discovery.start(g_device->get_api() == device_api::d3d9);
+    if (record_seconds > 0) {
+        const std::filesystem::path path = recording_path();
+        char note[256];
+        std::snprintf(note, sizeof(note), "game=%s\napi=%s\nsamples_per_frame=%d\nbuffer_bytes=%u\ncapture_width=%d\n",
+                      exe_stem().c_str(), api_text(g_device->get_api()), g_settings.discovery_samples, kDiscoveryBytes,
+                      g_settings.capture_width);
+        g_discovery.start_recording(path, note, record_seconds, kRecordMaxBytes);
+        log_info("Discovery recording to " + path.string());
+    }
     cam::configure_discovery(g_device, g_source.get(), uint32_t(g_settings.discovery_samples), kDiscoveryBytes);
     g_discovering = true;
     g_ring_seen = g_ring.latest_seq();
@@ -300,18 +340,7 @@ void stop_discovery() {
     log_info("Discovery stopped.");
 }
 
-std::string candidate_line(const disc::CandidateInfo& c) {
-    char buf[320];
-    int n = std::snprintf(buf, sizeof(buf), "%s at %s, %s-major, latch %s: score %.2f%s, reprojection %u/%u (error %.4f), "
-                                            "still/moving %u/%u",
-                          layout_name(c.profile.layout), c.where.c_str(), c.profile.column_major ? "column" : "row",
-                          latch_name(c.profile.latch), c.score, c.confident ? " (confident)" : "", c.reproj_passes,
-                          c.reproj_tests, c.reproj_error, c.temporal_agree, c.temporal_checks);
-    if (c.have_values && c.info.valid)
-        std::snprintf(buf + n, sizeof(buf) - n, "; FOV %.1f, near %.4g, %s depth", c.info.fov_y_deg, c.info.near_z,
-                      c.info.reversed ? "reversed" : "standard");
-    return buf;
-}
+using disc::candidate_line;
 
 void log_discovery(const disc::Status& s) {
     log_info("Discovery " + disc::status_line(s));
@@ -680,7 +709,7 @@ void on_init_device(device* dev) {
     g_settings.load();
     if (!g_ring.open()) g_init_error = "failed to create the shared-memory ring";
     reload_profile();
-    if (g_settings.discovery_autostart) start_discovery();
+    if (g_settings.discovery_autostart) start_discovery(g_settings.discovery_record);
 }
 
 // Before a depth clear: if it's the captured depth-stencil and this pass is its busiest so far this
@@ -995,6 +1024,27 @@ void draw_discovery_section() {
         g_discovery.request_report(game_dir() / kDiscoveryReport);
         g_disc_message = g_discovering ? "Writing " + (game_dir() / kDiscoveryReport).string()
                                        : "Start discovery first: the report is written by it.";
+    }
+    ImGui::SameLine();
+    const disc::RecordingStatus rec = g_discovery.recording();
+    if (rec.active) {
+        if (ImGui::Button("Stop recording")) g_discovery.stop_recording();
+    } else if (ImGui::Button("Record")) {
+        // From a fresh start, so the recording holds everything the analyzer saw.
+        stop_discovery();
+        start_discovery(kRecordSeconds);
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Restarts discovery and records its inputs for %.0f s to a .disc file next to the game, for\n"
+                          "lidar_discover to replay offline (discovery/README.md). Move and turn the camera meanwhile.",
+                          kRecordSeconds);
+    if (!rec.path.empty()) {
+        if (!rec.error.empty())
+            ImGui::TextColored(kWarn, "Recording failed: %s", rec.error.c_str());
+        else
+            ImGui::TextDisabled("%s %s: %.0f s, %.1f MB, %llu sample / %llu depth frames", rec.active ? "Recording" : "Recorded",
+                                rec.path.filename().string().c_str(), rec.seconds, rec.bytes / 1048576.0,
+                                (unsigned long long)rec.sample_frames, (unsigned long long)rec.depth_frames);
     }
     if (!g_disc_message.empty()) ImGui::TextDisabled("%s", g_disc_message.c_str());
 

@@ -55,15 +55,25 @@ target_sources(lidar_viewer PRIVATE
   ${IMGUI_DIR}/backends/imgui_impl_win32.cpp ${IMGUI_DIR}/backends/imgui_impl_dx11.cpp)
 target_include_directories(lidar_viewer PRIVATE ${IMGUI_DIR} ${IMGUI_DIR}/backends)
 
+enable_testing()
+
+# The camera core: profiles, camera matrix math, the model-view solver and the draw data the camera
+# tracker records. Pure (no ReShade calls), shared by the addon, discovery and the tests.
+add_library(lidar_camera STATIC addon/profile.cpp addon/camera_math.cpp addon/modelview.cpp addon/draw_data.cpp)
+target_include_directories(lidar_camera PUBLIC addon ${reshade_sdk_SOURCE_DIR}/include)
+target_link_libraries(lidar_camera PUBLIC lidar_common)
+
+# Discovery: its own module, with its own tests and replay tool (discovery/README.md).
+add_subdirectory(discovery)
+
 add_library(lidar_capture SHARED
-  addon/main.cpp addon/backends.cpp addon/depth_tracker.cpp addon/camera_tracker.cpp addon/profile.cpp addon/watchdog.cpp
-  addon/camera_math.cpp addon/discovery.cpp addon/modelview.cpp
+  addon/main.cpp addon/backends.cpp addon/depth_tracker.cpp addon/camera_tracker.cpp addon/watchdog.cpp
   addon/d3d11/capture_d3d11.cpp addon/d3d11/cbuffer_d3d11.cpp
   addon/d3d12/capture_d3d12.cpp addon/d3d12/cbuffer_d3d12.cpp addon/d3d12/root_layout.cpp
   addon/d3d9/capture_d3d9.cpp addon/d3d9/constants_d3d9.cpp)
 target_include_directories(lidar_capture PRIVATE addon ${reshade_sdk_SOURCE_DIR}/include ${reshade_imgui_SOURCE_DIR})
 target_compile_definitions(lidar_capture PRIVATE ImTextureID=ImU64)
-target_link_libraries(lidar_capture PRIVATE lidar_common delayimp)
+target_link_libraries(lidar_capture PRIVATE lidar_camera lidar_discovery delayimp)
 # Only load the shader compiler once a capture actually starts, not in every game the addon is in.
 target_link_options(lidar_capture PRIVATE /DELAYLOAD:d3dcompiler_47.dll)
 # ReShade only looks for the suffix matching its own bitness (32-bit games need .addon32).
@@ -84,14 +94,13 @@ foreach(dir ${CMAKE_SOURCE_DIR}/sandbox/fake_game ${FAKE_GAME_D3D9_DIR})
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_SOURCE_DIR}/profiles/fake_game_modelview.toml ${dir}/)
 endforeach()
 
-enable_testing()
-# Unit tests: one file per area, one CTest entry per group (lidar_tests <group>).
-set(UNIT_TEST_GROUPS ring unproject profile discovery root_layout modelview)
+# Unit tests: one file per area, one CTest entry per group (lidar_tests <group>). Discovery's are in
+# discovery/tests (lidar_discovery_tests).
+set(UNIT_TEST_GROUPS ring unproject profile root_layout modelview)
 list(TRANSFORM UNIT_TEST_GROUPS REPLACE "(.+)" "tests/unit/\\1.cpp" OUTPUT_VARIABLE UNIT_TEST_SOURCES)
-add_executable(lidar_tests tests/unit/main.cpp ${UNIT_TEST_SOURCES}
-  addon/profile.cpp addon/camera_math.cpp addon/modelview.cpp addon/d3d12/root_layout.cpp)
-target_include_directories(lidar_tests PRIVATE addon ${reshade_sdk_SOURCE_DIR}/include)
-target_link_libraries(lidar_tests PRIVATE lidar_common)
+add_executable(lidar_tests tests/common/test_main.cpp ${UNIT_TEST_SOURCES} addon/d3d12/root_layout.cpp)
+target_include_directories(lidar_tests PRIVATE tests/common)
+target_link_libraries(lidar_tests PRIVATE lidar_camera)
 foreach(group ${UNIT_TEST_GROUPS})
   add_test(NAME unit.${group} COMMAND lidar_tests ${group})
 endforeach()

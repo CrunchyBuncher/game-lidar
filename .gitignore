@@ -3,3 +3,4 @@ build-win32/
 scans/
 *.ply
 sandbox/
+*.disc
