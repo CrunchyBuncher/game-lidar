@@ -30,6 +30,10 @@ public:
     using MessageHook = bool (*)(HWND, UINT, WPARAM, LPARAM, LRESULT& result);
     MessageHook message_hook = nullptr;
 
+    // Set before create(): open the window behind the others without activating it, so it doesn't
+    // take the focus (automated test runs).
+    bool background = false;
+
     HWND hwnd = nullptr;
     int width = 0, height = 0;
     bool resized = false;  // set by pump() when the window (and the D3D11 back buffer) was resized
@@ -45,6 +49,7 @@ private:
     static LRESULT CALLBACK wnd_proc(HWND, UINT, WPARAM, LPARAM);
     LRESULT handle(UINT msg, WPARAM wp, LPARAM lp);
     void create_back_buffer();
+    void show();
     void unfocus();
 
     bool keys_[256] = {};

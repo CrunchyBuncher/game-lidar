@@ -95,6 +95,7 @@ struct Options {
     std::wstring ring;
     float freeze = -1;  // < 0: camera follows the path
     uint32_t decoy_draws = 0;  // D3D12 root CBVs: draws before the scene with other constants at b0
+    bool background = false;   // open behind other windows without taking the focus
 };
 
 Options parse(int argc, char** argv);

@@ -85,8 +85,15 @@ foreach(dir ${CMAKE_SOURCE_DIR}/sandbox/fake_game ${FAKE_GAME_D3D9_DIR})
 endforeach()
 
 enable_testing()
-add_executable(lidar_tests tests/test_main.cpp addon/profile.cpp addon/camera_math.cpp addon/modelview.cpp
-  addon/d3d12/root_layout.cpp)
+# Unit tests: one file per area, one CTest entry per group (lidar_tests <group>).
+set(UNIT_TEST_GROUPS ring unproject profile discovery root_layout modelview)
+list(TRANSFORM UNIT_TEST_GROUPS REPLACE "(.+)" "tests/unit/\\1.cpp" OUTPUT_VARIABLE UNIT_TEST_SOURCES)
+add_executable(lidar_tests tests/unit/main.cpp ${UNIT_TEST_SOURCES}
+  addon/profile.cpp addon/camera_math.cpp addon/modelview.cpp addon/d3d12/root_layout.cpp)
 target_include_directories(lidar_tests PRIVATE addon ${reshade_sdk_SOURCE_DIR}/include)
 target_link_libraries(lidar_tests PRIVATE lidar_common)
-add_test(NAME lidar_tests COMMAND lidar_tests)
+foreach(group ${UNIT_TEST_GROUPS})
+  add_test(NAME unit.${group} COMMAND lidar_tests ${group})
+endforeach()
+# End-to-end tests (tests/e2e/run_e2e.ps1) need ReShade installed in sandbox/, so they aren't
+# registered here: run them by hand.

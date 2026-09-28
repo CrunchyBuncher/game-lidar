@@ -22,8 +22,9 @@
 //                  [--depth standard|reversed|reversed-infinite] [--capture-width 480]
 //                  [--capture-every 1] [--fov 70] [--no-npc] [--no-color]
 //                  [--size 1280x720] [--duration seconds] [--no-publish]
-//                  [--ring NAME] [--freeze T] [--tint-until T] [--decoy-draws N]
+//                  [--ring NAME] [--freeze T] [--tint-until T] [--decoy-draws N] [--background]
 //        --no-publish: render only, leave the ring to the ReShade addon.
+//        --background: open behind other windows without taking the focus (the e2e tests).
 //        --ring: publish to another mapping (e.g. a reference for `lidar_verify addon`).
 //        --freeze: hold the scripted camera at path time T seconds.
 //        --tint-until: publish magenta color, with the true depth, for the first T seconds (D3D11): a
@@ -110,6 +111,8 @@ Options parse(int argc, char** argv) {
             o.fov_deg = float(std::atof(next()));
         } else if (a == "--no-npc") {
             o.npc = false;
+        } else if (a == "--background") {
+            o.background = true;
         } else if (a == "--no-color") {
             o.color = false;
         } else if (a == "--size") {

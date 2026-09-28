@@ -9,7 +9,11 @@
 //       --ring Local\game_lidar_ref` as reference. Same T, same window size.
 //       --depth-tol: largest per-pixel depth difference that still counts as a match (default 0,
 //       exact). D3D9 against a `--d24` reference needs 6e-8 in reversed modes: one 24-bit step.
+//   lidar_verify compare <a> <b> [--depth-tol 0] [--matrix-tol 0]
+//                                                  check that two frames saved with --dump agree
+//       (the end-to-end tests compare what each graphics API captured of the same frozen scene).
 //
+// `ring` and `addon` take --dump <file>: save the last frame received, for `compare`.
 // `ring` needs every frame to carry a pose (fake_game itself, or the addon with a profile).
 // Run the fake game with --no-npc, since the moving NPC isn't in the reference scene.
 // Exits non-zero if fewer than 99% of points lie within tolerance of a surface.
@@ -46,7 +50,112 @@ int report(std::vector<float>& err, float tol) {
     return frac >= 0.99 ? 0 : 1;
 }
 
-int verify_ring(int frames_wanted, float tol) {
+// A frame on disk, for `compare`: magic, header, depth, then color if the header's flags have it.
+constexpr uint32_t kDumpMagic = 0x4450444C;  // "LDPD"
+
+bool save_frame(const char* path, const Frame& f) {
+    FILE* out = std::fopen(path, "wb");
+    if (!out) {
+        std::printf("cannot write %s\n", path);
+        return false;
+    }
+    std::fwrite(&kDumpMagic, sizeof(kDumpMagic), 1, out);
+    std::fwrite(&f.header, sizeof(f.header), 1, out);
+    std::fwrite(f.depth.data(), sizeof(float), f.depth.size(), out);
+    if (f.header.flags & kFlagHasColor) std::fwrite(f.color.data(), sizeof(uint32_t), f.color.size(), out);
+    std::fclose(out);
+    return true;
+}
+
+bool load_frame(const char* path, Frame& f) {
+    FILE* in = std::fopen(path, "rb");
+    uint32_t magic = 0;
+    bool ok = in && std::fread(&magic, sizeof(magic), 1, in) == 1 && magic == kDumpMagic &&
+              std::fread(&f.header, sizeof(f.header), 1, in) == 1 && f.header.width <= kMaxWidth &&
+              f.header.height <= kMaxHeight;
+    if (ok) {
+        const size_t n = size_t(f.header.width) * f.header.height;
+        f.depth.resize(n);
+        ok = std::fread(f.depth.data(), sizeof(float), n, in) == n;
+        f.color.clear();
+        if (ok && (f.header.flags & kFlagHasColor)) {
+            f.color.resize(n);
+            ok = std::fread(f.color.data(), sizeof(uint32_t), n, in) == n;
+        }
+    }
+    if (in) std::fclose(in);
+    if (!ok) std::printf("cannot read frame dump %s\n", path);
+    return ok;
+}
+
+// Pixels whose color is more than kColorTol steps away in some channel (rasterization differs
+// slightly between APIs). Pixels without color (alpha 0: cropped) aren't compared.
+constexpr int kColorTol = 8;
+bool color_differs(uint32_t a, uint32_t b) {
+    for (int c = 0; c < 24; c += 8)
+        if (std::abs(int((a >> c) & 0xFF) - int((b >> c) & 0xFF)) > kColorTol) return true;
+    return false;
+}
+
+float matrix_diff(const float a[16], const float b[16]) {
+    float d = 0;
+    for (int i = 0; i < 16; ++i) d = std::max(d, std::abs(a[i] - b[i]));
+    return d;
+}
+
+// Two captures of the same frozen scene (e.g. from different graphics APIs) must agree: size, pose,
+// matrices, depth within depth_tol, and color where both have it.
+int compare_frames(const char* path_a, const char* path_b, float depth_tol, float matrix_tol) {
+    Frame a, b;
+    if (!load_frame(path_a, a) || !load_frame(path_b, b)) return 2;
+    if (a.header.width != b.header.width || a.header.height != b.header.height ||
+        a.header.src_width != b.header.src_width || a.header.src_height != b.header.src_height) {
+        std::printf("size mismatch: %ux%u of %ux%u vs %ux%u of %ux%u -> FAIL\n", a.header.width, a.header.height,
+                    a.header.src_width, a.header.src_height, b.header.width, b.header.height, b.header.src_width,
+                    b.header.src_height);
+        return 1;
+    }
+    bool fail = false;
+    const bool pose_a = a.header.flags & kFlagPoseValid, pose_b = b.header.flags & kFlagPoseValid;
+    const float view_diff = matrix_diff(a.header.view, b.header.view);
+    const float proj_diff = matrix_diff(a.header.proj, b.header.proj);
+    std::printf("pose: %s / %s\n", pose_a ? "yes" : "no", pose_b ? "yes" : "no");
+    std::printf("view max |diff| %.3g, projection max |diff| %.3g (tolerance %.3g)\n", view_diff, proj_diff,
+                matrix_tol);
+    fail |= pose_a != pose_b || proj_diff > matrix_tol || (pose_a && view_diff > matrix_tol);
+
+    float max_diff = 0;
+    size_t differ = 0, mismatched = 0;
+    for (size_t i = 0; i < a.depth.size(); ++i) {
+        const float d = std::abs(a.depth[i] - b.depth[i]);
+        max_diff = std::max(max_diff, d);
+        differ += d != 0;
+        mismatched += d > depth_tol;
+    }
+    std::printf("depth: %zu of %zu pixels differ, max |diff| %.3g, %zu beyond %.3g\n", differ, a.depth.size(),
+                max_diff, mismatched, depth_tol);
+    fail |= mismatched != 0;
+
+    if (!a.color.empty() && !b.color.empty()) {
+        size_t compared = 0, off = 0;
+        for (size_t i = 0; i < a.color.size(); ++i) {
+            if ((a.color[i] >> 24) == 0 || (b.color[i] >> 24) == 0) continue;
+            ++compared;
+            off += color_differs(a.color[i], b.color[i]);
+        }
+        const bool bad = off * 100 > compared;  // more than 1% of pixels
+        std::printf("color: %zu of %zu pixels off by more than %d steps%s\n", off, compared, kColorTol,
+                    bad ? " (over 1%)" : "");
+        fail |= bad;
+    } else if (a.color.empty() != b.color.empty()) {
+        std::printf("color: only one frame has it\n");
+        fail = true;
+    }
+    std::printf("-> %s\n", fail ? "FAIL" : "PASS");
+    return fail ? 1 : 0;
+}
+
+int verify_ring(int frames_wanted, float tol, const char* dump) {
     RingReader ring;
     const auto boxes = scene::build();
     std::vector<float> err;
@@ -82,6 +191,7 @@ int verify_ring(int frames_wanted, float tol) {
         std::printf("no frames received (is fake_game running?)\n");
         return 2;
     }
+    if (dump && !save_frame(dump, f)) return 2;
     const int result = report(err, tol);
     if (poseless > 0) std::printf("FAIL: %d frames had no pose\n", poseless);
     return poseless > 0 ? 1 : result;
@@ -92,9 +202,9 @@ int verify_ring(int frames_wanted, float tol) {
 // matrices, which must also match the reference's. Pose-less frames borrow the reference's view,
 // so the addon's fallback projection is what gets checked. Color, where both frames have it, must
 // match within a few steps per channel (rasterization differs slightly between APIs).
-int verify_addon(int frames_wanted, float tol, float depth_tol) {
+int verify_addon(int frames_wanted, float tol, float depth_tol, const char* dump) {
     RingReader ref_ring, ring;
-    Frame ref, f;
+    Frame ref, f, last;
     const ULONGLONG deadline = GetTickCount64() + 15000;
     bool have_ref = false;
     while (!have_ref && GetTickCount64() < deadline) {
@@ -116,7 +226,6 @@ int verify_addon(int frames_wanted, float tol, float depth_tol) {
     int with_color = 0;
     size_t color_compared = 0, color_off = 0;  // off: a channel more than kColorTol steps away
     size_t color_none = 0;                     // alpha 0: no color (cropped), not compared
-    constexpr int kColorTol = 8;
     while (frames < frames_wanted && GetTickCount64() < deadline) {
         if (!ring.is_open() && !ring.try_open()) {
             Sleep(100);
@@ -133,6 +242,7 @@ int verify_addon(int frames_wanted, float tol, float depth_tol) {
                         ref.header.src_width, ref.header.src_height);
             return 2;
         }
+        if (dump) last = f;  // as captured: pose-less frames get the reference's view below
         for (size_t i = 0; i < f.depth.size(); ++i) {
             const float d = std::abs(f.depth[i] - ref.depth[i]);
             max_diff = std::max(max_diff, d);
@@ -147,10 +257,7 @@ int verify_addon(int frames_wanted, float tol, float depth_tol) {
                     ++color_none;
                     continue;
                 }
-                bool off = false;
-                for (int c = 0; c < 24; c += 8)
-                    off |= std::abs(int((f.color[i] >> c) & 0xFF) - int((ref.color[i] >> c) & 0xFF)) > kColorTol;
-                color_off += off;
+                color_off += color_differs(f.color[i], ref.color[i]);
                 ++color_compared;
             }
         }
@@ -175,6 +282,7 @@ int verify_addon(int frames_wanted, float tol, float depth_tol) {
         std::printf("no addon frames received (is the ReShade-injected fake_game running?)\n");
         return 2;
     }
+    if (dump && !save_frame(dump, last)) return 2;
     float proj_diff = 0;
     for (int i = 0; i < 16; ++i) proj_diff = std::max(proj_diff, std::abs(f.header.proj[i] - ref.header.proj[i]));
     std::printf("depth vs reference: %zu of %zu pixels differ, max |diff| %.3g", differ, compared, max_diff);
@@ -224,24 +332,29 @@ int verify_ply(const char* path, float tol) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::printf("usage: lidar_verify ring [--frames N] [--tol m] | ply <file> [--tol m] |\n"
-                    "                    addon [--frames N] [--tol m] [--depth-tol d]\n");
+        std::printf("usage: lidar_verify ring [--frames N] [--tol m] [--dump file] | ply <file> [--tol m] |\n"
+                    "                    addon [--frames N] [--tol m] [--depth-tol d] [--dump file] |\n"
+                    "                    compare <a> <b> [--depth-tol d] [--matrix-tol m]\n");
         return 2;
     }
     const std::string mode = argv[1];
-    float tol = 0.02f, depth_tol = 0;
+    float tol = 0.02f, depth_tol = 0, matrix_tol = 0;
     int frames = 30;
-    const char* file = nullptr;
+    const char* dump = nullptr;
+    std::vector<const char*> files;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--tol" && i + 1 < argc) tol = float(std::atof(argv[++i]));
         else if (a == "--depth-tol" && i + 1 < argc) depth_tol = float(std::atof(argv[++i]));
+        else if (a == "--matrix-tol" && i + 1 < argc) matrix_tol = float(std::atof(argv[++i]));
         else if (a == "--frames" && i + 1 < argc) frames = std::atoi(argv[++i]);
-        else file = argv[i];
+        else if (a == "--dump" && i + 1 < argc) dump = argv[++i];
+        else files.push_back(argv[i]);
     }
-    if (mode == "ring") return verify_ring(frames, tol);
-    if (mode == "ply" && file) return verify_ply(file, tol);
-    if (mode == "addon") return verify_addon(frames, tol, depth_tol);
+    if (mode == "ring") return verify_ring(frames, tol, dump);
+    if (mode == "ply" && files.size() == 1) return verify_ply(files[0], tol);
+    if (mode == "addon") return verify_addon(frames, tol, depth_tol, dump);
+    if (mode == "compare" && files.size() == 2) return compare_frames(files[0], files[1], depth_tol, matrix_tol);
     std::printf("bad arguments\n");
     return 2;
 }

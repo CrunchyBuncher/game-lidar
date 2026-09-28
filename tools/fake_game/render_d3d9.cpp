@@ -192,6 +192,7 @@ struct Renderer {
 
 int run_d3d9(const Options& opt) {
     App app;
+    app.background = opt.background;
     if (!app.create(L"fake_game", opt.width, opt.height, /*d3d11=*/false)) return 1;
     Renderer r(opt, app);
     r.create();
