@@ -18,6 +18,11 @@ struct DrawStats {
     bool better_than(const DrawStats& o) const {
         return drawcalls_indirect < drawcalls / 3 ? vertices > o.vertices : drawcalls > o.drawcalls;
     }
+    // better_than by more than a quarter: what it takes to challenge the depth-stencil in use.
+    bool clearly_better_than(const DrawStats& o) const {
+        return drawcalls_indirect < drawcalls / 3 ? vertices > uint64_t(o.vertices) * 5 / 4
+                                                  : drawcalls > uint64_t(o.drawcalls) * 5 / 4;
+    }
 };
 
 struct Candidate {
