@@ -1,4 +1,4 @@
-// Discovery: the matrix classifier, view-projection decomposition and reprojection scoring.
+// The math under discovery: the matrix classifier, view-projection decomposition and reprojection scoring.
 #include <DirectXMath.h>
 
 #include <algorithm>
@@ -8,8 +8,9 @@
 
 #include "camera_math.h"
 #include "matrices.h"
+#include "profile.h"
+#include "synthetic.h"
 #include "test.h"
-#include "unproject.h"
 
 using namespace DirectX;
 using namespace lidar;
@@ -42,7 +43,7 @@ static XMMATRIX any_proj(int mode, bool jitter) {
     return p;
 }
 
-TEST_CASE(discovery, classify) {
+TEST_CASE(math, classify) {
     const XMMATRIX lh = XMMatrixLookToLH(XMVectorSet(12.5f, 3.2f, -40.0f, 1), XMVectorSet(0.3f, -0.2f, 0.9f, 0),
                                          XMVectorSet(0, 1, 0, 0));
     const XMMATRIX rh = XMMatrixLookToRH(XMVectorSet(-7.0f, 20.0f, 3.0f, 1), XMVectorSet(-0.5f, -0.4f, 0.2f, 0),
@@ -92,7 +93,7 @@ static float max_diff_m(const mat::Mat& a, const XMMATRIX& b) {
     return max_diff(f, b);
 }
 
-TEST_CASE(discovery, decompose) {
+TEST_CASE(math, decompose) {
     const XMMATRIX lh = XMMatrixLookToLH(XMVectorSet(12.5f, 3.2f, -40.0f, 1), XMVectorSet(0.3f, -0.2f, 0.9f, 0),
                                          XMVectorSet(0, 1, 0, 0));
     const XMMATRIX rh = XMMatrixLookToRH(XMVectorSet(-7.0f, 20.0f, 3.0f, 1), XMVectorSet(-0.5f, -0.4f, 0.2f, 0),
@@ -113,48 +114,7 @@ TEST_CASE(discovery, decompose) {
     EXPECT(!decompose_view_proj(mat::identity(), v, p));
 }
 
-// Depth of a tiny scene (ground y = 0, a wall at z = 30, a box) through view * proj, as a protocol
-// frame of w x h sampled from sw x sh.
-static std::vector<float> render_depth(const XMMATRIX& view, const XMMATRIX& proj, bool reversed, uint32_t w, uint32_t h,
-                                       uint32_t sw, uint32_t sh) {
-    const XMMATRIX vp = view * proj, inv_vp = XMMatrixInverse(nullptr, vp);
-    const XMVECTOR eye = XMMatrixInverse(nullptr, view).r[3];
-    FrameHeader hd{};
-    hd.width = w, hd.height = h, hd.src_width = sw, hd.src_height = sh;
-    XMStoreFloat4x4(reinterpret_cast<XMFLOAT4X4*>(hd.view), view);
-    XMStoreFloat4x4(reinterpret_cast<XMFLOAT4X4*>(hd.proj), proj);
-    const Unprojector up(hd);
-    std::vector<float> depth(size_t(w) * h);
-    for (uint32_t y = 0; y < h; ++y)
-        for (uint32_t x = 0; x < w; ++x) {
-            float nx, ny;
-            up.ndc(x, y, nx, ny);
-            const XMVECTOR p = XMVector3TransformCoord(XMVectorSet(nx, ny, 0.5f, 1), inv_vp);
-            const XMVECTOR d = XMVector3Normalize(XMVectorSubtract(p, eye));
-            float e[3], dir[3];
-            for (int k = 0; k < 3; ++k) e[k] = XMVectorGetByIndex(eye, k), dir[k] = XMVectorGetByIndex(d, k);
-            float t = 1e30f;
-            if (dir[1] < 0) t = std::min(t, -e[1] / dir[1]);
-            if (dir[2] > 0) t = std::min(t, (30 - e[2]) / dir[2]);
-            const float lo[3] = {-2, 0, 8}, hi[3] = {2, 3, 12};  // slab test
-            float t0 = 0, t1 = 1e30f;
-            for (int k = 0; k < 3; ++k) {
-                const float a = (lo[k] - e[k]) / dir[k], b = (hi[k] - e[k]) / dir[k];
-                t0 = std::max(t0, std::min(a, b));
-                t1 = std::min(t1, std::max(a, b));
-            }
-            if (t0 <= t1) t = std::min(t, t0);
-            float z = reversed ? 0.0f : 1.0f;  // clear value: sky
-            if (t < 1e29f) {
-                const XMVECTOR hit = XMVectorAdd(eye, XMVectorScale(d, t));
-                z = XMVectorGetZ(XMVector3TransformCoord(hit, vp));
-            }
-            depth[size_t(y) * w + x] = z;
-        }
-    return depth;
-}
-
-TEST_CASE(discovery, reproject) {
+TEST_CASE(math, reproject) {
     const uint32_t w = 160, h = 90, sw = 1280, sh = 720;
     auto look = [](float x, float z, float yaw) {
         return XMMatrixLookToLH(XMVectorSet(x, 1.7f, z, 1), XMVectorSet(std::sin(yaw), -0.15f, std::cos(yaw), 0),
@@ -188,5 +148,31 @@ TEST_CASE(discovery, reproject) {
         EXPECT(right.median_rel < 1e-4);
         EXPECT(still.median_rel > 0.01);
         EXPECT(off.median_rel > 0.005);
+        if (!(right.explained > 0.95 && still.explained < 0.05 && off.explained < 0.5))
+            std::printf("  reproject mode %d explained: right %g, still %g, off %g\n", mode, right.explained,
+                        still.explained, off.explained);
+        EXPECT(right.explained > 0.95);
+        EXPECT(still.explained < 0.05);
+        EXPECT(off.explained < 0.5);
+
+        // Memory that isn't depth: NaN and values outside [0, 1].
+        EXPECT(invalid_depth(a) == 0.0);
+        DepthGrid junk = a;
+        for (size_t i = 0; i < junk.depth.size(); i += 2) junk.depth[i] = i % 4 ? std::nanf("") : -3e38f;
+        EXPECT(invalid_depth(junk) > 0.4);
     }
+}
+
+// A view-projection from MGS Delta's View buffer (pixel b0 @ 6576) that splits into a view and a
+// projection with near 0.9998 and far 1: every depth reads as the same distance, so it "explained"
+// every depth image perfectly and outscored the camera. It isn't a camera.
+TEST_CASE(math, degenerate_projection) {
+    const float vp[16] = {0, 0, -5861.8f, 1, 0.095916f, 0, 0, 0, 0, 0.11989f, 0, 0, 0, 0, 5861.8f, 0};
+    CameraProfile p;
+    p.layout = CameraLayout::ViewProj;
+    float view[16], proj[16];
+    EXPECT(!decode_camera(p, reinterpret_cast<const uint8_t*>(vp), sizeof(vp), view, proj));
+    // A real one of the same shape (reversed infinite, near 10) still decodes.
+    const float ok[16] = {0, 0, 0, 1, 0.095916f, 0, 0, 0, 0, 0.11989f, 0, 0, 0, 0, 10, 0};
+    EXPECT(decode_camera(p, reinterpret_cast<const uint8_t*>(ok), sizeof(ok), view, proj));
 }

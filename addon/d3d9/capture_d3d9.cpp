@@ -457,7 +457,7 @@ void D3D9Capture::publish(command_queue*, RingWriter& ring) {
         if (q == S_OK && SUCCEEDED(sys_[p.slot]->LockRect(&lr, nullptr, D3DLOCK_READONLY | D3DLOCK_DONOTWAIT))) {
             const bool color_locked =
                 has_color && SUCCEEDED(color_sys_[p.slot]->LockRect(&clr, nullptr, D3DLOCK_READONLY | D3DLOCK_DONOTWAIT));
-            if (ring.is_open()) {
+            if (ring.is_open() && check_depth(p.header, static_cast<const uint8_t*>(lr.pBits), size_t(lr.Pitch))) {
                 Slot* slot = ring.begin_frame();
                 slot->frame = p.header;
                 const uint32_t w = p.header.width, h = p.header.height;

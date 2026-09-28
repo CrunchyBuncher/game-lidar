@@ -1,7 +1,8 @@
 // lidar_capture.addon64: ReShade addon that captures the scene depth buffer and the game's
 // camera matrices and publishes them to the shared-memory ring for the viewer.
 //
-// Depth path: depth_tracker picks the scene depth-stencil, a DepthCapture reads it back.
+// Depth path: depth_tracker ranks the depth-stencils, pick_depth() sticks to the scene's (see
+// DepthPick), a DepthCapture reads it back and drops readbacks that aren't depth or are blank.
 // Camera path: camera_tracker latches the profile's cbuffer window at the draws into each
 // depth-stencil (bytes from a CbufferSource), and at present the latch of the captured
 // depth-stencil becomes the frame's pose. Without a profile or a latch, frames go out
@@ -9,7 +10,7 @@
 //
 // Only the DepthCapture and CbufferSource implementations are API-specific (backends.cpp).
 //
-// Discovery mode (discovery.h) runs on top of both paths: the camera tracker samples draws, the
+// Discovery mode (discovery/, its own module) runs on top of both paths: the camera tracker samples draws, the
 // published depth frames are tapped from the ring, and its candidates can be previewed (used as an
 // unsaved profile) or saved as lidar_profile.toml.
 #include <imgui.h>
@@ -25,12 +26,15 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -57,6 +61,8 @@ constexpr char kSection[] = "LIDAR";
 constexpr char kDefaultProfile[] = "lidar_profile.toml";
 constexpr char kDiscoveryReport[] = "lidar_discovery.txt";
 constexpr uint32_t kDiscoveryBytes = 8192;  // per bound buffer at a sampled draw
+constexpr double kRecordSeconds = 30;       // discovery recordings (discovery/README.md)
+constexpr uint64_t kRecordMaxBytes = 2ull << 30;
 
 enum class DepthMode : int { Standard = 0, Reversed = 1, ReversedInfinite = 2 };
 constexpr const char* kCropKeys[4] = {"ColorCropLeft", "ColorCropTop", "ColorCropRight", "ColorCropBottom"};
@@ -73,16 +79,20 @@ struct Settings {
     float far_z = 1000.0f;
     int depth_mode = int(DepthMode::Reversed);
     // Discovery, read from the ini only (for unattended runs): start with the game, save the best
-    // candidate after this many seconds once it's confident (0 = never), draws sampled per frame.
+    // candidate after this many seconds once it's confident (0 = never), draws sampled per frame,
+    // record the session for this many seconds (0 = don't).
     bool discovery_autostart = false;
     int discovery_autosave = 0;
     int discovery_samples = 48;
+    int discovery_record = 0;
 
     void load() {
         reshade::get_config_value(nullptr, kSection, "DiscoveryAutoStart", discovery_autostart);
         reshade::get_config_value(nullptr, kSection, "DiscoveryAutoSave", discovery_autosave);
         reshade::get_config_value(nullptr, kSection, "DiscoverySamples", discovery_samples);
         discovery_samples = std::clamp(discovery_samples, 4, 512);
+        reshade::get_config_value(nullptr, kSection, "DiscoveryRecord", discovery_record);
+        discovery_record = std::clamp(discovery_record, 0, 600);
         reshade::get_config_value(nullptr, kSection, "Enabled", enabled);
         reshade::get_config_value(nullptr, kSection, "Color", color);
         for (int i = 0; i < 4; ++i) {
@@ -159,6 +169,30 @@ double g_mv_us = 0;                 // smoothed solve time
 std::vector<depth::Candidate> g_candidates;  // last frame's depth-stencils, best first
 uint64_t g_selected = 0;                     // handle captured last frame
 uint64_t g_override = 0;                     // manual pick from the overlay, 0 = auto
+
+// The automatic pick sticks to its depth-stencil: engines that allocate depth-stencils from shared
+// (transient, aliased) memory (UE5 on D3D12) have several with about the same draws each frame, and
+// the busiest flips between them. The busiest one only takes over after kPickSwitchFrames frames of
+// clearly drawing more (or of the one in use not drawing at all); until then, frames the one in use
+// doesn't draw aren't captured. A depth-stencil whose readback wasn't depth (DepthCapture::check_depth:
+// its memory held something else by present) isn't picked for kSkipFrames frames. One captured at present
+// that came back blank while a snapshot from before a clear was there (the later pass drew without depth:
+// UE3's HUD, a pause menu) has the snapshot used for kSkipFrames frames, whatever the later pass drew.
+struct DepthPick {
+    uint64_t ds = 0;
+    uint32_t challenged = 0;  // consecutive frames another one clearly drew more
+    uint32_t missing = 0;     // consecutive frames it didn't draw
+};
+DepthPick g_pick;
+constexpr uint32_t kPickSwitchFrames = 15;
+constexpr uint64_t kSkipFrames = 120;
+std::unordered_map<uint64_t, uint64_t> g_not_depth;         // depth-stencil -> g_frame it's skipped until
+std::unordered_map<uint64_t, uint64_t> g_prefer_snapshot;   // depth-stencil -> g_frame until
+struct CaptureRecord {  // a readback in flight
+    uint64_t frame = 0, ds = 0;
+    bool snapshot_available = false, used_snapshot = false;
+};
+std::deque<CaptureRecord> g_captured_from;
 // A snapshot of the captured depth-stencil taken before a clear this frame (games that reuse it for a
 // later pass), and the pass it holds.
 struct DepthSnapshot {
@@ -279,9 +313,43 @@ void camera_position(const float view[16], double pos[3]) {
 
 // ---- Discovery ------------------------------------------------------------------------------
 
-void start_discovery() {
+const char* api_text(device_api api) {
+    switch (api) {
+        case device_api::d3d9: return "d3d9";
+        case device_api::d3d11: return "d3d11";
+        case device_api::d3d12: return "d3d12";
+        default: return "other";
+    }
+}
+
+std::string exe_stem() {
+    wchar_t buf[MAX_PATH];
+    const DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    return std::filesystem::path(std::wstring(buf, n)).stem().string();
+}
+
+// lidar_discovery_<exe>_<date>.disc next to the exe.
+std::filesystem::path recording_path() {
+    const std::time_t now = std::time(nullptr);
+    char date[32];
+    std::strftime(date, sizeof(date), "%Y%m%d_%H%M%S", std::localtime(&now));
+    return game_dir() / ("lidar_discovery_" + exe_stem() + "_" + date + ".disc");
+}
+
+// `record_seconds` > 0: also records the session from its start (a recording replays exactly only
+// from the analyzer's first input).
+void start_discovery(double record_seconds = 0) {
     if (g_source == nullptr || g_discovering) return;
     g_discovery.start(g_device->get_api() == device_api::d3d9);
+    if (record_seconds > 0) {
+        const std::filesystem::path path = recording_path();
+        char note[256];
+        std::snprintf(note, sizeof(note), "game=%s\napi=%s\nsamples_per_frame=%d\nbuffer_bytes=%u\ncapture_width=%d\n",
+                      exe_stem().c_str(), api_text(g_device->get_api()), g_settings.discovery_samples, kDiscoveryBytes,
+                      g_settings.capture_width);
+        g_discovery.start_recording(path, note, record_seconds, kRecordMaxBytes);
+        log_info("Discovery recording to " + path.string());
+    }
     cam::configure_discovery(g_device, g_source.get(), uint32_t(g_settings.discovery_samples), kDiscoveryBytes);
     g_discovering = true;
     g_ring_seen = g_ring.latest_seq();
@@ -300,18 +368,7 @@ void stop_discovery() {
     log_info("Discovery stopped.");
 }
 
-std::string candidate_line(const disc::CandidateInfo& c) {
-    char buf[320];
-    int n = std::snprintf(buf, sizeof(buf), "%s at %s, %s-major, latch %s: score %.2f%s, reprojection %u/%u (error %.4f), "
-                                            "still/moving %u/%u",
-                          layout_name(c.profile.layout), c.where.c_str(), c.profile.column_major ? "column" : "row",
-                          latch_name(c.profile.latch), c.score, c.confident ? " (confident)" : "", c.reproj_passes,
-                          c.reproj_tests, c.reproj_error, c.temporal_agree, c.temporal_checks);
-    if (c.have_values && c.info.valid)
-        std::snprintf(buf + n, sizeof(buf) - n, "; FOV %.1f, near %.4g, %s depth", c.info.fov_y_deg, c.info.near_z,
-                      c.info.reversed ? "reversed" : "standard");
-    return buf;
-}
+using disc::candidate_line;
 
 void log_discovery(const disc::Status& s) {
     log_info("Discovery " + disc::status_line(s));
@@ -680,7 +737,7 @@ void on_init_device(device* dev) {
     g_settings.load();
     if (!g_ring.open()) g_init_error = "failed to create the shared-memory ring";
     reload_profile();
-    if (g_settings.discovery_autostart) start_discovery();
+    if (g_settings.discovery_autostart) start_discovery(g_settings.discovery_record);
 }
 
 // Before a depth clear: if it's the captured depth-stencil and this pass is its busiest so far this
@@ -693,6 +750,57 @@ void on_depth_clear(command_list* cmd, resource ds, resource color, const depth:
     if (g_snapshot.ds == ds.handle && !pass.better_than(g_snapshot.pass)) return;
     const watchdog::Step step("depth clear: snapshot");
     if (g_capture->snapshot(ds, g_settings.color ? color : resource{0}, uint32_t(g_settings.capture_width))) g_snapshot = {ds.handle, pass, pass_index};
+}
+
+// Learns from the captures the backend dropped (see DepthPick).
+void note_rejected() {
+    for (const DepthCapture::Rejected& r : g_capture->take_rejected())
+        for (const CaptureRecord& c : g_captured_from) {
+            if (c.frame != r.frame_index) continue;
+            static std::set<std::pair<uint64_t, bool>> logged;  // (depth-stencil, blank): log each once
+            const bool log = logged.emplace(c.ds, r.blank).second;
+            if (!r.blank) {
+                if (log)
+                    log_info("Depth: the captured depth-stencil read back as something else (not depth); "
+                             "skipping it for a while.");
+                g_not_depth[c.ds] = g_frame + kSkipFrames;
+            } else if (c.snapshot_available && !c.used_snapshot) {
+                if (log)
+                    log_info("Depth: the captured depth-stencil was blank at present (cleared by a later pass); "
+                             "using its snapshot from before the clear for a while.");
+                g_prefer_snapshot[c.ds] = g_frame + kSkipFrames;
+            }
+        }
+    for (auto* m : {&g_not_depth, &g_prefer_snapshot}) std::erase_if(*m, [](const auto& e) { return e.second <= g_frame; });
+    while (g_captured_from.size() > 16) g_captured_from.pop_front();  // far more than readbacks in flight
+}
+
+// The depth-stencil to capture this frame (nullptr: none), from g_candidates (see DepthPick).
+const depth::Candidate* pick_depth() {
+    for (const auto& c : g_candidates)
+        if (c.resource.handle == g_override) return &c;
+    const depth::Candidate *best = nullptr, *current = nullptr;
+    for (const auto& c : g_candidates) {
+        if (!c.fits_frame || g_not_depth.contains(c.resource.handle)) continue;
+        if (best == nullptr) best = &c;  // best first
+        if (c.resource.handle == g_pick.ds) current = &c;
+    }
+    const auto take = [](const depth::Candidate* c) {
+        g_pick = {c != nullptr ? c->resource.handle : 0};
+        return c;
+    };
+    if (g_pick.ds == 0 || g_not_depth.contains(g_pick.ds)) return take(best);
+    if (current == nullptr) {  // didn't draw this frame
+        g_pick.challenged = 0;
+        return ++g_pick.missing < kPickSwitchFrames ? nullptr : take(best);
+    }
+    g_pick.missing = 0;
+    if (best != current && best->stats.clearly_better_than(current->stats)) {
+        if (++g_pick.challenged >= kPickSwitchFrames) return take(best);
+    } else {
+        g_pick.challenged = 0;
+    }
+    return current;
 }
 
 void on_destroy_device(device* dev) {
@@ -708,6 +816,10 @@ void on_destroy_device(device* dev) {
     g_capture.reset();
     g_ring.close();
     g_candidates.clear();
+    g_pick = {};
+    g_not_depth.clear();
+    g_prefer_snapshot.clear();
+    g_captured_from.clear();
     g_device = nullptr;
 }
 
@@ -742,16 +854,15 @@ void on_present(command_queue* queue, swapchain* sc, const rect*, const rect*, u
     for (int i = 0; i < 4; ++i) crop[i] = g_settings.color_crop[i] / 100;
     g_capture->set_color_crop(crop);
     g_capture->publish(queue, g_ring);
+    note_rejected();
     watchdog::exchange_step("present: capture");
 
-    const depth::Candidate* pick = nullptr;
-    for (const auto& c : g_candidates)
-        if (c.resource.handle == g_override) pick = &c;
-    if (pick == nullptr && g_candidates.front().fits_frame) pick = &g_candidates.front();
+    const depth::Candidate* pick = pick_depth();
     g_selected = pick ? pick->resource.handle : 0;
-    // The snapshot, unless the pass still in the depth-stencil drew more.
-    const bool use_snapshot = pick != nullptr && g_settings.enabled && snapshot.ds == pick->resource.handle &&
-                              !pick->last_segment.better_than(snapshot.pass);
+    // The snapshot, unless the pass still in the depth-stencil drew more (and didn't leave it blank before).
+    const bool have_snapshot = pick != nullptr && g_settings.enabled && snapshot.ds == pick->resource.handle;
+    const bool use_snapshot = have_snapshot && (!pick->last_segment.better_than(snapshot.pass) ||
+                                                g_prefer_snapshot.contains(pick->resource.handle));
     if (!use_snapshot) g_capture->drop_snapshot();
 
     if (g_settings.enabled && pick != nullptr) {
@@ -777,6 +888,7 @@ void on_present(command_queue* queue, swapchain* sc, const rect*, const rect*, u
         if (posed || active_camera() == nullptr) {
             g_capture->capture(queue, pick->resource, g_settings.color ? pick->color : resource{0},
                                uint32_t(g_settings.capture_width), h);
+            g_captured_from.push_back({g_frame, pick->resource.handle, have_snapshot, use_snapshot});
             g_snapshot_used = use_snapshot ? std::optional(snapshot) : std::nullopt;
         } else {
             g_capture->drop_snapshot();
@@ -996,6 +1108,27 @@ void draw_discovery_section() {
         g_disc_message = g_discovering ? "Writing " + (game_dir() / kDiscoveryReport).string()
                                        : "Start discovery first: the report is written by it.";
     }
+    ImGui::SameLine();
+    const disc::RecordingStatus rec = g_discovery.recording();
+    if (rec.active) {
+        if (ImGui::Button("Stop recording")) g_discovery.stop_recording();
+    } else if (ImGui::Button("Record")) {
+        // From a fresh start, so the recording holds everything the analyzer saw.
+        stop_discovery();
+        start_discovery(kRecordSeconds);
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Restarts discovery and records its inputs for %.0f s to a .disc file next to the game, for\n"
+                          "lidar_discover to replay offline (discovery/README.md). Move and turn the camera meanwhile.",
+                          kRecordSeconds);
+    if (!rec.path.empty()) {
+        if (!rec.error.empty())
+            ImGui::TextColored(kWarn, "Recording failed: %s", rec.error.c_str());
+        else
+            ImGui::TextDisabled("%s %s: %.0f s, %.1f MB, %llu sample / %llu depth frames", rec.active ? "Recording" : "Recorded",
+                                rec.path.filename().string().c_str(), rec.seconds, rec.bytes / 1048576.0,
+                                (unsigned long long)rec.sample_frames, (unsigned long long)rec.depth_frames);
+    }
     if (!g_disc_message.empty()) ImGui::TextDisabled("%s", g_disc_message.c_str());
 
     const disc::Status& s = g_disc_status;
@@ -1040,8 +1173,8 @@ void draw_discovery_section() {
                                   ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap))
                 expanded = expanded == i ? -1 : i;
             ImGui::TableNextColumn();
-            ImGui::Text("%s%s%s", layout_name(c.profile.layout), c.profile.column_major ? " (column)" : "",
-                        c.profile.latch == Latch::Common ? " (common)" : "");
+            ImGui::Text("%s%s%s%s", layout_name(c.profile.layout), c.profile.column_major ? " (column)" : "",
+                        c.profile.latch == Latch::Common ? " (common)" : "", c.history ? " (last frame's)" : "");
             ImGui::TableNextColumn();
             ImGui::TextUnformatted(c.where.c_str());
             ImGui::TableNextColumn();
@@ -1051,7 +1184,7 @@ void draw_discovery_section() {
                 ImGui::Text("%.2f", c.score);
             ImGui::TableNextColumn();
             if (c.reproj_tests)
-                ImGui::Text("%u/%u, err %.2f%%", c.reproj_passes, c.reproj_tests, c.reproj_error * 100);
+                ImGui::Text("%u/%u, explains %.0f%%", c.reproj_passes, c.reproj_tests, c.explained * 100);
             else
                 ImGui::TextDisabled("-");
             ImGui::TableNextColumn();
@@ -1124,6 +1257,12 @@ void draw_overlay(effect_runtime*) {
     ImGui::Text("Published %llu frames at %ux%u, skipped %llu (GPU readback busy)",
                 static_cast<unsigned long long>(g_capture->published()), g_capture->width(), g_capture->height(),
                 static_cast<unsigned long long>(g_capture->skipped()));
+    ImGui::Text("Dropped %llu not depth, %llu blank", static_cast<unsigned long long>(g_capture->not_depth()),
+                static_cast<unsigned long long>(g_capture->blank()));
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Not depth: the depth-stencil's memory held other data by the time it was copied.\n"
+                          "Blank: nothing drawn in it (cleared by a later pass, a menu). The viewer would carve\n"
+                          "away everything in view.");
     changed |= ImGui::SliderInt("Capture width", &g_settings.capture_width, 64, int(kMaxWidth));
     changed |= ImGui::Checkbox("Color", &g_settings.color);
     ImGui::SameLine();
@@ -1187,6 +1326,12 @@ void draw_overlay(effect_runtime*) {
                 if (c.resource.handle == g_selected) {
                     ImGui::SameLine();
                     ImGui::TextColored(kOk, "captured");
+                } else if (g_not_depth.contains(c.resource.handle)) {
+                    ImGui::SameLine();
+                    ImGui::TextColored(kWarn, "not depth");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Its last capture read back as something else: its memory held other data\n"
+                                          "by the end of the frame. Automatic skips it for a while.");
                 }
                 ImGui::TableNextColumn();
                 ImGui::Text("%ux%u%s", c.desc.texture.width, c.desc.texture.height,

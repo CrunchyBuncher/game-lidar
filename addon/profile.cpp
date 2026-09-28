@@ -405,6 +405,7 @@ bool decode_camera(const CameraProfile& c, const uint8_t* window, size_t window_
         if (c.has_translation) v = mul(to_relative, v);
         store(v, view);
         store(p, proj);
+        if (!analyze_projection(proj).valid) return fail(why, "proj is not a perspective projection");
         return true;
     }
 
@@ -469,7 +470,9 @@ ProjectionInfo analyze_projection(const float p[16]) {
         if (!(d0 > 0) && d1 > 0) d0 = inf;
         if (!(d1 > 0) && d0 > 0) d1 = inf;
     }
-    if (!(d0 > 0) || !(d1 > 0) || d0 == d1) return info;
+    // Near and far close together: every depth value means about the same distance, so it can't place
+    // anything (and trivially "matches" any depth image). Scene cameras span orders of magnitude.
+    if (!(d0 > 0) || !(d1 > 0) || std::max(d0, d1) < 10 * std::min(d0, d1)) return info;
     info.reversed = d1 < d0;
     info.near_z = float(std::min(d0, d1));
     info.far_z = float(std::max(d0, d1));

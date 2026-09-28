@@ -558,7 +558,7 @@ void D3D12Capture::publish(command_queue*, RingWriter& ring) {
     const uint64_t done = dev_->get_completed_fence_value(fence_);
     while (!pending_.empty() && pending_.front().fence <= done) {
         const Pending& p = pending_.front();
-        if (ring.is_open()) {
+        if (ring.is_open() && check_depth(p.header, readback_data_[p.slot], row_pitch_)) {
             Slot* slot = ring.begin_frame();
             slot->frame = p.header;
             const uint32_t w = p.header.width, h = p.header.height;

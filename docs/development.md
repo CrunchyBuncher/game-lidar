@@ -31,9 +31,11 @@ a downsampled depth image plus the camera's view and projection matrices.
   each depth-stencil. The bytes come from a `CbufferSource`. At present, the latch for the captured
   depth-stencil becomes the frame's pose. Without a profile, frames go out camera-relative with a
   projection from the overlay settings.
-- **Discovery** (`discovery.cpp`) runs on top of both paths. It samples every bound constant buffer
-  at the draws, scans them for view / projection / combined matrices, and ranks candidates by how
-  they behave and how well they reproject one depth frame onto a later one. `modelview.cpp`
+- **Discovery** (its own module, [discovery/](../discovery/README.md)) runs on top of both paths.
+  The tracker samples every bound constant buffer at the draws. Discovery scans them for view,
+  projection and combined matrices, and ranks candidates by how they behave and how well they
+  reproject one depth frame onto a later one. It can record its inputs and replay them offline
+  (`lidar_discover`). `modelview.cpp`
   recovers the camera from per-object world·view matrices for games that never upload it alone
   (see [plan_modelview.md](../plan_modelview.md)).
 - **Profiles** (`profile.cpp`) say where a game keeps its camera: which stage, slot and offset,
@@ -64,11 +66,13 @@ It can start before or after the producer, and reconnects when the game restarts
 ## Source layout
 | Path | What |
 |---|---|
-| `addon/` | The ReShade addon; `d3d9/`, `d3d11/`, `d3d12/` hold the per-API halves |
+| `addon/` | The ReShade addon; `d3d9/`, `d3d11/`, `d3d12/` hold the per-API halves. Its pure camera code (profiles, camera math, model-view solver, draw data) builds as the `lidar_camera` library |
+| `discovery/` | Camera discovery: analyzer, recordings, the `lidar_discover` replay tool and its own tests (`lidar_discovery_tests`). See [its README](../discovery/README.md) |
 | `viewer/` | The point-cloud viewer and its shaders |
 | `common/` | Frame protocol, shared-memory ring, window/device helpers |
 | `profiles/` | Game profiles (`.toml`) |
-| `tests/unit/` | Unit tests (`lidar_tests`), one file per area: ring, unprojection, profiles, discovery, root layouts, model-view solver |
+| `tests/unit/` | Unit tests (`lidar_tests`), one file per area: ring, unprojection, profiles, root layouts, model-view solver |
+| `tests/common/` | The test harness and matrix helpers both test executables share |
 | `tests/e2e/` | End-to-end tests: the addon in the test game, per graphics API (`run_e2e.ps1`) |
 | `tools/verify/` | `lidar_verify`: checks a live ring, a saved `.ply`, or two captured frames against each other |
 | `tools/fake_game/` | A test game for exercising the addon without a real game (below) |
@@ -90,6 +94,8 @@ cmake --build build-win32 --config Release --target lidar_capture lidar_tests
 - With an unsupported API (OpenGL, Vulkan, D3D10) the addon registers nothing but a device-created
   callback, writes one "Inactive: ..." line to the log, and stays out of the way.
 - **Write report** in the Discovery section writes `lidar_discovery.txt` with every candidate.
+  **Record** saves discovery's inputs to a `.disc` file to replay offline with `lidar_discover`
+  ([discovery/README.md](../discovery/README.md)).
 - Settings are under `[LIDAR]` in `ReShade.ini`. Edit it only while the game is closed.
 - `lidar_verify ring` works with any producer, so it's the quickest check that frames are arriving
   with a sane pose.
@@ -104,8 +110,10 @@ CMakeLists.txt.
 ```powershell
 ctest --test-dir build -C Release
 build\bin\Release\lidar_tests.exe --list
-build\bin\Release\lidar_tests.exe profile discovery.reproject
+build\bin\Release\lidar_tests.exe profile modelview.solver
 ```
+Discovery has its own suite, `lidar_discovery_tests` (CTest `discovery.*`). It doesn't use the
+ring. See [discovery/README.md](../discovery/README.md#tests).
 
 ### End-to-end tests
 `tests/e2e/run_e2e.ps1` runs the addon in the test game and checks its frames with `lidar_verify`.

@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "protocol.h"
 #include "ring.h"
@@ -39,8 +41,16 @@ public:
     }
     virtual void drop_snapshot() {}
 
-    // Publishes every readback the GPU has finished. Never waits.
+    // Publishes every readback the GPU has finished. Never waits. A readback that isn't depth or is
+    // blank (see check_depth()) is dropped instead, and reported by take_rejected().
     virtual void publish(reshade::api::command_queue* queue, RingWriter& ring) = 0;
+
+    struct Rejected {
+        uint64_t frame_index;
+        bool blank;  // else: not depth
+    };
+    // Every capture dropped since the last call.
+    std::vector<Rejected> take_rejected() { return std::exchange(rejected_, {}); }
 
     const std::string& error() const { return error_; }
     // Why the last capture has no color ("" if it has).
@@ -52,8 +62,47 @@ public:
     uint32_t height() const { return cap_h_; }
     uint64_t published() const { return published_; }
     uint64_t skipped() const { return skipped_; }
+    uint64_t not_depth() const { return not_depth_; }
+    uint64_t blank() const { return blank_; }
 
 protected:
+    // Share of invalid values (NaN, infinite, outside [0, 1]) above which a readback isn't depth. A
+    // depth buffer only holds [0, 1]; more than this is memory that held something else by the time
+    // it was copied (a transient depth-stencil whose memory a later pass reused, D3D12 placed
+    // resources), which the viewer would show as a flicker. Same test as discovery's (invalid_depth).
+    static constexpr double kMaxInvalid = 0.01;
+    // Share of values strictly inside (0, 1) at or below which a readback is blank: the depth-stencil
+    // as cleared, nothing drawn (captured after a later pass cleared it and drew without depth, e.g.
+    // UE3's HUD). With a pose, the viewer would take it as seeing through everything and carve it out.
+    static constexpr double kMaxBlank = 0.001;
+
+    // Whether a readback of `header`'s frame (Float32Ndc rows, `pitch` bytes apart) is worth publishing.
+    // If not, counts it and records it for take_rejected(); the caller drops it.
+    bool check_depth(const FrameHeader& header, const uint8_t* rows, size_t pitch) {
+        const uint32_t w = header.width, h = header.height;
+        size_t bad = 0, drawn = 0;
+        for (uint32_t y = 0; y < h; ++y) {
+            const float* row = reinterpret_cast<const float*>(rows + y * pitch);
+            for (uint32_t x = 0; x < w; ++x) {
+                bad += !(row[x] >= 0.0f && row[x] <= 1.0f);
+                drawn += row[x] > 0.0f && row[x] < 1.0f;
+            }
+        }
+        const double n = double(w) * double(h);
+        if (n == 0) return true;
+        if (double(bad) > kMaxInvalid * n) {
+            ++not_depth_;
+            rejected_.push_back({header.frame_index, false});
+            return false;
+        }
+        if (double(drawn) <= kMaxBlank * n) {
+            ++blank_;
+            rejected_.push_back({header.frame_index, true});
+            return false;
+        }
+        return true;
+    }
+
     // Applies the color crop to a published slot with color.
     void crop_color(Slot& slot) const {
         const uint32_t w = slot.frame.width, h = slot.frame.height;
@@ -68,7 +117,8 @@ protected:
     float crop_[4] = {};
     std::string color_note_ = "not captured";
     uint32_t cap_w_ = 0, cap_h_ = 0;
-    uint64_t published_ = 0, skipped_ = 0;
+    uint64_t published_ = 0, skipped_ = 0, not_depth_ = 0, blank_ = 0;
+    std::vector<Rejected> rejected_;
 };
 
 // The implementation for `dev`'s API. Returns nullptr and sets `error` if the API isn't

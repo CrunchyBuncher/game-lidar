@@ -134,7 +134,8 @@ Everything is in the LiDAR tab and saved under `[LIDAR]` in the game's `ReShade.
   outline keeps its color; depth still covers the whole screen. Results vary by game, so if
   cropping doesn't help, leave the HUD in and experiment with the other settings instead.
 - **Unattended discovery:** set `DiscoveryAutoStart=1`, `DiscoveryAutoSave=<seconds>` and
-  `DiscoverySamples` in the ini.
+  `DiscoverySamples` in the ini. `DiscoveryRecord=<seconds>` also records the session for offline
+  replay (see [discovery/README.md](discovery/README.md)).
 
 Only edit the ini while the game is closed, because ReShade overwrites it with its in-memory
 settings.
