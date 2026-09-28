@@ -1,7 +1,10 @@
 // lidar_verify: checks captured geometry against the fake game's true scene.
 //
 //   lidar_verify ring [--frames 30] [--tol 0.02]   read live frames from the ring (CPU unprojection)
-//   lidar_verify ply <file> [--tol 0.02]           check a viewer-saved .ply (GPU pipeline)
+//   lidar_verify ply <file> [--tol 0.02] [--min-within 0.99]
+//                                                  check a viewer-saved .ply (GPU pipeline)
+//       --min-within: the fraction of points that must lie within --tol. With the NPC on, its points
+//       aren't in the (static) true scene, so a scan of it needs some room.
 //   lidar_verify addon [--frames 30] [--tol 0.02] [--depth-tol 0]
 //                                                  check the ReShade addon's frames against a reference
 //       Needs two fake_games' worth of setup: the ReShade-injected one run with
@@ -16,7 +19,7 @@
 // `ring` and `addon` take --dump <file>: save the last frame received, for `compare`.
 // `ring` needs every frame to carry a pose (fake_game itself, or the addon with a profile).
 // Run the fake game with --no-npc, since the moving NPC isn't in the reference scene.
-// Exits non-zero if fewer than 99% of points lie within tolerance of a surface.
+// Exits non-zero if fewer than 99% of points (ply: --min-within) lie within tolerance of a surface.
 #include <windows.h>
 
 #include <algorithm>
@@ -34,7 +37,7 @@ using namespace lidar;
 
 namespace {
 
-int report(std::vector<float>& err, float tol) {
+int report(std::vector<float>& err, float tol, double min_within = 0.99) {
     if (err.empty()) {
         std::printf("no points\n");
         return 2;
@@ -46,8 +49,10 @@ int report(std::vector<float>& err, float tol) {
     std::printf("points: %zu\n", err.size());
     std::printf("error  p50 %.4f m   p99 %.4f m   max %.4f m\n", pct(0.5), pct(0.99), err.back());
     std::printf("outliers (> %.3f m): %zu\n", tol, err.size() - within);
-    std::printf("within %.3f m: %.2f%%  -> %s\n", tol, frac * 100.0, frac >= 0.99 ? "PASS" : "FAIL");
-    return frac >= 0.99 ? 0 : 1;
+    const bool pass = frac >= min_within;
+    std::printf("within %.3f m: %.2f%% (needs %.2f%%)  -> %s\n", tol, frac * 100.0, min_within * 100.0,
+                pass ? "PASS" : "FAIL");
+    return pass ? 0 : 1;
 }
 
 // A frame on disk, for `compare`: magic, header, depth, then color if the header's flags have it.
@@ -303,7 +308,7 @@ int verify_addon(int frames_wanted, float tol, float depth_tol, const char* dump
     return report(err, tol) != 0 || mismatched != 0 || color_bad ? 1 : 0;
 }
 
-int verify_ply(const char* path, float tol) {
+int verify_ply(const char* path, float tol, double min_within) {
     FILE* f = std::fopen(path, "rb");
     if (!f) {
         std::printf("cannot open %s\n", path);
@@ -325,20 +330,22 @@ int verify_ply(const char* path, float tol) {
         err.push_back(scene::distance(boxes, p));
     }
     std::fclose(f);
-    return report(err, tol);
+    return report(err, tol, min_within);
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::printf("usage: lidar_verify ring [--frames N] [--tol m] [--dump file] | ply <file> [--tol m] |\n"
+        std::printf("usage: lidar_verify ring [--frames N] [--tol m] [--dump file] |\n"
+                    "                    ply <file> [--tol m] [--min-within f] |\n"
                     "                    addon [--frames N] [--tol m] [--depth-tol d] [--dump file] |\n"
                     "                    compare <a> <b> [--depth-tol d] [--matrix-tol m]\n");
         return 2;
     }
     const std::string mode = argv[1];
     float tol = 0.02f, depth_tol = 0, matrix_tol = 0;
+    double min_within = 0.99;
     int frames = 30;
     const char* dump = nullptr;
     std::vector<const char*> files;
@@ -347,12 +354,13 @@ int main(int argc, char** argv) {
         if (a == "--tol" && i + 1 < argc) tol = float(std::atof(argv[++i]));
         else if (a == "--depth-tol" && i + 1 < argc) depth_tol = float(std::atof(argv[++i]));
         else if (a == "--matrix-tol" && i + 1 < argc) matrix_tol = float(std::atof(argv[++i]));
+        else if (a == "--min-within" && i + 1 < argc) min_within = std::atof(argv[++i]);
         else if (a == "--frames" && i + 1 < argc) frames = std::atoi(argv[++i]);
         else if (a == "--dump" && i + 1 < argc) dump = argv[++i];
         else files.push_back(argv[i]);
     }
     if (mode == "ring") return verify_ring(frames, tol, dump);
-    if (mode == "ply" && files.size() == 1) return verify_ply(files[0], tol);
+    if (mode == "ply" && files.size() == 1) return verify_ply(files[0], tol, min_within);
     if (mode == "addon") return verify_addon(frames, tol, depth_tol, dump);
     if (mode == "compare" && files.size() == 2) return compare_frames(files[0], files[1], depth_tol, matrix_tol);
     std::printf("bad arguments\n");

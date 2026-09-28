@@ -8,6 +8,7 @@
 //                     [--no-carve] [--carve-margin 0.15] [--carve-rel 0.02]
 //                     [--color-update first|closest|latest]
 //                     [--size 1600x900] [--out file.ply] [--save-after s] [--exit-after s]
+//                     [--background]
 // Keys:  right-drag look, WASD move, Q/E down/up, Shift fast, wheel speed,
 //        F follow player (right-drag orbits it, wheel zooms, R resets), V attach to the player's camera, H color mode, T trail,
 //        M carving, U hide above the player, O hide between you and the player,
@@ -70,6 +71,7 @@ struct Options {
     int width = 1600, height = 900;
     std::string out;
     float save_after = 0, exit_after = 0;
+    bool background = false;  // open behind other windows without taking the focus (the e2e tests)
 };
 
 Options parse(int argc, char** argv) {
@@ -90,6 +92,7 @@ Options parse(int argc, char** argv) {
         else if (a == "--out") o.out = next();
         else if (a == "--save-after") o.save_after = float(std::atof(next()));
         else if (a == "--exit-after") o.exit_after = float(std::atof(next()));
+        else if (a == "--background") o.background = true;
         else if (a == "--no-carve") c.carve = false;
         else if (a == "--carve-margin") c.carve_margin = float(std::atof(next()));
         else if (a == "--carve-rel") c.carve_rel = float(std::atof(next()));
@@ -117,6 +120,7 @@ int main(int argc, char** argv) {
     Options opt = parse(argc, argv);  // the panel edits it live
     CaptureSettings& capture = opt.capture;
     App app;
+    app.background = opt.background;
     if (!app.create(L"lidar_viewer", opt.width, opt.height)) return 1;
     ID3D11Device* dev = app.dev.Get();
     ID3D11DeviceContext* ctx = app.ctx.Get();

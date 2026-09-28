@@ -126,6 +126,24 @@ It needs a Release build of `lidar_verify`, `lidar_capture` and `fake_game`, and
 behind other windows (`fake_game --background`, no console), so they don't take the focus. It sets `Profile` in the rigs' ReShade.ini per case and restores the
 file afterwards. Logs and captured frames go to `build\e2e\`. The whole run takes a few minutes.
 
+### Viewer end-to-end tests
+`tests/e2e/run_viewer_e2e.ps1` checks what the viewer makes of the addon's frames: GPU
+unprojection, voxel dedupe and carving (`run_e2e.ps1` only checks the frames, with `lidar_verify`'s
+CPU unprojection). One flow, two scenarios, in each of the three API environments: 6 runs. Per run,
+the ReShade-injected test game walks its camera path at 4x speed (`--speed 4`), `lidar_viewer`
+saves a scan after 8 s (`--out`, `--save-after`, `--exit-after`), and `lidar_verify ply` checks it.
+- `npc-carve`: the NPC on and carving on. 99.5% of points within 5 mm. The NPC where it stands at
+  save time isn't in the static true scene, so its points count as errors (measured 0.05-0.13%);
+  with carving broken its whole trail stays (0.8-1.2%), which fails.
+- `static`: `--no-npc` and the viewer's `--no-carve`. 99.9% within 5 mm (measured: none off).
+```powershell
+tests\e2e\run_viewer_e2e.ps1                              # 6 runs, about a minute
+tests\e2e\run_viewer_e2e.ps1 -Api d3d9 -Scenario static
+```
+Both suites share the environments and helpers through `tests/e2e/e2e_common.ps1`. It needs a
+Release build of `lidar_viewer` too; the viewer opens in the background as well
+(`lidar_viewer --background`). Logs and scans go to `build\e2e\viewer-logs\`.
+
 ### By hand
 ```powershell
 # with a producer running (the addon in a game, or the test game):
@@ -147,7 +165,8 @@ With `--no-publish` the addon does the capturing. Without it, the test game publ
 depth and camera, as a reference producer.
 
 **Options:** `--depth standard|reversed|reversed-infinite`, `--capture-width 480`,
-`--no-npc`, `--no-color`, `--tint-until T`, `--fov 70`, `--no-publish` (leave the ring to the addon). Keys: `M` manual camera (WASD/QE + right-drag),
+`--no-npc`, `--no-color`, `--tint-until T`, `--fov 70`, `--speed X` (walk the camera path X times as
+fast; the NPC keeps its pace), `--no-publish` (leave the ring to the addon). Keys: `M` manual camera (WASD/QE + right-drag),
 `Space` pause capture.
 
 `--api d3d12` renders the same level with D3D12 (render only, so the addon must publish),

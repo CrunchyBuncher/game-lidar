@@ -94,6 +94,7 @@ struct Options {
     bool publish = true;
     std::wstring ring;
     float freeze = -1;  // < 0: camera follows the path
+    float speed = 1;    // how fast the camera goes along its path (the NPC keeps its pace)
     uint32_t decoy_draws = 0;  // D3D12 root CBVs: draws before the scene with other constants at b0
     bool background = false;   // open behind other windows without taking the focus
 };
