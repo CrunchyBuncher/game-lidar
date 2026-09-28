@@ -27,7 +27,7 @@ jobs:
       - name: Build x64 (viewer, addon, tests)
         run: |
           cmake -S . -B build -A x64 $env:CMAKE_ARGS.Split(' ')
-          cmake --build build --config Release --target lidar_viewer lidar_capture lidar_tests --parallel
+          cmake --build build --config Release --target lidar_viewer lidar_capture lidar_tests lidar_discovery_tests --parallel
 
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure
