@@ -365,7 +365,7 @@ void D3D11Capture::publish(reshade::api::command_queue* queue, RingWriter& ring)
             ctx->Unmap(stage_[p.stage].Get(), 0);
             break;
         }
-        if (ring.is_open() && is_depth(p.header, static_cast<const uint8_t*>(m.pData), m.RowPitch)) {
+        if (ring.is_open() && check_depth(p.header, static_cast<const uint8_t*>(m.pData), m.RowPitch)) {
             Slot* slot = ring.begin_frame();
             slot->frame = p.header;
             const uint32_t w = p.header.width, h = p.header.height;

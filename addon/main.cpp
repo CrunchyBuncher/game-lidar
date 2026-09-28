@@ -2,7 +2,7 @@
 // camera matrices and publishes them to the shared-memory ring for the viewer.
 //
 // Depth path: depth_tracker ranks the depth-stencils, pick_depth() sticks to the scene's (see
-// DepthPick), a DepthCapture reads it back and drops readbacks that aren't depth.
+// DepthPick), a DepthCapture reads it back and drops readbacks that aren't depth or are blank.
 // Camera path: camera_tracker latches the profile's cbuffer window at the draws into each
 // depth-stencil (bytes from a CbufferSource), and at present the latch of the captured
 // depth-stencil becomes the frame's pose. Without a profile or a latch, frames go out
@@ -32,6 +32,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -173,8 +174,10 @@ uint64_t g_override = 0;                     // manual pick from the overlay, 0 
 // (transient, aliased) memory (UE5 on D3D12) have several with about the same draws each frame, and
 // the busiest flips between them. The busiest one only takes over after kPickSwitchFrames frames of
 // clearly drawing more (or of the one in use not drawing at all); until then, frames the one in use
-// doesn't draw aren't captured. A depth-stencil whose readback wasn't depth (DepthCapture::is_depth: its
-// memory held something else by present) isn't picked for kNotDepthFrames frames.
+// doesn't draw aren't captured. A depth-stencil whose readback wasn't depth (DepthCapture::check_depth:
+// its memory held something else by present) isn't picked for kSkipFrames frames. One captured at present
+// that came back blank while a snapshot from before a clear was there (the later pass drew without depth:
+// UE3's HUD, a pause menu) has the snapshot used for kSkipFrames frames, whatever the later pass drew.
 struct DepthPick {
     uint64_t ds = 0;
     uint32_t challenged = 0;  // consecutive frames another one clearly drew more
@@ -182,9 +185,14 @@ struct DepthPick {
 };
 DepthPick g_pick;
 constexpr uint32_t kPickSwitchFrames = 15;
-constexpr uint64_t kNotDepthFrames = 120;
+constexpr uint64_t kSkipFrames = 120;
 std::unordered_map<uint64_t, uint64_t> g_not_depth;         // depth-stencil -> g_frame it's skipped until
-std::deque<std::pair<uint64_t, uint64_t>> g_captured_from;  // g_frame -> depth-stencil, readbacks in flight
+std::unordered_map<uint64_t, uint64_t> g_prefer_snapshot;   // depth-stencil -> g_frame until
+struct CaptureRecord {  // a readback in flight
+    uint64_t frame = 0, ds = 0;
+    bool snapshot_available = false, used_snapshot = false;
+};
+std::deque<CaptureRecord> g_captured_from;
 // A snapshot of the captured depth-stencil taken before a clear this frame (games that reuse it for a
 // later pass), and the pass it holds.
 struct DepthSnapshot {
@@ -744,17 +752,26 @@ void on_depth_clear(command_list* cmd, resource ds, resource color, const depth:
     if (g_capture->snapshot(ds, g_settings.color ? color : resource{0}, uint32_t(g_settings.capture_width))) g_snapshot = {ds.handle, pass, pass_index};
 }
 
-// Marks the depth-stencils of captures the backend dropped as not depth (see DepthPick).
-void note_not_depth() {
-    for (const uint64_t frame : g_capture->take_not_depth())
-        for (const auto& [f, ds] : g_captured_from)
-            if (f == frame) {
-                if (!g_not_depth.contains(ds))
+// Learns from the captures the backend dropped (see DepthPick).
+void note_rejected() {
+    for (const DepthCapture::Rejected& r : g_capture->take_rejected())
+        for (const CaptureRecord& c : g_captured_from) {
+            if (c.frame != r.frame_index) continue;
+            static std::set<std::pair<uint64_t, bool>> logged;  // (depth-stencil, blank): log each once
+            const bool log = logged.emplace(c.ds, r.blank).second;
+            if (!r.blank) {
+                if (log)
                     log_info("Depth: the captured depth-stencil read back as something else (not depth); "
                              "skipping it for a while.");
-                g_not_depth[ds] = g_frame + kNotDepthFrames;
+                g_not_depth[c.ds] = g_frame + kSkipFrames;
+            } else if (c.snapshot_available && !c.used_snapshot) {
+                if (log)
+                    log_info("Depth: the captured depth-stencil was blank at present (cleared by a later pass); "
+                             "using its snapshot from before the clear for a while.");
+                g_prefer_snapshot[c.ds] = g_frame + kSkipFrames;
             }
-    std::erase_if(g_not_depth, [](const auto& e) { return e.second <= g_frame; });
+        }
+    for (auto* m : {&g_not_depth, &g_prefer_snapshot}) std::erase_if(*m, [](const auto& e) { return e.second <= g_frame; });
     while (g_captured_from.size() > 16) g_captured_from.pop_front();  // far more than readbacks in flight
 }
 
@@ -801,6 +818,7 @@ void on_destroy_device(device* dev) {
     g_candidates.clear();
     g_pick = {};
     g_not_depth.clear();
+    g_prefer_snapshot.clear();
     g_captured_from.clear();
     g_device = nullptr;
 }
@@ -836,14 +854,15 @@ void on_present(command_queue* queue, swapchain* sc, const rect*, const rect*, u
     for (int i = 0; i < 4; ++i) crop[i] = g_settings.color_crop[i] / 100;
     g_capture->set_color_crop(crop);
     g_capture->publish(queue, g_ring);
-    note_not_depth();
+    note_rejected();
     watchdog::exchange_step("present: capture");
 
     const depth::Candidate* pick = pick_depth();
     g_selected = pick ? pick->resource.handle : 0;
-    // The snapshot, unless the pass still in the depth-stencil drew more.
-    const bool use_snapshot = pick != nullptr && g_settings.enabled && snapshot.ds == pick->resource.handle &&
-                              !pick->last_segment.better_than(snapshot.pass);
+    // The snapshot, unless the pass still in the depth-stencil drew more (and didn't leave it blank before).
+    const bool have_snapshot = pick != nullptr && g_settings.enabled && snapshot.ds == pick->resource.handle;
+    const bool use_snapshot = have_snapshot && (!pick->last_segment.better_than(snapshot.pass) ||
+                                                g_prefer_snapshot.contains(pick->resource.handle));
     if (!use_snapshot) g_capture->drop_snapshot();
 
     if (g_settings.enabled && pick != nullptr) {
@@ -869,7 +888,7 @@ void on_present(command_queue* queue, swapchain* sc, const rect*, const rect*, u
         if (posed || active_camera() == nullptr) {
             g_capture->capture(queue, pick->resource, g_settings.color ? pick->color : resource{0},
                                uint32_t(g_settings.capture_width), h);
-            g_captured_from.emplace_back(g_frame, pick->resource.handle);
+            g_captured_from.push_back({g_frame, pick->resource.handle, have_snapshot, use_snapshot});
             g_snapshot_used = use_snapshot ? std::optional(snapshot) : std::nullopt;
         } else {
             g_capture->drop_snapshot();
@@ -1235,10 +1254,15 @@ void draw_overlay(effect_runtime*) {
         ImGui::TextColored(kError,
                            "The game renders with MSAA, which can't be captured: turn anti-aliasing (MSAA) off in the\n"
                            "game's video settings. Until then depth and discovery only see a secondary buffer.");
-    ImGui::Text("Published %llu frames at %ux%u, skipped %llu (GPU readback busy), dropped %llu (not depth)",
+    ImGui::Text("Published %llu frames at %ux%u, skipped %llu (GPU readback busy)",
                 static_cast<unsigned long long>(g_capture->published()), g_capture->width(), g_capture->height(),
-                static_cast<unsigned long long>(g_capture->skipped()),
-                static_cast<unsigned long long>(g_capture->not_depth()));
+                static_cast<unsigned long long>(g_capture->skipped()));
+    ImGui::Text("Dropped %llu not depth, %llu blank", static_cast<unsigned long long>(g_capture->not_depth()),
+                static_cast<unsigned long long>(g_capture->blank()));
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Not depth: the depth-stencil's memory held other data by the time it was copied.\n"
+                          "Blank: nothing drawn in it (cleared by a later pass, a menu). The viewer would carve\n"
+                          "away everything in view.");
     changed |= ImGui::SliderInt("Capture width", &g_settings.capture_width, 64, int(kMaxWidth));
     changed |= ImGui::Checkbox("Color", &g_settings.color);
     ImGui::SameLine();
