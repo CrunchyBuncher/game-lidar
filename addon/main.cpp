@@ -259,6 +259,24 @@ void reload_profile() {
 
 void log_info(const std::string& msg) { reshade::log::message(reshade::log::level::info, msg.c_str()); }
 
+// Microseconds since `t0`, a QueryPerformanceCounter reading.
+double us_since(const LARGE_INTEGER& t0) {
+    LARGE_INTEGER t1, freq;
+    QueryPerformanceCounter(&t1);
+    QueryPerformanceFrequency(&freq);
+    return double(t1.QuadPart - t0.QuadPart) * 1e6 / double(freq.QuadPart);
+}
+
+double dist3(const double a[3], const double b[3]) {
+    return std::sqrt((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]) + (a[2] - b[2]) * (a[2] - b[2]));
+}
+
+// Where the camera is in the world, in the game's units (view = [R 0; t 1], row vectors: p = -t * R^T).
+void camera_position(const float view[16], double pos[3]) {
+    for (int i = 0; i < 3; ++i)
+        pos[i] = -(double(view[12]) * view[i * 4] + double(view[13]) * view[i * 4 + 1] + double(view[14]) * view[i * 4 + 2]);
+}
+
 // ---- Discovery ------------------------------------------------------------------------------
 
 void start_discovery() {
@@ -296,17 +314,7 @@ std::string candidate_line(const disc::CandidateInfo& c) {
 }
 
 void log_discovery(const disc::Status& s) {
-    char buf[360];
-    std::snprintf(buf, sizeof(buf),
-                  "Discovery %.0f s: %llu frames analyzed (%llu dropped, %.2f ms each), %u draws/%u sampled/%u buffers "
-                  "last frame; hypotheses: %zu rigid, %zu proj, %zu viewproj, %zu invviewproj, %zu translation; depth %llu frames "
-                  "(%llu still, %llu moving), %llu reprojection rounds",
-                  s.seconds, (unsigned long long)s.frames_analyzed, (unsigned long long)s.frames_dropped, s.analyze_ms,
-                  s.last_draws, s.last_samples, s.last_buffers, s.hypotheses[0], s.hypotheses[1], s.hypotheses[2],
-                  s.hypotheses[3], s.hypotheses[4],
-                  (unsigned long long)s.depth_frames, (unsigned long long)s.still_frames,
-                  (unsigned long long)s.moving_frames, (unsigned long long)s.reproj_rounds);
-    log_info(buf);
+    log_info("Discovery " + disc::status_line(s));
     for (size_t i = 0; i < s.candidates.size() && i < 5; ++i)
         log_info("  #" + std::to_string(i + 1) + " " + candidate_line(s.candidates[i]));
 }
@@ -425,7 +433,7 @@ bool solve_model_view(const CameraProfile& camera, const cam::CbufferRead& proj_
         g_camera.why = "no draws recorded (model-view cameras need Direct3D 9 for now)";
         return false;
     }
-    LARGE_INTEGER t0, t1, freq;
+    LARGE_INTEGER t0;
     QueryPerformanceCounter(&t0);
     cam::solver_draws(d->second, camera.column_major, g_mv_input);
     g_mv = g_solver.solve(g_mv_input);
@@ -434,9 +442,7 @@ bool solve_model_view(const CameraProfile& camera, const cam::CbufferRead& proj_
                  (g_mv.anchor_shared != 0 ? ", in the game's world frame (" + std::to_string(g_mv.anchor_shared) +
                                                 " objects share the anchor matrix)"
                                           : ", in one object's frame (nothing shares a matrix: may be tilted)"));
-    QueryPerformanceCounter(&t1);
-    QueryPerformanceFrequency(&freq);
-    g_mv_us = g_mv_us * 0.9 + double(t1.QuadPart - t0.QuadPart) * 1e6 / double(freq.QuadPart) * 0.1;
+    g_mv_us = g_mv_us * 0.9 + us_since(t0) * 0.1;
     if (!g_mv.posed) {
         g_camera.why = "the draws don't agree on a camera this frame (" + std::to_string(g_mv.inliers) + " of " +
                        std::to_string(g_mv.known) + " known objects agree)";
@@ -444,12 +450,6 @@ bool solve_model_view(const CameraProfile& camera, const cam::CbufferRead& proj_
     }
     mat::store(g_mv.view, view);
     return true;
-}
-
-// Where the camera is in the world, in the game's units (view = [R 0; t 1], row vectors: p = -t * R^T).
-void camera_position(const float view[16], double pos[3]) {
-    for (int i = 0; i < 3; ++i)
-        pos[i] = -(double(view[12]) * view[i * 4] + double(view[13]) * view[i * 4 + 1] + double(view[14]) * view[i * 4 + 2]);
 }
 
 // Decodes the pass' latched cameras and picks the one to follow (see Follow). Returns false, with
@@ -481,11 +481,7 @@ bool pick_camera(const CameraProfile& camera, const std::vector<cam::LatchedRead
     for (size_t i = 1; i < options.size(); ++i)
         if (options[i].draws > options[chosen].draws) chosen = i;
     if (g_follow.have && g_frame - g_follow.frame <= kFollowFrames) {
-        auto dist = [&](const Option& o) {
-            return std::sqrt((o.pos[0] - g_follow.pos[0]) * (o.pos[0] - g_follow.pos[0]) +
-                             (o.pos[1] - g_follow.pos[1]) * (o.pos[1] - g_follow.pos[1]) +
-                             (o.pos[2] - g_follow.pos[2]) * (o.pos[2] - g_follow.pos[2]));
-        };
+        auto dist = [&](const Option& o) { return dist3(o.pos, g_follow.pos); };
         size_t nearest = 0;
         for (size_t i = 1; i < options.size(); ++i)
             if (dist(options[i]) < dist(options[nearest])) nearest = i;
@@ -572,14 +568,9 @@ void log_camera_changes() {
 void track_pose(bool posed) {
     PoseStats& s = g_pose_stats;
     if (posed) {
-        // Camera position in the world: view = [R 0; t 1] (row vectors), so p = -t * R^T.
-        const float* v = g_camera.view;
         double p[3];
-        for (int i = 0; i < 3; ++i) p[i] = -(v[12] * v[i * 4] + v[13] * v[i * 4 + 1] + v[14] * v[i * 4 + 2]);
-        if (s.have_last)
-            s.max_step = std::max(s.max_step, std::sqrt((p[0] - s.last[0]) * (p[0] - s.last[0]) +
-                                                        (p[1] - s.last[1]) * (p[1] - s.last[1]) +
-                                                        (p[2] - s.last[2]) * (p[2] - s.last[2])));
+        camera_position(g_camera.view, p);
+        if (s.have_last) s.max_step = std::max(s.max_step, dist3(p, s.last));
         std::copy_n(p, 3, s.last);
         std::copy_n(p, 3, s.pos);
         s.have_last = true;
@@ -727,7 +718,7 @@ void on_present(command_queue* queue, swapchain* sc, const rect*, const rect*, u
     const std::lock_guard lock(g_mutex);
     if (dev != g_device || !g_init_error.empty()) return;
 
-    LARGE_INTEGER t0, t1, freq;
+    LARGE_INTEGER t0;
     QueryPerformanceCounter(&t0);
 
     watchdog::exchange_step("present: camera end_frame");
@@ -798,10 +789,7 @@ void on_present(command_queue* queue, swapchain* sc, const rect*, const rect*, u
     }
     ++g_frame;
 
-    QueryPerformanceCounter(&t1);
-    QueryPerformanceFrequency(&freq);
-    const double us = double(t1.QuadPart - t0.QuadPart) * 1e6 / double(freq.QuadPart);
-    g_cpu_us = g_cpu_us * 0.95 + us * 0.05;
+    g_cpu_us = g_cpu_us * 0.95 + us_since(t0) * 0.05;
 }
 
 const char* format_name(format f) {
@@ -818,6 +806,25 @@ const char* format_name(format f) {
         case format::intz: return "INTZ";
         default: return "other";
     }
+}
+
+const ImVec4 kOk(0.3f, 1, 0.4f, 1);
+const ImVec4 kWarn(1, 0.8f, 0.2f, 1);
+const ImVec4 kError(1, 0.3f, 0.3f, 1);
+
+// A "(?)" after the last item, showing `text` on hover.
+void help_marker(const char* text) {
+    ImGui::SameLine();
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", text);
+}
+
+// FOV, aspect, near, far, depth direction and handedness, after `prefix`.
+void projection_text(const char* prefix, const ProjectionInfo& p) {
+    char far_text[32] = "infinite";
+    if (!std::isinf(p.far_z)) std::snprintf(far_text, sizeof(far_text), "%.6g", p.far_z);
+    ImGui::Text("%sFOV %.2f deg, aspect %.3f, near %.4g, far %s, %s, %s-handed", prefix, p.fov_y_deg, p.aspect,
+                p.near_z, far_text, p.reversed ? "reversed depth" : "standard depth", p.right_handed ? "right" : "left");
 }
 
 void matrix_table(const char* id, const float m[16]) {
@@ -851,7 +858,7 @@ bool draw_camera_section() {
         ImGui::TextDisabled(d3d9 ? "Tracking %zu constant registers" : "Tracking %zu constant buffers",
                             g_source->tracked_buffers());
     if (g_preview) {
-        ImGui::TextColored(ImVec4(1, 0.8f, 0.2f, 1), "Previewing a discovery candidate (not saved)");
+        ImGui::TextColored(kWarn, "Previewing a discovery candidate (not saved)");
         ImGui::SameLine();
         if (ImGui::Button("End preview")) {
             g_preview.reset();
@@ -860,7 +867,7 @@ bool draw_camera_section() {
         }
     }
     if (!g_preview && !g_profile_error.empty()) {
-        ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1), "%s", g_profile_error.c_str());
+        ImGui::TextColored(kError, "%s", g_profile_error.c_str());
         return changed;
     }
     // None after ending a preview with no profile to go back to.
@@ -897,11 +904,8 @@ bool draw_camera_section() {
         }
         g_ring.request_clear();  // the viewer's points are in the old units
     }
-    ImGui::SameLine();
-    ImGui::TextDisabled("(?)");
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("How many of the game's world units make one meter. The viewer assumes meters (voxel\n"
-                          "size, range, height colors). Changing it clears the viewer's points.");
+    help_marker("How many of the game's world units make one meter. The viewer assumes meters (voxel\n"
+                "size, range, height colors). Changing it clears the viewer's points.");
 
     // Up axis: live too, like the scale.
     bool z_up = c.z_up;
@@ -910,24 +914,18 @@ bool draw_camera_section() {
         if (!g_preview) write_profile_key(g_profile_path, "up", z_up ? "\"z\"" : "\"y\"");
         g_ring.request_clear();
     }
-    ImGui::SameLine();
-    ImGui::TextDisabled("(?)");
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("The game's world has z up (IW, Unreal, Source), not y: the capture shows on its side\n"
-                          "without this. Discovery suggests it once the camera has turned around. Changing it\n"
-                          "clears the viewer's points.");
+    help_marker("The game's world has z up (IW, Unreal, Source), not y: the capture shows on its side\n"
+                "without this. Discovery suggests it once the camera has turned around. Changing it\n"
+                "clears the viewer's points.");
 
     if (ImGui::Button("Clear viewer points")) g_ring.request_clear();
-    ImGui::SameLine();
-    ImGui::TextDisabled("(?)");
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Like C in the viewer, from here. Also done when the scale, the up axis or the previewed\n"
-                          "camera changes. Does nothing if the viewer isn't running.");
+    help_marker("Like C in the viewer, from here. Also done when the scale, the up axis or the previewed\n"
+                "camera changes. Does nothing if the viewer isn't running.");
 
     switch (g_camera.state) {
         case CameraStatus::NoProfile: break;
         case CameraStatus::NoLatch:
-            ImGui::TextColored(ImVec4(1, 0.8f, 0.2f, 1),
+            ImGui::TextColored(kWarn,
                                d3d9 ? "No latch: those registers were never set before a draw into the captured depth "
                                       "buffer (or slot isn't 0)."
                                     : "No latch: no draw into the captured depth buffer had that cbuffer bound.");
@@ -938,12 +936,12 @@ bool draw_camera_section() {
             const int missed = std::popcount(g_camera.recent);
             const char* posed = c.model_view() ? "Pose solved" : "Pose latched";
             if (missed == 0)
-                ImGui::TextColored(ImVec4(0.3f, 1, 0.4f, 1), "%s", posed);
+                ImGui::TextColored(kOk, "%s", posed);
             else if (missed < 64)
-                ImGui::TextColored(ImVec4(1, 0.8f, 0.2f, 1), "%s in %d of the last 64 frames (the others: %s)", posed,
+                ImGui::TextColored(kWarn, "%s in %d of the last 64 frames (the others: %s)", posed,
                                    64 - missed, g_camera.why.c_str());
             else
-                ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1), "Latched, but rejected: %s", g_camera.why.c_str());
+                ImGui::TextColored(kError, "Latched, but rejected: %s", g_camera.why.c_str());
             break;
         }
     }
@@ -955,20 +953,16 @@ bool draw_camera_section() {
         if (g_mv.segment != 0 && g_mv.anchor_shared != 0)
             ImGui::TextDisabled("World frame: the game's (%u objects share its matrix)", g_mv.anchor_shared);
         else if (g_mv.segment != 0)
-            ImGui::TextColored(ImVec4(1, 0.8f, 0.2f, 1), "World frame: one object's (may be tilted)");
+            ImGui::TextColored(kWarn, "World frame: one object's (may be tilted)");
     }
     ImGui::Text("Frames with pose %llu, without %llu", static_cast<unsigned long long>(g_camera.with_pose),
                 static_cast<unsigned long long>(g_camera.without_pose));
 
     if (g_camera.with_pose > 0) {  // the last pose, kept through rejected frames
         const ProjectionInfo& p = g_camera.info;
-        char far_text[32] = "infinite";
-        if (!std::isinf(p.far_z)) std::snprintf(far_text, sizeof(far_text), "%.6g", p.far_z);
-        ImGui::Text("From proj: FOV %.2f deg, aspect %.3f, near %.4g, far %s, %s, %s-handed", p.fov_y_deg, p.aspect,
-                    p.near_z, far_text, p.reversed ? "reversed depth" : "standard depth",
-                    p.right_handed ? "right" : "left");
+        projection_text("From proj: ", p);
         if (p.right_handed != c.right_handed)
-            ImGui::TextColored(ImVec4(1, 0.8f, 0.2f, 1), "Hint: the projection is %s-handed but the profile says %s.",
+            ImGui::TextColored(kWarn, "Hint: the projection is %s-handed but the profile says %s.",
                                p.right_handed ? "right" : "left", c.right_handed ? "right" : "left");
         if (ImGui::TreeNode("Matrices")) {
             ImGui::TextUnformatted("view");
@@ -1015,13 +1009,12 @@ void draw_discovery_section() {
     ImGui::Text("Depth: %llu frames (%llu still, %llu moving), %llu reprojection rounds",
                 (unsigned long long)s.depth_frames, (unsigned long long)s.still_frames,
                 (unsigned long long)s.moving_frames, (unsigned long long)s.reproj_rounds);
-    const ImVec4 warn(1, 0.8f, 0.2f, 1);
     if (g_discovering && s.frames_analyzed == 0 && g_selected == 0)
-        ImGui::TextColored(warn, "No depth buffer is captured, so no draws are sampled.");
+        ImGui::TextColored(kWarn, "No depth buffer is captured, so no draws are sampled.");
     else if (g_discovering && s.depth_frames == 0 && s.seconds > 3)
-        ImGui::TextColored(warn, "No depth frames: turn Capture on (candidates are validated with depth).");
+        ImGui::TextColored(kWarn, "No depth frames: turn Capture on (candidates are validated with depth).");
     else if (g_discovering && s.reproj_rounds == 0 && s.seconds > 3)
-        ImGui::TextColored(warn, "Move and turn the camera: validation needs the view to change.");
+        ImGui::TextColored(kWarn, "Move and turn the camera: validation needs the view to change.");
     if (s.candidates.empty()) {
         if (s.frames_analyzed > 0) ImGui::TextDisabled("No candidates yet.");
         return;
@@ -1053,7 +1046,7 @@ void draw_discovery_section() {
             ImGui::TextUnformatted(c.where.c_str());
             ImGui::TableNextColumn();
             if (c.confident)
-                ImGui::TextColored(ImVec4(0.3f, 1, 0.4f, 1), "%.2f", c.score);
+                ImGui::TextColored(kOk, "%.2f", c.score);
             else
                 ImGui::Text("%.2f", c.score);
             ImGui::TableNextColumn();
@@ -1087,14 +1080,7 @@ void draw_discovery_section() {
         if (!c.have_values) {
             ImGui::TextDisabled("(no values in the latest frame)");
         } else {
-            const ProjectionInfo& p = c.info;
-            if (p.valid) {
-                char far_text[32] = "infinite";
-                if (!std::isinf(p.far_z)) std::snprintf(far_text, sizeof(far_text), "%.6g", p.far_z);
-                ImGui::Text("FOV %.2f deg, aspect %.3f, near %.4g, far %s, %s, %s-handed", p.fov_y_deg, p.aspect,
-                            p.near_z, far_text, p.reversed ? "reversed depth" : "standard depth",
-                            p.right_handed ? "right" : "left");
-            }
+            if (c.info.valid) projection_text("", c.info);
             ImGui::TextUnformatted("view");
             matrix_table("cand_view", c.view);
             ImGui::TextUnformatted("proj");
@@ -1118,21 +1104,21 @@ void draw_overlay(effect_runtime*) {
     const watchdog::Step step("overlay");
     const std::lock_guard lock(g_mutex);
     if (g_device == nullptr) {
-        ImGui::TextColored(ImVec4(1, 0.6f, 0.2f, 1), "No supported device: %s",
+        ImGui::TextColored(kWarn, "No supported device: %s",
                            g_init_error.empty() ? "none created yet" : g_init_error.c_str());
         return;
     }
     if (!g_init_error.empty()) {
-        ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1), "%s", g_init_error.c_str());
+        ImGui::TextColored(kError, "%s", g_init_error.c_str());
         return;
     }
 
     bool changed = ImGui::Checkbox("Capture", &g_settings.enabled);
     ImGui::SameLine();
     ImGui::TextDisabled("(%.1f fps, addon CPU %.0f us/frame)", ImGui::GetIO().Framerate, g_cpu_us);
-    if (!g_capture->error().empty()) ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1), "%s", g_capture->error().c_str());
+    if (!g_capture->error().empty()) ImGui::TextColored(kError, "%s", g_capture->error().c_str());
     if (msaa_hides_scene())
-        ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1),
+        ImGui::TextColored(kError,
                            "The game renders with MSAA, which can't be captured: turn anti-aliasing (MSAA) off in the\n"
                            "game's video settings. Until then depth and discovery only see a secondary buffer.");
     ImGui::Text("Published %llu frames at %ux%u, skipped %llu (GPU readback busy)",
@@ -1146,7 +1132,7 @@ void draw_overlay(effect_runtime*) {
     else if (g_capture->color_note().empty())
         ImGui::TextDisabled("(the scene's render target, sampled with depth)");
     else
-        ImGui::TextColored(ImVec4(1, 0.8f, 0.2f, 1), "none: %s", g_capture->color_note().c_str());
+        ImGui::TextColored(kWarn, "none: %s", g_capture->color_note().c_str());
     if (g_settings.color && ImGui::TreeNode("Color crop (HUD)")) {
         ImGui::TextDisabled("Percent of the screen from each edge whose color is dropped (depth is kept).\n"
                             "The outline on screen is the area that keeps its color.");
@@ -1177,7 +1163,7 @@ void draw_overlay(effect_runtime*) {
             if (c.resource.handle == g_selected) {
                 const bool reversed = g_settings.depth_mode != int(DepthMode::Standard);
                 if (c.reversed_clear != reversed)
-                    ImGui::TextColored(ImVec4(1, 0.8f, 0.2f, 1), "Hint: the game clears depth to %s, which suggests %s.",
+                    ImGui::TextColored(kWarn, "Hint: the game clears depth to %s, which suggests %s.",
                                        c.reversed_clear ? "0" : "1", c.reversed_clear ? "reversed" : "standard");
             }
     }
@@ -1200,7 +1186,7 @@ void draw_overlay(effect_runtime*) {
                 if (ImGui::RadioButton("##use", g_override == c.resource.handle)) g_override = c.resource.handle;
                 if (c.resource.handle == g_selected) {
                     ImGui::SameLine();
-                    ImGui::TextColored(ImVec4(0.3f, 1, 0.4f, 1), "captured");
+                    ImGui::TextColored(kOk, "captured");
                 }
                 ImGui::TableNextColumn();
                 ImGui::Text("%ux%u%s", c.desc.texture.width, c.desc.texture.height,

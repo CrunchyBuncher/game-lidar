@@ -53,6 +53,9 @@ struct Status {
     std::vector<CandidateInfo> candidates;  // best first
 };
 
+// The status' counters as one line (candidates aside), for ReShade.log and the report.
+std::string status_line(const Status& s);
+
 class Discovery {
 public:
     Discovery() = default;

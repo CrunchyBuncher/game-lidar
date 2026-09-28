@@ -45,6 +45,9 @@ struct BufId {
     shader_stage stage = shader_stage::vertex;
     uint32_t slot = 0, space = 0, size = 0;
     bool operator==(const BufId&) const = default;
+
+    static BufId of(const cam::CbufferKey& k) { return {k.stage, k.slot, k.space, k.size}; }
+    cam::CbufferKey key() const { return {stage, slot, space, size}; }
 };
 struct BufIdHash {
     size_t operator()(const BufId& b) const {
@@ -182,6 +185,31 @@ bool view_changed(const mat::Mat& a, const mat::Mat& b) {
     return false;
 }
 
+// Report order: by stage, then slot, then offset.
+bool report_less(const BufId& xb, uint32_t xoff, const BufId& yb, uint32_t yoff) {
+    if (xb.stage != yb.stage) return uint32_t(xb.stage) < uint32_t(yb.stage);
+    if (xb.slot != yb.slot) return xb.slot < yb.slot;
+    return xoff < yoff;
+}
+
+void write_matrix(std::ofstream& f, const float m[16]) {
+    char line[128];
+    for (int r = 0; r < 4; ++r) {
+        std::snprintf(line, sizeof(line), "    %12.5g %12.5g %12.5g %12.5g\n", m[r * 4], m[r * 4 + 1], m[r * 4 + 2],
+                      m[r * 4 + 3]);
+        f << line;
+    }
+}
+
+// A decoded camera into decode()'s outputs: as matrices, and as decode_camera wrote them if asked.
+void set_decoded(const float v[16], const float pr[16], mat::Mat& view, mat::Mat& proj, float* view_f,
+                 float* proj_f) {
+    view = mat::load(v, false);
+    proj = mat::load(pr, false);
+    if (view_f) std::memcpy(view_f, v, sizeof(float) * 16);
+    if (proj_f) std::memcpy(proj_f, pr, sizeof(float) * 16);
+}
+
 // A float3 that could be a world position (a translation candidate): finite, not tiny, not huge, and
 // no denormals (bits of an int or a packed value, not a coordinate).
 bool looks_like_position(const float f[3]) {
@@ -269,12 +297,12 @@ std::string draw_text(const cam::DrawCall& c, const cam::DrawGeometry& g) {
 // UP draws by the hash of their data (`content`, what the solver uses), or by the game's pointers.
 uint64_t report_key(const cam::DrawRecord& r, bool content) { return cam::object_key(r, !content); }
 
+using mat::rotation_between_deg;
 using mat::translation_between;
-double rotation_between(const mat::Mat& a, const mat::Mat& b) { return mat::rotation_between_deg(a, b); }
 
 bool same_motion(const mat::Mat& a, const mat::Mat& b) {
     const double scale = std::max({1.0, std::abs(a.m[3][0]), std::abs(a.m[3][1]), std::abs(a.m[3][2])});
-    return rotation_between(a, b) < 0.05 && translation_between(a, b) < 0.01 + 1e-4 * scale;
+    return rotation_between_deg(a, b) < 0.05 && translation_between(a, b) < 0.01 + 1e-4 * scale;
 }
 
 using KeyMap = std::unordered_map<uint64_t, std::vector<const cam::DrawRecord*>>;
@@ -393,7 +421,7 @@ void write_census_pair(std::ofstream& f, const Census& a, const Census& b) {
                           "  %s-major: %zu invertible, motion consensus %zu (%.0f%%): rotation %.3f deg, "
                           "translation (%.3f %.3f %.3f)\n",
                           column_major ? "column" : "row", ms.size(), best_n, 100.0 * best_n / ms.size(),
-                          rotation_between(d, mat::identity()), d.m[3][0], d.m[3][1], d.m[3][2]);
+                          rotation_between_deg(d, mat::identity()), d.m[3][0], d.m[3][1], d.m[3][2]);
             f << line;
             if (best_n > listed_inliers) listed = std::move(ms), listed_inliers = best_n;
         }
@@ -411,7 +439,7 @@ void write_census_pair(std::ofstream& f, const Census& a, const Census& b) {
         }
         std::snprintf(line, sizeof(line), "  %5u -> %5u %s  %s  %.4f deg  %.4f\n", m.a->draw, m.b->draw,
                       draw_text(m.a->call, m.a->geometry).c_str(), m.inlier ? "in " : "OUT",
-                      rotation_between(m.d, *ref), translation_between(m.d, *ref));
+                      rotation_between_deg(m.d, *ref), translation_between(m.d, *ref));
         f << line;
     }
 }
@@ -514,7 +542,7 @@ struct Discovery::State {
         for (uint32_t si = 0; si < uint32_t(sf.samples.samples.size()); ++si) {
             for (const cam::BoundBuffer& b : sf.samples.samples[si].buffers) {
                 ++buffers;
-                const BufId id{b.key.stage, b.key.slot, b.key.space, b.key.size};
+                const BufId id = BufId::of(b.key);
                 bound.insert(id);
                 const std::vector<uint8_t>& bytes = b.read.bytes;
                 const uint64_t h = hash_bytes(bytes.data(), bytes.size(), BufIdHash()(id));
@@ -624,16 +652,14 @@ struct Discovery::State {
             if (loc.kind != MatrixKind::Translation) slot(loc.buf, loc.offset);
         for (const cam::DrawSample& d : sf.samples.samples)
             for (const cam::BoundBuffer& b : d.buffers)
-                for (uint32_t off = 0; off < 256; off += 64) slot({b.key.stage, b.key.slot, b.key.space, b.key.size}, off);
+                for (uint32_t off = 0; off < 256; off += 64) slot(BufId::of(b.key), off);
         std::sort(s.windows.begin(), s.windows.end(), [](const Snapshot::Window& x, const Snapshot::Window& y) {
-            if (x.buf.stage != y.buf.stage) return uint32_t(x.buf.stage) < uint32_t(y.buf.stage);
-            if (x.buf.slot != y.buf.slot) return x.buf.slot < y.buf.slot;
-            return x.offset < y.offset;
+            return report_less(x.buf, x.offset, y.buf, y.offset);
         });
 
         for (const cam::DrawSample& d : sf.samples.samples)
             for (const cam::BoundBuffer& b : d.buffers) {
-                const BufId id{b.key.stage, b.key.slot, b.key.space, b.key.size};
+                const BufId id = BufId::of(b.key);
                 const std::vector<uint8_t>& bytes = b.read.bytes;
                 for (Snapshot::Window& w : s.windows) {
                     if (!(w.buf == id) || w.offset + 64 > bytes.size()) continue;
@@ -686,7 +712,7 @@ struct Discovery::State {
     void add_candidate(CameraLayout layout, const Hypothesis& a, const Hypothesis* b, Latch latch,
                        const Hypothesis* t = nullptr, bool subtract = false, bool supersede = false) {
         CameraProfile p;
-        p.key = {a.loc.buf.stage, a.loc.buf.slot, a.loc.buf.space, a.loc.buf.size};
+        p.key = a.loc.buf.key();
         p.layout = layout;
         p.view_offset = a.loc.offset;
         if (b) p.proj_offset = b->loc.offset;
@@ -839,18 +865,13 @@ struct Discovery::State {
         window.assign(p.window_size(), 0);
         std::memcpy(window.data() + (p.view_offset - p.window_offset()), common ? ra->common : ra->first, 64);
         if (rb) std::memcpy(window.data() + (p.proj_offset - p.window_offset()), common ? rb->common : rb->first, 64);
-        if (p.has_translation) {
-            const auto ht = hyps.find(c.t);
-            const Record* rt = ht != hyps.end() ? ht->second.at(frame) : nullptr;
-            if (rt == nullptr) return 1;
-            std::memcpy(window.data() + (p.translation_offset - p.window_offset()), common ? rt->common : rt->first, 12);
-        }
+        const auto ht = hyps.find(c.t);
+        const Record* rt = ht != hyps.end() ? ht->second.at(frame) : nullptr;
+        if (rt == nullptr) return 1;
+        std::memcpy(window.data() + (p.translation_offset - p.window_offset()), common ? rt->common : rt->first, 12);
         float v[16], pr[16];
         if (!decode_camera(p, window.data(), window.size(), v, pr)) return 2;
-        view = mat::load(v, false);
-        proj = mat::load(pr, false);
-        if (view_f) std::memcpy(view_f, v, sizeof(v));
-        if (proj_f) std::memcpy(proj_f, pr, sizeof(pr));
+        set_decoded(v, pr, view, proj, view_f, proj_f);
         return 0;
     }
 
@@ -890,10 +911,7 @@ struct Discovery::State {
             if (sg.b) std::memcpy(window.data() + (p.proj_offset - p.window_offset()), sg.b, 64);
             float v[16], pr[16];
             if (!decode_camera(p, window.data(), window.size(), v, pr)) continue;
-            view = mat::load(v, false);
-            proj = mat::load(pr, false);
-            if (view_f) std::memcpy(view_f, v, sizeof(v));
-            if (proj_f) std::memcpy(proj_f, pr, sizeof(pr));
+            set_decoded(v, pr, view, proj, view_f, proj_f);
             return 0;
         }
         return 2;
@@ -1031,16 +1049,7 @@ struct Discovery::State {
         std::ofstream f(path);
         if (!f) return;
         char line[512];
-        std::snprintf(line, sizeof(line),
-                      "game-lidar discovery report\n%.1f s, %llu frames analyzed (%llu dropped, %.2f ms each), %llu "
-                      "depth frames (%llu still, %llu moving), %llu reprojection rounds\nlast frame: %u draws, %u "
-                      "sampled, %u buffers\n\n",
-                      stats.seconds, (unsigned long long)stats.frames_analyzed, (unsigned long long)stats.frames_dropped,
-                      stats.analyze_ms,
-                      (unsigned long long)stats.depth_frames, (unsigned long long)stats.still_frames,
-                      (unsigned long long)stats.moving_frames, (unsigned long long)stats.reproj_rounds,
-                      stats.last_draws, stats.last_samples, stats.last_buffers);
-        f << line;
+        f << "game-lidar discovery report\n" << status_line(stats) << "\n\n";
         f << "== Candidates (best first) ==\n";
         int rank = 0;
         for (const Candidate* c : ranked()) {
@@ -1064,9 +1073,7 @@ struct Discovery::State {
         std::vector<const Hypothesis*> hs;
         for (const auto& [loc, h] : hyps) hs.push_back(&h);
         std::sort(hs.begin(), hs.end(), [](const Hypothesis* x, const Hypothesis* y) {
-            if (x->loc.buf.stage != y->loc.buf.stage) return uint32_t(x->loc.buf.stage) < uint32_t(y->loc.buf.stage);
-            if (x->loc.buf.slot != y->loc.buf.slot) return x->loc.buf.slot < y->loc.buf.slot;
-            return x->loc.offset < y->loc.offset;
+            return report_less(x->loc.buf, x->loc.offset, y->loc.buf, y->loc.offset);
         });
         for (const Hypothesis* h : hs) {
             std::snprintf(line, sizeof(line),
@@ -1082,12 +1089,7 @@ struct Discovery::State {
                 std::snprintf(line, sizeof(line), "    %12.5g %12.5g %12.5g\n", t[0], t[1], t[2]);
                 f << line;
             } else if (!h->history.empty()) {
-                const float* m = h->history.back().common;
-                for (int r = 0; r < 4; ++r) {
-                    std::snprintf(line, sizeof(line), "    %12.5g %12.5g %12.5g %12.5g\n", m[r * 4], m[r * 4 + 1],
-                                  m[r * 4 + 2], m[r * 4 + 3]);
-                    f << line;
-                }
+                write_matrix(f, h->history.back().common);
             }
         }
 
@@ -1111,11 +1113,7 @@ struct Discovery::State {
                     std::snprintf(line, sizeof(line), "  %zu draws [%s ] %s\n", v.draws.size(), draws.c_str() + 1,
                                   kinds_text(v.bits).c_str());
                     f << line;
-                    for (int r = 0; r < 4; ++r) {
-                        std::snprintf(line, sizeof(line), "    %12.5g %12.5g %12.5g %12.5g\n", v.f[r * 4],
-                                      v.f[r * 4 + 1], v.f[r * 4 + 2], v.f[r * 4 + 3]);
-                        f << line;
-                    }
+                    write_matrix(f, v.f);
                 }
             }
             f << "sampled draws (call | geometry):\n";
@@ -1129,6 +1127,20 @@ struct Discovery::State {
         for (size_t i = 1; i < censuses.size(); ++i) write_census_pair(f, censuses[i - 1], censuses[i]);
     }
 };
+
+std::string status_line(const Status& s) {
+    char buf[360];
+    std::snprintf(buf, sizeof(buf),
+                  "%.1f s: %llu frames analyzed (%llu dropped, %.2f ms each), %u draws/%u sampled/%u buffers "
+                  "last frame; hypotheses: %zu rigid, %zu proj, %zu viewproj, %zu invviewproj, %zu translation; depth %llu frames "
+                  "(%llu still, %llu moving), %llu reprojection rounds",
+                  s.seconds, (unsigned long long)s.frames_analyzed, (unsigned long long)s.frames_dropped, s.analyze_ms,
+                  s.last_draws, s.last_samples, s.last_buffers, s.hypotheses[0], s.hypotheses[1], s.hypotheses[2],
+                  s.hypotheses[3], s.hypotheses[4],
+                  (unsigned long long)s.depth_frames, (unsigned long long)s.still_frames,
+                  (unsigned long long)s.moving_frames, (unsigned long long)s.reproj_rounds);
+    return buf;
+}
 
 Discovery::~Discovery() { stop(); }
 
