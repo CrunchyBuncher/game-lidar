@@ -10,7 +10,7 @@ inline constexpr unsigned kQuadsPerBatch = 16384;  // 4 vertices each: fits 16-b
 //   cs_min_dist - per pixel, the nearest distance observed in its 3x3 neighborhood (for carving)
 //   cs_carve    - free-space carving: delete points the current frame sees through; also
 //                 refreshes the color of points it sees (color_update)
-//   cs_ingest   - depth frame -> world points, deduplicated through a voxel hash
+//   cs_ingest   - depth frame -> world points, deduplicated through a voxel hash (pinhole pixels dropped)
 //   cs_args     - refresh indirect draw/dispatch arguments
 // Unprojection mirrors common/unproject.h.
 inline const char* kCompute = R"(
@@ -161,6 +161,18 @@ void cs_carve(uint3 id : SV_DispatchThreadID) {
     free_list[f] = id.x;
 }
 
+// A pinhole: every neighbor is clearly nearer, so the pixel sees through a surface (a seam between
+// meshes, one pixel wide). What's behind it is never seen directly, so it would float alone.
+// Edge pixels have no full neighborhood and are kept.
+bool is_pinhole(uint2 p, float d) {
+    if (any(p < 1) || any(p >= dims - 1)) return false;
+    float nearer = d - max(0.15, 0.05 * d);
+    [unroll] for (int y = -1; y <= 1; ++y)
+        [unroll] for (int x = -1; x <= 1; ++x)
+            if ((x != 0 || y != 0) && observed_distance(uint2(int2(p) + int2(x, y))) >= nearer) return false;
+    return true;
+}
+
 [numthreads(8, 8, 1)]
 void cs_ingest(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= dims)) return;
@@ -168,6 +180,7 @@ void cs_ingest(uint3 id : SV_DispatchThreadID) {
     if (abs(v.w) < 1e-20) return;
     float d = length(v.xyz);
     if (!(d > near_cut && d < max_range)) return;  // also rejects NaN / inf
+    if (is_pinhole(id.xy, d)) return;
     float3 w = mul(float4(v.xyz, 1), inv_view).xyz;
 
     uint h = voxel_hash(w);

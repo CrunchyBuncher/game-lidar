@@ -29,7 +29,8 @@ add_custom_command(TARGET fake_game POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E make_directory ${FAKE_GAME_D3D9_DIR}
   COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:fake_game> ${FAKE_GAME_D3D9_DIR}/)
 
-add_executable(lidar_viewer viewer/main.cpp)
+add_executable(lidar_viewer
+  viewer/main.cpp viewer/camera.cpp viewer/cutaway.cpp viewer/point_cloud.cpp viewer/renderer.cpp)
 target_link_libraries(lidar_viewer PRIVATE lidar_common)
 
 add_executable(lidar_verify tools/verify/main.cpp)
