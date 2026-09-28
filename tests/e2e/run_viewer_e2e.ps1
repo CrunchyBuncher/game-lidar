@@ -7,10 +7,10 @@ cloud on the GPU, and lidar_verify checks the saved scan against the true scene.
 Where run_e2e.ps1 checks the addon's frames (with lidar_verify's CPU unprojection), this checks
 what the viewer makes of them: GPU unprojection, voxel dedupe and carving. There is one flow
 ($Scenarios below), run in every graphics API environment ($Environments in e2e_common.ps1, shared
-with run_e2e.ps1). Per run: the ReShade-injected fake_game walks its camera path at 4x speed
-(--no-publish: the addon publishes), lidar_viewer saves a .ply after -SaveAfter seconds and exits,
-and `lidar_verify ply` needs the scenario's MinWithin of the points within $Tolerance of the scene
-(99.9% static, 99.5% with the NPC).
+with run_e2e.ps1). Per run: the ReShade-injected fake_game walks its camera path at the scenario's
+Speed (--no-publish: the addon publishes), lidar_viewer saves a .ply after SaveAfter seconds and
+exits, and `lidar_verify ply` needs the scenario's MinWithin of the points within $Tolerance of the
+scene (99.9% static, 99.5% with the NPC).
 
 Needs a Release build (lidar_viewer, lidar_verify, lidar_capture, fake_game) and ReShade in
 sandbox\fake_game\ as dxgi.dll. Close any game with the addon first: everything here shares the
@@ -27,7 +27,6 @@ tests\e2e\run_viewer_e2e.ps1 -Api d3d9 -Scenario static
 param(
     [string[]]$Api = 'all',        # all | d3d11 | d3d12 | d3d9, several comma-separated
     [string[]]$Scenario = '*',     # names, wildcards allowed
-    [double]$SaveAfter = 8,        # viewer seconds before it saves the scan (about half a lap)
     [string]$BuildDir = 'build'
 )
 $ErrorActionPreference = 'Stop'
@@ -36,20 +35,23 @@ $Api, $Scenario = ($Api, $Scenario) | ForEach-Object { , @($_ -split ',' | ForEa
 . (Join-Path $PSScriptRoot 'e2e_common.ps1')  # $Environments, $Tolerance, the helpers
 
 # ---- The test flow: written once, run in every environment ---------------------------------------
-# Game: extra fake_game flags. Viewer: extra lidar_viewer flags. MinWithin: the fraction of points
-# that must lie within $Tolerance of the scene.
+# Game: extra fake_game flags. Viewer: extra lidar_viewer flags. Speed: how fast the camera walks its
+# path (the NPC keeps its pace). SaveAfter: viewer seconds before it saves the scan; with Speed,
+# about half a lap either way. MinWithin: the fraction of points that must lie within $Tolerance of
+# the scene.
 # npc-carve: the NPC walks through the level and carving removes where it was. Its points where it
 # stands at save time aren't in the static true scene (up to 1.8 m off), so they count as errors:
-# measured 0.05-0.13% of the scan (4x speed, saves across a lap). With carving broken its whole
-# trail would stay: 0.8-1.2% (measured with --no-carve), which 99.5% catches.
-# static: neither, so the whole scan must match the scene (measured: no point off by 5 mm).
+# measured 0.05-0.13% of the scan (4x, saves across a lap). With carving broken its whole trail
+# would stay: 0.83-1.16% (measured with --no-carve), which 99.5% catches. The trail is only as long
+# as the NPC walked, so this runs slower than static: at 8x the camera outran it (0.44% at 8 s).
+# static: neither, so the whole scan must match the scene (measured: no point off by 5 mm), and it
+# runs as fast as the capture keeps up.
 $Scenarios = @(
-    @{ Name = 'npc-carve'; Game = @();          Viewer = @();             MinWithin = 0.995 }
-    @{ Name = 'static';    Game = @('--no-npc'); Viewer = @('--no-carve'); MinWithin = 0.999 }
+    @{ Name = 'npc-carve'; Game = @();          Viewer = @();             Speed = 4; SaveAfter = 8; MinWithin = 0.995 }
+    @{ Name = 'static';    Game = @('--no-npc'); Viewer = @('--no-carve'); Speed = 16; SaveAfter = 2; MinWithin = 0.999 }
 )
 $ProfileName = 'lidar_profile.toml'  # the addon's camera profile, next to the rig's exe
 $Depth = 'reversed'
-$Speed = 4  # the camera walks its path 4x as fast: a harder load, and a shorter run
 
 # ---- Runner --------------------------------------------------------------------------------------
 $viewer = Join-Path $bin 'lidar_viewer.exe'
@@ -59,7 +61,6 @@ Initialize-Suite $logs @($verify, $viewer, (Join-Path $root 'sandbox\fake_game\f
 $apis = Select-Environments $Api
 $scenarios = @($Scenarios | Where-Object { $n = $_.Name; @($Scenario | Where-Object { $n -like $_ }).Count -gt 0 })
 if ($scenarios.Count -eq 0) { throw "no scenario matches '$Scenario' (scenarios: $($Scenarios.Name -join ', '))" }
-$exitAfter = $SaveAfter + 1
 
 try {
     foreach ($apiName in $apis) {
@@ -72,9 +73,10 @@ try {
             Set-RigProfile $rig $ProfileName
             $ply = Join-Path $logs "$apiName-$($s.Name).ply"
             $log = Join-Path $logs "$apiName-$($s.Name).log"
-            $gameArgs = @($e.Args) + $s.Game + @('--no-publish', '--depth', $Depth, '--speed', "$Speed",
+            $exitAfter = $s.SaveAfter + 1
+            $gameArgs = @($e.Args) + $s.Game + @('--no-publish', '--depth', $Depth, '--speed', "$($s.Speed)",
                                                   '--duration', "$($exitAfter + 15)")
-            $viewerArgs = $s.Viewer + @('--out', $ply, '--save-after', "$SaveAfter", '--exit-after', "$exitAfter")
+            $viewerArgs = $s.Viewer + @('--out', $ply, '--save-after', "$($s.SaveAfter)", '--exit-after', "$exitAfter")
             $verifyArgs = @('ply', $ply, '--tol', "$Tolerance", '--min-within', "$($s.MinWithin)")
             "fake_game $($gameArgs -join ' ')`nlidar_viewer $($viewerArgs -join ' ')`nlidar_verify $($verifyArgs -join ' ')`n" | Set-Content $log
 

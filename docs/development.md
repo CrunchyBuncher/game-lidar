@@ -130,14 +130,17 @@ file afterwards. Logs and captured frames go to `build\e2e\`. The whole run take
 `tests/e2e/run_viewer_e2e.ps1` checks what the viewer makes of the addon's frames: GPU
 unprojection, voxel dedupe and carving (`run_e2e.ps1` only checks the frames, with `lidar_verify`'s
 CPU unprojection). One flow, two scenarios, in each of the three API environments: 6 runs. Per run,
-the ReShade-injected test game walks its camera path at 4x speed (`--speed 4`), `lidar_viewer`
-saves a scan after 8 s (`--out`, `--save-after`, `--exit-after`), and `lidar_verify ply` checks it.
-- `npc-carve`: the NPC on and carving on. 99.5% of points within 5 mm. The NPC where it stands at
-  save time isn't in the static true scene, so its points count as errors (measured 0.05-0.13%);
-  with carving broken its whole trail stays (0.8-1.2%), which fails.
-- `static`: `--no-npc` and the viewer's `--no-carve`. 99.9% within 5 mm (measured: none off).
+the ReShade-injected test game walks its camera path faster than normal (`--speed`, the NPC keeps
+its pace), `lidar_viewer` saves a scan about half a lap in (`--out`, `--save-after`,
+`--exit-after`), and `lidar_verify ply` checks it.
+- `npc-carve`: the NPC on and carving on, at 4x, saved after 8 s. 99.5% of points within 5 mm. The
+  NPC where it stands at save time isn't in the static true scene, so its points count as errors
+  (measured 0.05-0.13%); with carving broken its whole trail stays (0.83-1.16%), which fails. The
+  trail needs the NPC to have walked a while, hence the slower camera: at 8x it would pass.
+- `static`: `--no-npc` and the viewer's `--no-carve`, at 16x, saved after 2 s. 99.9% within 5 mm
+  (measured: none off).
 ```powershell
-tests\e2e\run_viewer_e2e.ps1                              # 6 runs, about a minute
+tests\e2e\run_viewer_e2e.ps1                              # 6 runs, under a minute
 tests\e2e\run_viewer_e2e.ps1 -Api d3d9 -Scenario static
 ```
 Both suites share the environments and helpers through `tests/e2e/e2e_common.ps1`. It needs a
